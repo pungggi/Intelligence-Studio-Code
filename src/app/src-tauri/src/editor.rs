@@ -3,8 +3,9 @@
 //! This is the core editor engine. It owns the text buffer and provides
 //! edit operations that keep the syntax tree in sync incrementally.
 
-use crate::highlighting::{self, HighlightedLine};
-use crate::{EditorContent, ExtHostStatus};
+use crate::highlighting;
+use crate::ipc_bridge::IpcHandle;
+use crate::{EditorContent, HighlightedLine};
 use anyhow::{Context, Result};
 use ropey::Rope;
 use std::fs;
@@ -17,6 +18,7 @@ pub struct EditorState {
     modified: bool,
     parser: tree_sitter::Parser,
     tree: Option<tree_sitter::Tree>,
+    version: u32,
 }
 
 impl EditorState {
@@ -35,6 +37,7 @@ impl EditorState {
             modified: false,
             parser,
             tree,
+            version: 0,
         }
     }
 
@@ -88,6 +91,7 @@ impl EditorState {
 
         self.rope.insert(char_idx, text);
         self.modified = true;
+        self.version += 1;
 
         // Incremental tree-sitter update
         if let Some(tree) = &mut self.tree {
@@ -130,6 +134,7 @@ impl EditorState {
 
         self.rope.remove(char_idx..end_idx);
         self.modified = true;
+        self.version += 1;
 
         if let Some(tree) = &mut self.tree {
             let new_line = self.rope.byte_to_line(start_byte.min(self.rope.len_bytes().saturating_sub(1)));
@@ -188,6 +193,7 @@ impl EditorState {
 
         self.rope.remove(char_idx..end_idx);
         self.modified = true;
+        self.version += 1;
 
         if let Some(tree) = &mut self.tree {
             let new_line = self.rope.byte_to_line(start_byte.min(self.rope.len_bytes().saturating_sub(1)));
@@ -243,7 +249,7 @@ impl EditorState {
         }
     }
 
-    pub fn get_content(&self) -> EditorContent {
+    pub fn get_content(&self, ipc: &IpcHandle) -> EditorContent {
         let lines: Vec<HighlightedLine> = (0..self.rope.len_lines())
             .map(|i| {
                 let line_text = self.rope.line(i).to_string();
@@ -268,13 +274,23 @@ impl EditorState {
             file_path: self.file_path.as_ref().map(|p| p.display().to_string()),
             language: self.language.clone(),
             modified: self.modified,
+            diagnostics: ipc.get_diagnostics(),
         }
     }
 
-    pub fn ext_host_status(&self) -> ExtHostStatus {
-        ExtHostStatus {
-            running: false, // TODO: check actual Extension Host process
-            commands: vec![],
-        }
+    pub fn get_full_text(&self) -> String {
+        self.rope.to_string()
+    }
+
+    pub fn file_path_str(&self) -> Option<String> {
+        self.file_path.as_ref().map(|p| p.display().to_string())
+    }
+
+    pub fn language(&self) -> Option<String> {
+        self.language.clone()
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
     }
 }

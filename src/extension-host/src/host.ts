@@ -4,17 +4,16 @@
  * Headless Node.js process that:
  * 1. Listens for IPC connections from the native frontend
  * 2. Loads and activates VS Code extensions
- * 3. Manages LSP server lifecycle
- * 4. Routes API calls between extensions and the frontend
+ * 3. Routes messages between extensions and the frontend
  */
 
-import { createServer } from "net";
+import { resolve } from "path";
 import { ExtensionLoader } from "./extension-loader";
 import { IpcServer } from "./ipc-server";
 import { VscodeApiShim } from "./vscode-api-shim";
 
 const SOCKET_PATH =
-  process.env.CORECODE_SOCKET ?? "/tmp/corecode-extension-host.sock";
+  process.env.CORECODE_SOCKET ?? "/tmp/corecode-ext-host.sock";
 
 async function main(): Promise<void> {
   console.log("[ExtensionHost] Starting...");
@@ -33,14 +32,22 @@ async function main(): Promise<void> {
   });
 
   // Forward API shim events back to frontend
-  apiShim.onEvent((event) => {
-    ipcServer.send(event);
+  apiShim.onOutgoing((msg) => {
+    ipcServer.send(msg);
   });
 
-  // TODO M2: Scan extension directories and load extensions
-  // await extensionLoader.scanAndActivate('/path/to/extensions');
+  // Scan and activate extensions
+  const extensionsDir =
+    process.env.CORECODE_EXTENSIONS ??
+    resolve(__dirname, "../../../test-extensions");
 
-  console.log("[ExtensionHost] Ready");
+  console.log(`[ExtensionHost] Scanning extensions in: ${extensionsDir}`);
+  await extensionLoader.scanAndActivate(extensionsDir);
+
+  const active = extensionLoader.getActiveExtensions();
+  console.log(
+    `[ExtensionHost] Ready — ${active.length} extension(s) active: ${active.join(", ") || "none"}`
+  );
 
   // Keep process alive
   process.on("SIGTERM", async () => {

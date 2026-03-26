@@ -152,8 +152,122 @@ body {
   user-select: none;
 }
 
+#diagnostics-count {
+  color: #f38ba8;
+}
+
 #ext-host-status {
   margin-left: auto;
+}
+
+#ext-host-status.connected {
+  color: #a6e3a1;
+}
+
+/* Diagnostic underlines */
+.diag-error {
+  text-decoration: wavy underline #f38ba8;
+  text-underline-offset: 3px;
+}
+
+.diag-warning {
+  text-decoration: wavy underline #fab387;
+  text-underline-offset: 3px;
+}
+
+.diag-info {
+  text-decoration: wavy underline #89b4fa;
+  text-underline-offset: 3px;
+}
+
+.diag-hint {
+  text-decoration: wavy underline #a6e3a1;
+  text-underline-offset: 3px;
+}
+
+/* Diagnostic gutter markers */
+.gutter-error {
+  color: #f38ba8;
+}
+
+.gutter-warning {
+  color: #fab387;
+}
+
+/* Command Palette */
+.palette-hidden {
+  display: none !important;
+}
+
+#command-palette {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+#palette-backdrop {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.4);
+}
+
+#palette-panel {
+  position: relative;
+  margin-top: 60px;
+  width: 500px;
+  max-width: 90vw;
+  background: var(--bg-titlebar);
+  border: 1px solid #45475a;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+#palette-input {
+  width: 100%;
+  padding: 10px 16px;
+  background: var(--bg);
+  border: none;
+  border-bottom: 1px solid #313244;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 14px;
+  outline: none;
+}
+
+#palette-input::placeholder {
+  color: var(--fg-dim);
+}
+
+#palette-list {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.palette-item {
+  padding: 8px 16px;
+  cursor: pointer;
+  color: var(--fg);
+  font-size: 13px;
+}
+
+.palette-item:hover,
+.palette-item.selected {
+  background: #313244;
+}
+
+.palette-item .palette-label {
+  color: var(--accent);
+  margin-right: 8px;
 }
 
 /* Scrollbar */

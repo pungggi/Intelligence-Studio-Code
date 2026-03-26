@@ -1,8 +1,11 @@
 /**
- * CoreCode M1 — Editor Frontend
+ * CoreCode M2 — Editor Frontend
  *
- * Lightweight editor UI that communicates with the Tauri/Rust backend
- * for text editing and syntax highlighting.
+ * Features:
+ * - Text editing with syntax highlighting
+ * - Diagnostics display (underlines + gutter markers)
+ * - Command palette (Ctrl+Shift+P)
+ * - Extension Host status
  */
 
 const { invoke } = window.__TAURI__.core;
@@ -13,6 +16,11 @@ let cursorCol = 0;
 let lines = [];
 let filePath = null;
 let modified = false;
+let diagnostics = [];
+let paletteOpen = false;
+let paletteSelectedIndex = 0;
+let paletteCommands = [];
+let paletteFiltered = [];
 
 // --- DOM ---
 const editorEl = document.getElementById('editor');
@@ -22,6 +30,12 @@ const languageBadgeEl = document.getElementById('language-badge');
 const cursorPosEl = document.getElementById('cursor-pos');
 const fileInfoEl = document.getElementById('file-info');
 const statusEl = document.getElementById('status');
+const diagCountEl = document.getElementById('diagnostics-count');
+const extHostStatusEl = document.getElementById('ext-host-status');
+const paletteEl = document.getElementById('command-palette');
+const paletteInputEl = document.getElementById('palette-input');
+const paletteListEl = document.getElementById('palette-list');
+const paletteBackdropEl = document.getElementById('palette-backdrop');
 
 // --- Rendering ---
 
@@ -29,6 +43,7 @@ function renderContent(content) {
   lines = content.lines || [];
   filePath = content.file_path;
   modified = content.modified;
+  diagnostics = content.diagnostics || [];
 
   // Title
   if (filePath) {
@@ -49,26 +64,53 @@ function renderContent(content) {
   // File info
   fileInfoEl.textContent = `${content.line_count} lines`;
 
+  // Diagnostics count
+  const errorCount = diagnostics.filter(d => d.severity === 'error').length;
+  const warnCount = diagnostics.filter(d => d.severity === 'warning').length;
+  if (errorCount || warnCount) {
+    const parts = [];
+    if (errorCount) parts.push(`${errorCount} error${errorCount > 1 ? 's' : ''}`);
+    if (warnCount) parts.push(`${warnCount} warning${warnCount > 1 ? 's' : ''}`);
+    diagCountEl.textContent = parts.join(', ');
+  } else {
+    diagCountEl.textContent = '';
+  }
+
+  // Build a map of diagnostics per line
+  const diagsByLine = new Map();
+  for (const d of diagnostics) {
+    if (!diagsByLine.has(d.line)) diagsByLine.set(d.line, []);
+    diagsByLine.get(d.line).push(d);
+  }
+
   // Editor lines
   editorEl.innerHTML = '';
   gutterEl.innerHTML = '';
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    const lineDiags = diagsByLine.get(i) || [];
 
     // Gutter line number
     const gutterLine = document.createElement('div');
     gutterLine.className = 'line';
+    if (lineDiags.some(d => d.severity === 'error')) {
+      gutterLine.classList.add('gutter-error');
+    } else if (lineDiags.some(d => d.severity === 'warning')) {
+      gutterLine.classList.add('gutter-warning');
+    }
     gutterLine.textContent = String(i + 1);
     gutterEl.appendChild(gutterLine);
 
-    // Editor line with syntax highlighting
+    // Editor line with syntax highlighting + diagnostics
     const editorLine = document.createElement('div');
     editorLine.className = 'line';
     editorLine.dataset.line = i;
 
     if (line.tokens && line.tokens.length > 0) {
-      editorLine.innerHTML = applyTokens(line.text, line.tokens);
+      editorLine.innerHTML = applyTokensAndDiags(line.text, line.tokens, lineDiags);
+    } else if (lineDiags.length > 0) {
+      editorLine.innerHTML = applyDiags(line.text || '', lineDiags);
     } else {
       editorLine.textContent = line.text || '';
     }
@@ -76,33 +118,54 @@ function renderContent(content) {
     editorEl.appendChild(editorLine);
   }
 
-  // Render cursor
   renderCursor();
   updateStatusBar();
 }
 
-function applyTokens(text, tokens) {
+function applyTokensAndDiags(text, tokens, diags) {
   if (!text) return '';
 
+  // First apply tokens, then wrap diagnostic ranges
   let html = '';
   let lastEnd = 0;
 
   for (const token of tokens) {
-    // Gap before this token
     if (token.start > lastEnd) {
-      html += escapeHtml(text.substring(lastEnd, token.start));
+      html += wrapDiagSpans(escapeHtml(text.substring(lastEnd, token.start)), lastEnd, token.start, diags);
     }
-
     const tokenText = text.substring(token.start, token.end);
-    html += `<span class="tok-${token.kind}">${escapeHtml(tokenText)}</span>`;
+    const diagClass = getDiagClass(token.start, token.end, diags);
+    html += `<span class="tok-${token.kind}${diagClass ? ' ' + diagClass : ''}">${escapeHtml(tokenText)}</span>`;
     lastEnd = token.end;
   }
 
-  // Remaining text
   if (lastEnd < text.length) {
-    html += escapeHtml(text.substring(lastEnd));
+    html += wrapDiagSpans(escapeHtml(text.substring(lastEnd)), lastEnd, text.length, diags);
   }
 
+  return html;
+}
+
+function applyDiags(text, diags) {
+  if (!diags.length) return escapeHtml(text);
+  return wrapDiagSpans(escapeHtml(text), 0, text.length, diags);
+}
+
+function getDiagClass(start, end, diags) {
+  for (const d of diags) {
+    if (d.col_start < end && d.col_end > start) {
+      return `diag-${d.severity}`;
+    }
+  }
+  return '';
+}
+
+function wrapDiagSpans(html, textStart, textEnd, diags) {
+  for (const d of diags) {
+    if (d.col_start < textEnd && d.col_end > textStart) {
+      return `<span class="diag-${d.severity}">${html}</span>`;
+    }
+  }
   return html;
 }
 
@@ -114,7 +177,6 @@ function escapeHtml(text) {
 }
 
 function renderCursor() {
-  // Remove existing cursor
   const existing = document.querySelector('.cursor');
   if (existing) existing.remove();
 
@@ -123,9 +185,7 @@ function renderCursor() {
 
   const lineEl = lineEls[cursorLine];
   const lineRect = lineEl.getBoundingClientRect();
-  const editorRect = editorEl.getBoundingClientRect();
 
-  // Approximate character width (monospace)
   const charWidth = measureCharWidth();
   const lineHeight = lineRect.height;
 
@@ -165,9 +225,145 @@ function updateStatusBar() {
   cursorPosEl.textContent = `Ln ${cursorLine + 1}, Col ${cursorCol + 1}`;
 }
 
+// --- Command Palette ---
+
+function openPalette() {
+  paletteOpen = true;
+  paletteEl.classList.remove('palette-hidden');
+  paletteInputEl.value = '';
+  paletteSelectedIndex = 0;
+
+  // Fetch commands from backend
+  invoke('list_commands').then(cmds => {
+    paletteCommands = cmds || [];
+    filterPalette('');
+    paletteInputEl.focus();
+  });
+}
+
+function closePalette() {
+  paletteOpen = false;
+  paletteEl.classList.add('palette-hidden');
+  editorEl.focus();
+}
+
+function filterPalette(query) {
+  const q = query.toLowerCase();
+  paletteFiltered = q
+    ? paletteCommands.filter(c => c.toLowerCase().includes(q))
+    : paletteCommands.slice();
+
+  // Always add built-in commands
+  const builtins = [
+    { label: 'Open File', command: '__builtin:open' },
+    { label: 'Save File', command: '__builtin:save' },
+  ].filter(b => !q || b.label.toLowerCase().includes(q));
+
+  renderPaletteList(builtins);
+}
+
+function renderPaletteList(builtins) {
+  paletteListEl.innerHTML = '';
+
+  // Built-in commands first
+  for (let i = 0; i < builtins.length; i++) {
+    const item = document.createElement('div');
+    item.className = 'palette-item' + (i === paletteSelectedIndex ? ' selected' : '');
+    item.innerHTML = `<span class="palette-label">Built-in</span>${escapeHtml(builtins[i].label)}`;
+    const cmd = builtins[i].command;
+    item.addEventListener('click', () => executePaletteCommand(cmd));
+    paletteListEl.appendChild(item);
+  }
+
+  // Extension commands
+  for (let i = 0; i < paletteFiltered.length; i++) {
+    const idx = builtins.length + i;
+    const item = document.createElement('div');
+    item.className = 'palette-item' + (idx === paletteSelectedIndex ? ' selected' : '');
+    item.innerHTML = `<span class="palette-label">Extension</span>${escapeHtml(paletteFiltered[i])}`;
+    const cmd = paletteFiltered[i];
+    item.addEventListener('click', () => executePaletteCommand(cmd));
+    paletteListEl.appendChild(item);
+  }
+
+  if (!builtins.length && !paletteFiltered.length) {
+    const empty = document.createElement('div');
+    empty.className = 'palette-item';
+    empty.textContent = 'No commands found';
+    paletteListEl.appendChild(empty);
+  }
+}
+
+async function executePaletteCommand(command) {
+  closePalette();
+
+  if (command === '__builtin:open') {
+    await openFileDialog();
+  } else if (command === '__builtin:save') {
+    await saveFile();
+  } else {
+    await invoke('execute_command', { command });
+    // Refresh diagnostics after command execution
+    setTimeout(refreshDiagnostics, 500);
+  }
+}
+
+paletteInputEl.addEventListener('input', () => {
+  paletteSelectedIndex = 0;
+  filterPalette(paletteInputEl.value);
+});
+
+paletteInputEl.addEventListener('keydown', (e) => {
+  const total = paletteListEl.children.length;
+
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    paletteSelectedIndex = Math.min(paletteSelectedIndex + 1, total - 1);
+    updatePaletteSelection();
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    paletteSelectedIndex = Math.max(paletteSelectedIndex - 1, 0);
+    updatePaletteSelection();
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    const items = paletteListEl.querySelectorAll('.palette-item');
+    if (items[paletteSelectedIndex]) {
+      items[paletteSelectedIndex].click();
+    }
+  } else if (e.key === 'Escape') {
+    closePalette();
+  }
+});
+
+paletteBackdropEl.addEventListener('click', closePalette);
+
+function updatePaletteSelection() {
+  const items = paletteListEl.querySelectorAll('.palette-item');
+  items.forEach((el, i) => {
+    el.classList.toggle('selected', i === paletteSelectedIndex);
+  });
+}
+
 // --- Keyboard Input ---
 
-editorEl.addEventListener('keydown', async (e) => {
+document.addEventListener('keydown', async (e) => {
+  // Ctrl+Shift+P: Command Palette
+  if (e.ctrlKey && e.shiftKey && e.key === 'P') {
+    e.preventDefault();
+    if (paletteOpen) {
+      closePalette();
+    } else {
+      openPalette();
+    }
+    return;
+  }
+
+  // Don't handle editor keys when palette is open
+  if (paletteOpen) return;
+
+  // Only handle editor keys when editor is focused
+  if (document.activeElement !== editorEl) return;
+
   // Navigation
   if (e.key === 'ArrowUp') {
     e.preventDefault();
@@ -360,6 +556,39 @@ async function saveFile() {
   }
 }
 
+// --- Diagnostics polling ---
+
+async function refreshDiagnostics() {
+  try {
+    const content = await invoke('get_content');
+    renderContent(content);
+  } catch (err) {
+    // Ignore
+  }
+}
+
+// Poll diagnostics every 2 seconds (Extension Host may push new ones)
+setInterval(refreshDiagnostics, 2000);
+
+// --- Extension Host status polling ---
+
+async function pollExtHostStatus() {
+  try {
+    const status = await invoke('get_ext_host_status');
+    if (status.running) {
+      extHostStatusEl.textContent = `Extension Host: Connected (${status.commands.length} commands)`;
+      extHostStatusEl.classList.add('connected');
+    } else {
+      extHostStatusEl.textContent = 'Extension Host: Disconnected';
+      extHostStatusEl.classList.remove('connected');
+    }
+  } catch (err) {
+    extHostStatusEl.textContent = 'Extension Host: Error';
+  }
+}
+
+setInterval(pollExtHostStatus, 3000);
+
 // --- Init ---
 
 async function init() {
@@ -367,7 +596,8 @@ async function init() {
     const content = await invoke('get_content');
     renderContent(content);
     editorEl.focus();
-    statusEl.textContent = 'Ready — Ctrl+O to open a file';
+    statusEl.textContent = 'Ready — Ctrl+O to open, Ctrl+Shift+P for commands';
+    pollExtHostStatus();
   } catch (err) {
     console.error('Init error:', err);
     statusEl.textContent = `Error: ${err}`;
@@ -379,7 +609,6 @@ if (window.__TAURI__) {
   init();
 } else {
   window.addEventListener('DOMContentLoaded', () => {
-    // Retry after a short delay if Tauri isn't ready
     setTimeout(init, 100);
   });
 }

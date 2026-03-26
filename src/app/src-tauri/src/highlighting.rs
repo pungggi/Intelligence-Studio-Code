@@ -6,8 +6,6 @@
 use crate::Token;
 use ropey::Rope;
 
-pub use crate::HighlightedLine;
-
 /// Extract highlight tokens for a specific line from the syntax tree.
 pub fn highlight_line(tree: &tree_sitter::Tree, rope: &Rope, line_idx: usize) -> Vec<Token> {
     let root = tree.root_node();
