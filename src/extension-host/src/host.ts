@@ -12,19 +12,19 @@ import { ExtensionLoader } from "./extension-loader";
 import { IpcServer } from "./ipc-server";
 import { VscodeApiShim } from "./vscode-api-shim";
 
-const SOCKET_PATH =
-  process.env.CORECODE_SOCKET ?? "/tmp/corecode-ext-host.sock";
+const IPC_HOST = process.env.CORECODE_IPC_HOST ?? "127.0.0.1";
+const IPC_PORT = parseInt(process.env.CORECODE_IPC_PORT ?? "17532", 10);
 
 async function main(): Promise<void> {
   console.log("[ExtensionHost] Starting...");
 
   const apiShim = new VscodeApiShim();
   const extensionLoader = new ExtensionLoader(apiShim);
-  const ipcServer = new IpcServer(SOCKET_PATH);
+  const ipcServer = new IpcServer(IPC_HOST, IPC_PORT);
 
   // Start IPC server and wait for frontend connection
   await ipcServer.start();
-  console.log(`[ExtensionHost] IPC server listening on ${SOCKET_PATH}`);
+  console.log(`[ExtensionHost] IPC server listening on ${IPC_HOST}:${IPC_PORT}`);
 
   // Forward IPC messages to the API shim
   ipcServer.onMessage((msg) => {

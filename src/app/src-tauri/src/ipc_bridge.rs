@@ -1,6 +1,7 @@
 //! IPC Bridge — Async communication with the Node.js Extension Host.
 //!
-//! Uses Unix Domain Sockets with length-prefixed JSON messages.
+//! Uses TCP on localhost with length-prefixed JSON messages.
+//! Cross-platform (Linux, macOS, Windows).
 //! Runs on a dedicated Tokio runtime in a background thread.
 
 use anyhow::Result;
@@ -8,10 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-const SOCKET_PATH: &str = "/tmp/corecode-ext-host.sock";
+const IPC_HOST: &str = "127.0.0.1";
+const IPC_PORT: u16 = 17532;
 
 /// A diagnostic from the Extension Host (e.g., ESLint error).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,10 +133,12 @@ async fn ipc_loop(
     connected: Arc<Mutex<bool>>,
     commands: Arc<Mutex<Vec<String>>>,
 ) {
-    loop {
-        log::info!("[IPC] Connecting to Extension Host at {}...", SOCKET_PATH);
+    let addr = format!("{}:{}", IPC_HOST, IPC_PORT);
 
-        match UnixStream::connect(SOCKET_PATH).await {
+    loop {
+        log::info!("[IPC] Connecting to Extension Host at {}...", addr);
+
+        match TcpStream::connect(&addr).await {
             Ok(stream) => {
                 *connected.lock().unwrap() = true;
                 log::info!("[IPC] Connected to Extension Host");
@@ -155,7 +159,7 @@ async fn ipc_loop(
 }
 
 async fn handle_connection(
-    stream: UnixStream,
+    stream: TcpStream,
     rx: &mut mpsc::Receiver<OutgoingMessage>,
     diagnostics: &Arc<Mutex<Vec<Diagnostic>>>,
     commands: &Arc<Mutex<Vec<String>>>,

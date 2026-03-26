@@ -1,12 +1,15 @@
 /**
- * IPC Server - Unix Domain Socket server for communication with the native frontend.
+ * IPC Server - TCP server for communication with the native frontend.
  *
+ * Cross-platform: uses TCP on localhost instead of Unix Domain Sockets.
  * Protocol: Length-prefixed JSON frames.
  * Each frame is [4 bytes LE length][JSON payload].
  */
 
 import { createServer, Server, Socket } from "net";
-import { unlinkSync, existsSync } from "fs";
+
+const IPC_HOST = "127.0.0.1";
+const IPC_PORT = 17532;
 
 export interface IpcMessage {
   method: string;
@@ -20,22 +23,22 @@ export class IpcServer {
   private client: Socket | null = null;
   private messageHandler: MessageHandler | null = null;
   private buffer: Buffer = Buffer.alloc(0);
+  private host: string;
+  private port: number;
 
-  constructor(private socketPath: string) {}
+  constructor(host?: string, port?: number) {
+    this.host = host ?? IPC_HOST;
+    this.port = port ?? IPC_PORT;
+  }
 
   async start(): Promise<void> {
-    // Clean up stale socket file
-    if (existsSync(this.socketPath)) {
-      unlinkSync(this.socketPath);
-    }
-
     return new Promise((resolve, reject) => {
       this.server = createServer((socket) => {
         console.log("[IPC] Frontend connected");
         this.client = socket;
         this.buffer = Buffer.alloc(0);
 
-        socket.on("data", (data) => {
+        socket.on("data", (data: Buffer) => {
           this.onData(data);
         });
 
@@ -44,12 +47,12 @@ export class IpcServer {
           this.client = null;
         });
 
-        socket.on("error", (err) => {
+        socket.on("error", (err: Error) => {
           console.error("[IPC] Socket error:", err.message);
         });
       });
 
-      this.server.listen(this.socketPath, () => {
+      this.server.listen(this.port, this.host, () => {
         resolve();
       });
 
@@ -101,9 +104,6 @@ export class IpcServer {
     this.client?.destroy();
     return new Promise((resolve) => {
       this.server?.close(() => {
-        if (existsSync(this.socketPath)) {
-          unlinkSync(this.socketPath);
-        }
         resolve();
       });
     });
