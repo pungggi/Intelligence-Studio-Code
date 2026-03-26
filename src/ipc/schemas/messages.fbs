@@ -1,0 +1,131 @@
+// CoreCode IPC Protocol - FlatBuffers Schema
+//
+// Defines the binary message format for communication between
+// the native frontend (Rust) and the Extension Host (Node.js).
+
+namespace corecode.ipc;
+
+// --- Enums ---
+
+enum MessageType : byte {
+  // Text document sync
+  TextDocumentDidOpen = 0,
+  TextDocumentDidChange = 1,
+  TextDocumentDidClose = 2,
+
+  // Diagnostics
+  PublishDiagnostics = 10,
+
+  // Commands
+  ExecuteCommand = 20,
+  RegisterCommand = 21,
+
+  // Notifications (window messages)
+  ShowNotification = 30,
+
+  // Completions
+  RequestCompletions = 40,
+  CompletionResponse = 41,
+
+  // Hover
+  RequestHover = 50,
+  HoverResponse = 51,
+}
+
+enum DiagnosticSeverity : byte {
+  Error = 0,
+  Warning = 1,
+  Information = 2,
+  Hint = 3,
+}
+
+enum NotificationLevel : byte {
+  Info = 0,
+  Warning = 1,
+  Error = 2,
+}
+
+// --- Position & Range ---
+
+struct Position {
+  line: uint32;
+  character: uint32;  // UTF-16 offset (LSP compatible)
+}
+
+struct Range {
+  start: Position;
+  end: Position;
+}
+
+// --- Text Document Sync ---
+
+table TextDocumentDidOpenMsg {
+  uri: string;
+  language_id: string;
+  version: uint32;
+  text: string;
+}
+
+table TextChange {
+  range: Range;
+  text: string;
+}
+
+table TextDocumentDidChangeMsg {
+  uri: string;
+  version: uint32;
+  changes: [TextChange];
+}
+
+table TextDocumentDidCloseMsg {
+  uri: string;
+}
+
+// --- Diagnostics ---
+
+table Diagnostic {
+  range: Range;
+  severity: DiagnosticSeverity;
+  message: string;
+  source: string;
+  code: string;
+}
+
+table PublishDiagnosticsMsg {
+  uri: string;
+  diagnostics: [Diagnostic];
+}
+
+// --- Commands ---
+
+table ExecuteCommandMsg {
+  command: string;
+  arguments: string;  // JSON-encoded arguments
+}
+
+// --- Notifications ---
+
+table ShowNotificationMsg {
+  level: NotificationLevel;
+  message: string;
+  actions: [string];
+}
+
+// --- Top-level Message Envelope ---
+
+union MessageBody {
+  TextDocumentDidOpenMsg,
+  TextDocumentDidChangeMsg,
+  TextDocumentDidCloseMsg,
+  PublishDiagnosticsMsg,
+  ExecuteCommandMsg,
+  ShowNotificationMsg,
+}
+
+table Message {
+  id: uint64;
+  type: MessageType;
+  body: MessageBody;
+}
+
+root_type Message;

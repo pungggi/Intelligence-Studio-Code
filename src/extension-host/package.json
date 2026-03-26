@@ -1,0 +1,19 @@
+{
+  "name": "corecode-extension-host",
+  "version": "0.1.0",
+  "description": "CoreCode Extension Host - VS Code extension runtime",
+  "main": "dist/host.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/host.js",
+    "test": "node --test src/**/*.test.ts"
+  },
+  "dependencies": {
+    "flatbuffers": "^24.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}
