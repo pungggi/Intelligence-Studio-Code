@@ -1,14 +1,13 @@
 /**
  * VS Code API Shim - Provides a compatible `vscode` namespace to extensions.
  *
- * This is the core compatibility layer. Extensions call `vscode.xyz()` and
- * this shim translates those calls into IPC messages for the native frontend.
- *
- * M2 implements:
- * - vscode.workspace.textDocuments / onDidOpenTextDocument / onDidChangeTextDocument
+ * M3 implements:
+ * - vscode.workspace.textDocuments / onDidOpenTextDocument / onDidChangeTextDocument / onDidCloseTextDocument
+ * - vscode.workspace.getConfiguration (reads contributes.configuration from extensions)
  * - vscode.languages.createDiagnosticCollection
  * - vscode.commands.registerCommand / executeCommand
  * - vscode.window.showInformationMessage / showWarningMessage / showErrorMessage
+ * - vscode.window.showQuickPick / showInputBox
  */
 
 import type { IpcMessage } from "./ipc-server";
@@ -31,7 +30,11 @@ class EventEmitter<T> {
 
   fire(data: T): void {
     for (const listener of this.listeners) {
-      listener(data);
+      try {
+        listener(data);
+      } catch (err) {
+        console.error("[ApiShim] Event listener error:", err);
+      }
     }
   }
 }
@@ -53,18 +56,18 @@ function createTextDocument(
   version: number,
   text: string
 ): TextDocument {
-  let content = text;
+  const content = text;
+  const lineCache = content.split("\n");
   return {
     uri,
     languageId,
     version,
     getText: () => content,
     get lineCount() {
-      return content.split("\n").length;
+      return lineCache.length;
     },
     lineAt(line: number) {
-      const lines = content.split("\n");
-      return { text: lines[line] ?? "" };
+      return { text: lineCache[line] ?? "" };
     },
   };
 }
@@ -96,6 +99,38 @@ export interface DiagnosticCollection {
   dispose(): void;
 }
 
+// --- QuickPick / InputBox types ---
+
+export interface QuickPickItem {
+  label: string;
+  description?: string;
+  detail?: string;
+  picked?: boolean;
+}
+
+export interface QuickPickOptions {
+  placeHolder?: string;
+  title?: string;
+  canPickMany?: boolean;
+}
+
+export interface InputBoxOptions {
+  prompt?: string;
+  placeHolder?: string;
+  value?: string;
+  title?: string;
+  password?: boolean;
+  validateInput?: (value: string) => string | undefined | null;
+}
+
+// --- Configuration ---
+
+interface ConfigurationSection {
+  get<T>(key: string, defaultValue?: T): T | undefined;
+  has(key: string): boolean;
+  update(key: string, value: unknown): Promise<void>;
+}
+
 // --- Main Shim ---
 
 export type OutgoingCallback = (msg: IpcMessage) => void;
@@ -109,11 +144,36 @@ export class VscodeApiShim {
   private documents = new Map<string, TextDocument>();
   private diagnosticCollections: DiagnosticCollection[] = [];
 
+  /** Configuration defaults from extension contributes.configuration */
+  private configDefaults = new Map<string, unknown>();
+  /** Runtime configuration overrides */
+  private configOverrides = new Map<string, unknown>();
+
+  /** Pending QuickPick/InputBox requests waiting for frontend response */
+  private pendingUiRequests = new Map<
+    string,
+    { resolve: (value: unknown) => void; reject: (err: Error) => void }
+  >();
+  private uiRequestId = 0;
+
   // Events
   private _onDidOpenTextDocument = new EventEmitter<TextDocument>();
   private _onDidChangeTextDocument =
     new EventEmitter<{ document: TextDocument }>();
   private _onDidCloseTextDocument = new EventEmitter<TextDocument>();
+
+  /**
+   * Register configuration defaults from an extension's package.json.
+   */
+  registerConfigurationDefaults(
+    properties: Record<string, { default?: unknown }>
+  ): void {
+    for (const [key, schema] of Object.entries(properties)) {
+      if (schema.default !== undefined) {
+        this.configDefaults.set(key, schema.default);
+      }
+    }
+  }
 
   /**
    * Handle a message from the native frontend (via IPC).
@@ -143,6 +203,17 @@ export class VscodeApiShim {
           params: { commands: Array.from(this.registeredCommands.keys()) },
         });
         break;
+      case "quickPickResponse":
+      case "inputBoxResponse": {
+        const p = msg.params as Record<string, unknown>;
+        const reqId = p.requestId as string;
+        const pending = this.pendingUiRequests.get(reqId);
+        if (pending) {
+          this.pendingUiRequests.delete(reqId);
+          pending.resolve(p.value ?? undefined);
+        }
+        break;
+      }
       default:
         console.log(`[ApiShim] Unknown method: ${msg.method}`);
     }
@@ -157,7 +228,7 @@ export class VscodeApiShim {
     );
     this.documents.set(params.uri, doc);
     this._onDidOpenTextDocument.fire(doc);
-    console.log(`[ApiShim] Document opened: ${params.uri}`);
+    console.log(`[ApiShim] Document opened: ${params.uri} (lang: ${doc.languageId})`);
   }
 
   private handleDidChange(params: {
@@ -168,7 +239,6 @@ export class VscodeApiShim {
     const existing = this.documents.get(params.uri);
     if (!existing) return;
 
-    // Create updated document
     const doc = createTextDocument(
       params.uri,
       existing.languageId,
@@ -184,6 +254,7 @@ export class VscodeApiShim {
     if (doc) {
       this.documents.delete(params.uri);
       this._onDidCloseTextDocument.fire(doc);
+      console.log(`[ApiShim] Document closed: ${params.uri}`);
     }
   }
 
@@ -208,13 +279,29 @@ export class VscodeApiShim {
       onDidOpenTextDocument: self._onDidOpenTextDocument.event,
       onDidChangeTextDocument: self._onDidChangeTextDocument.event,
       onDidCloseTextDocument: self._onDidCloseTextDocument.event,
-      getConfiguration(_section?: string) {
+      getConfiguration(section?: string): ConfigurationSection {
         return {
-          get<T>(_key: string, defaultValue?: T): T | undefined {
+          get<T>(key: string, defaultValue?: T): T | undefined {
+            const fullKey = section ? `${section}.${key}` : key;
+            // Check overrides first, then defaults
+            if (self.configOverrides.has(fullKey)) {
+              return self.configOverrides.get(fullKey) as T;
+            }
+            if (self.configDefaults.has(fullKey)) {
+              return self.configDefaults.get(fullKey) as T;
+            }
             return defaultValue;
           },
-          has(_key: string): boolean {
-            return false;
+          has(key: string): boolean {
+            const fullKey = section ? `${section}.${key}` : key;
+            return (
+              self.configOverrides.has(fullKey) ||
+              self.configDefaults.has(fullKey)
+            );
+          },
+          async update(key: string, value: unknown): Promise<void> {
+            const fullKey = section ? `${section}.${key}` : key;
+            self.configOverrides.set(fullKey, value);
           },
         };
       },
@@ -231,7 +318,6 @@ export class VscodeApiShim {
         callback: (...args: unknown[]) => unknown
       ): { dispose: () => void } {
         self.registeredCommands.set(command, callback);
-        // Notify frontend of updated command list
         self.sendOutgoing({
           method: "registeredCommands",
           params: { commands: Array.from(self.registeredCommands.keys()) },
@@ -311,7 +397,7 @@ export class VscodeApiShim {
       col_end: d.range.end.character,
       severity: severityToString(d.severity),
       message: d.message,
-      source,
+      source: d.source ?? source,
     }));
 
     this.sendOutgoing({
@@ -323,12 +409,17 @@ export class VscodeApiShim {
   // --- vscode.window ---
 
   get window() {
+    const self = this;
     return {
       async showInformationMessage(
         message: string,
         ...items: string[]
       ): Promise<string | undefined> {
         console.log(`[INFO] ${message}`);
+        self.sendOutgoing({
+          method: "showMessage",
+          params: { type: "info", message, items },
+        });
         return items[0];
       },
       async showWarningMessage(
@@ -336,6 +427,10 @@ export class VscodeApiShim {
         ...items: string[]
       ): Promise<string | undefined> {
         console.log(`[WARN] ${message}`);
+        self.sendOutgoing({
+          method: "showMessage",
+          params: { type: "warning", message, items },
+        });
         return items[0];
       },
       async showErrorMessage(
@@ -343,7 +438,79 @@ export class VscodeApiShim {
         ...items: string[]
       ): Promise<string | undefined> {
         console.log(`[ERROR] ${message}`);
+        self.sendOutgoing({
+          method: "showMessage",
+          params: { type: "error", message, items },
+        });
         return items[0];
+      },
+      async showQuickPick(
+        items: string[] | QuickPickItem[],
+        options?: QuickPickOptions
+      ): Promise<string | QuickPickItem | undefined> {
+        const requestId = String(++self.uiRequestId);
+
+        // Normalize items to QuickPickItem format
+        const normalizedItems: QuickPickItem[] = (items as unknown[]).map(
+          (item) =>
+            typeof item === "string" ? { label: item } : (item as QuickPickItem)
+        );
+
+        self.sendOutgoing({
+          method: "showQuickPick",
+          params: {
+            requestId,
+            items: normalizedItems,
+            placeHolder: options?.placeHolder,
+            title: options?.title,
+          },
+        });
+
+        return new Promise((resolve, reject) => {
+          self.pendingUiRequests.set(requestId, {
+            resolve: resolve as (value: unknown) => void,
+            reject,
+          });
+
+          // Timeout after 60 seconds
+          setTimeout(() => {
+            if (self.pendingUiRequests.has(requestId)) {
+              self.pendingUiRequests.delete(requestId);
+              resolve(undefined);
+            }
+          }, 60000);
+        });
+      },
+      async showInputBox(
+        options?: InputBoxOptions
+      ): Promise<string | undefined> {
+        const requestId = String(++self.uiRequestId);
+
+        self.sendOutgoing({
+          method: "showInputBox",
+          params: {
+            requestId,
+            prompt: options?.prompt,
+            placeHolder: options?.placeHolder,
+            value: options?.value,
+            title: options?.title,
+            password: options?.password ?? false,
+          },
+        });
+
+        return new Promise((resolve, reject) => {
+          self.pendingUiRequests.set(requestId, {
+            resolve: resolve as (value: unknown) => void,
+            reject,
+          });
+
+          setTimeout(() => {
+            if (self.pendingUiRequests.has(requestId)) {
+              self.pendingUiRequests.delete(requestId);
+              resolve(undefined);
+            }
+          }, 60000);
+        });
       },
     };
   }

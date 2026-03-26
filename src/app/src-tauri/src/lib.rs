@@ -171,6 +171,29 @@ fn list_commands(state: tauri::State<AppState>) -> Result<Vec<String>, String> {
     Ok(state.ipc.get_commands())
 }
 
+#[tauri::command]
+fn get_notifications(state: tauri::State<AppState>) -> Result<Vec<ipc_bridge::Notification>, String> {
+    Ok(state.ipc.drain_notifications())
+}
+
+#[tauri::command]
+fn get_ui_requests(state: tauri::State<AppState>) -> Result<Vec<ipc_bridge::UiRequest>, String> {
+    Ok(state.ipc.drain_ui_requests())
+}
+
+#[tauri::command]
+fn respond_ui_request(
+    request_id: String,
+    value: Option<serde_json::Value>,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    state.ipc.send(OutgoingMessage::UiResponse {
+        request_id,
+        value,
+    });
+    Ok(())
+}
+
 /// Notify Extension Host of text changes.
 fn notify_change(editor: &EditorState, ipc: &IpcHandle) {
     if let Some(path) = editor.file_path_str() {
@@ -242,6 +265,9 @@ pub fn run() {
             get_ext_host_status,
             execute_command,
             list_commands,
+            get_notifications,
+            get_ui_requests,
+            respond_ui_request,
         ])
         .setup(|app| {
             log::info!("CoreCode M2 starting...");

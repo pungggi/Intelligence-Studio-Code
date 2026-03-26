@@ -70,6 +70,11 @@ pub enum OutgoingMessage {
     ExecuteCommand { command: String, args: Vec<serde_json::Value> },
     #[serde(rename = "listCommands")]
     ListCommands,
+    #[serde(rename = "quickPickResponse")]
+    UiResponse {
+        request_id: String,
+        value: Option<serde_json::Value>,
+    },
 }
 
 /// Messages received from the Extension Host.
@@ -87,6 +92,22 @@ fn lock_or_default<T: Default>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T>
     })
 }
 
+/// A notification message from the Extension Host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Notification {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub message: String,
+}
+
+/// A QuickPick or InputBox request from the Extension Host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiRequest {
+    pub kind: String,
+    pub request_id: String,
+    pub params: serde_json::Value,
+}
+
 /// Handle to the IPC bridge for sending messages.
 #[derive(Clone)]
 pub struct IpcHandle {
@@ -94,6 +115,8 @@ pub struct IpcHandle {
     diagnostics: Arc<Mutex<Vec<Diagnostic>>>,
     connected: Arc<Mutex<bool>>,
     commands: Arc<Mutex<Vec<String>>>,
+    notifications: Arc<Mutex<Vec<Notification>>>,
+    ui_requests: Arc<Mutex<Vec<UiRequest>>>,
 }
 
 impl IpcHandle {
@@ -124,6 +147,18 @@ impl IpcHandle {
     pub fn get_commands(&self) -> Vec<String> {
         lock_or_default(&self.commands).clone()
     }
+
+    /// Drain all pending notifications (returns and clears them).
+    pub fn drain_notifications(&self) -> Vec<Notification> {
+        let mut store = lock_or_default(&self.notifications);
+        std::mem::take(&mut *store)
+    }
+
+    /// Drain all pending UI requests (QuickPick/InputBox).
+    pub fn drain_ui_requests(&self) -> Vec<UiRequest> {
+        let mut store = lock_or_default(&self.ui_requests);
+        std::mem::take(&mut *store)
+    }
 }
 
 /// Start the IPC bridge. Returns a handle for sending messages.
@@ -133,12 +168,16 @@ pub fn start_ipc_bridge() -> IpcHandle {
     let diagnostics = Arc::new(Mutex::new(Vec::new()));
     let connected = Arc::new(Mutex::new(false));
     let commands = Arc::new(Mutex::new(Vec::new()));
+    let notifications = Arc::new(Mutex::new(Vec::new()));
+    let ui_requests = Arc::new(Mutex::new(Vec::new()));
 
     let handle = IpcHandle {
         sender: tx,
         diagnostics: diagnostics.clone(),
         connected: connected.clone(),
         commands: commands.clone(),
+        notifications: notifications.clone(),
+        ui_requests: ui_requests.clone(),
     };
 
     std::thread::Builder::new()
@@ -150,7 +189,7 @@ pub fn start_ipc_bridge() -> IpcHandle {
                 .expect("Failed to create Tokio runtime");
 
             rt.block_on(async move {
-                ipc_loop(rx, diagnostics, connected, commands).await;
+                ipc_loop(rx, diagnostics, connected, commands, notifications, ui_requests).await;
             });
         })
         .expect("Failed to spawn IPC bridge thread");
@@ -163,6 +202,8 @@ async fn ipc_loop(
     diagnostics: Arc<Mutex<Vec<Diagnostic>>>,
     connected: Arc<Mutex<bool>>,
     commands: Arc<Mutex<Vec<String>>>,
+    notifications: Arc<Mutex<Vec<Notification>>>,
+    ui_requests: Arc<Mutex<Vec<UiRequest>>>,
 ) {
     let addr = format!("{}:{}", IPC_HOST, IPC_PORT);
     let mut retry_count: u32 = 0;
@@ -187,7 +228,7 @@ async fn ipc_loop(
                 retry_count = 0;
                 delay_ms = INITIAL_RETRY_DELAY_MS;
 
-                if let Err(e) = handle_connection(stream, &mut rx, &diagnostics, &commands).await {
+                if let Err(e) = handle_connection(stream, &mut rx, &diagnostics, &commands, &notifications, &ui_requests).await {
                     log::warn!("[IPC] Connection lost: {}", e);
                 }
 
@@ -217,12 +258,16 @@ async fn handle_connection(
     rx: &mut mpsc::Receiver<OutgoingMessage>,
     diagnostics: &Arc<Mutex<Vec<Diagnostic>>>,
     commands: &Arc<Mutex<Vec<String>>>,
+    notifications: &Arc<Mutex<Vec<Notification>>>,
+    ui_requests: &Arc<Mutex<Vec<UiRequest>>>,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
 
     // Spawn reader task
     let diag_clone = diagnostics.clone();
     let cmd_clone = commands.clone();
+    let notif_clone = notifications.clone();
+    let ui_clone = ui_requests.clone();
     let mut read_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         let mut accumulated = Vec::new();
@@ -255,7 +300,7 @@ async fn handle_connection(
 
                         let payload = &accumulated[4..4 + frame_len];
                         match serde_json::from_slice::<IncomingMessage>(payload) {
-                            Ok(msg) => handle_incoming(&msg, &diag_clone, &cmd_clone),
+                            Ok(msg) => handle_incoming(&msg, &diag_clone, &cmd_clone, &notif_clone, &ui_clone),
                             Err(e) => log::warn!("[IPC] Malformed message: {}", e),
                         }
 
@@ -304,6 +349,8 @@ fn handle_incoming(
     msg: &IncomingMessage,
     diagnostics: &Arc<Mutex<Vec<Diagnostic>>>,
     commands: &Arc<Mutex<Vec<String>>>,
+    notifications: &Arc<Mutex<Vec<Notification>>>,
+    ui_requests: &Arc<Mutex<Vec<UiRequest>>>,
 ) {
     match msg.method.as_str() {
         "publishDiagnostics" => {
@@ -316,7 +363,6 @@ fn handle_incoming(
                 if let Ok(mut diags) = serde_json::from_value::<Vec<Diagnostic>>(
                     params.get("diagnostics").cloned().unwrap_or_default(),
                 ) {
-                    // Tag each diagnostic with its URI
                     for d in &mut diags {
                         if d.uri.is_none() {
                             d.uri = uri.clone();
@@ -324,7 +370,6 @@ fn handle_incoming(
                     }
 
                     let mut store = lock_or_default(diagnostics);
-                    // Replace diagnostics for this URI, keep others
                     if let Some(ref u) = uri {
                         store.retain(|d| d.uri.as_deref() != Some(u));
                     }
@@ -341,6 +386,23 @@ fn handle_incoming(
                 ) {
                     *lock_or_default(commands) = cmds;
                 }
+            }
+        }
+        "showMessage" => {
+            if let Some(params) = &msg.params {
+                let msg_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("info").to_string();
+                let message = params.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                lock_or_default(notifications).push(Notification { msg_type, message });
+            }
+        }
+        "showQuickPick" | "showInputBox" => {
+            if let Some(params) = &msg.params {
+                let request_id = params.get("requestId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                lock_or_default(ui_requests).push(UiRequest {
+                    kind: msg.method.clone(),
+                    request_id,
+                    params: params.clone(),
+                });
             }
         }
         _ => {

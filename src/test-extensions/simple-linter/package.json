@@ -1,0 +1,49 @@
+{
+  "name": "simple-linter",
+  "displayName": "CoreCode Simple Linter",
+  "description": "A simple linter that checks JavaScript/TypeScript files for common issues",
+  "version": "0.1.0",
+  "publisher": "corecode-test",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "activationEvents": [
+    "onLanguage:javascript",
+    "onLanguage:typescript",
+    "onLanguage:js",
+    "onLanguage:ts"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "simpleLinter.lint",
+        "title": "Simple Linter: Lint Current File"
+      },
+      {
+        "command": "simpleLinter.clearDiagnostics",
+        "title": "Simple Linter: Clear Diagnostics"
+      }
+    ],
+    "configuration": {
+      "title": "Simple Linter",
+      "properties": {
+        "simpleLinter.maxLineLength": {
+          "type": "number",
+          "default": 120,
+          "description": "Maximum line length before warning"
+        },
+        "simpleLinter.warnConsoleLog": {
+          "type": "boolean",
+          "default": true,
+          "description": "Warn about console.log statements"
+        },
+        "simpleLinter.warnVar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Warn about var declarations (prefer const/let)"
+        }
+      }
+    }
+  }
+}

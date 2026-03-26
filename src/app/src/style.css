@@ -270,6 +270,36 @@ body {
   margin-right: 8px;
 }
 
+/* Notification toasts */
+.toast {
+  position: fixed;
+  bottom: 40px;
+  right: 20px;
+  padding: 10px 20px;
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--fg);
+  z-index: 200;
+  animation: toast-in 0.3s ease-out;
+  max-width: 400px;
+  word-wrap: break-word;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.toast-info    { background: #313244; border-left: 3px solid #89b4fa; }
+.toast-warning { background: #313244; border-left: 3px solid #fab387; }
+.toast-error   { background: #313244; border-left: 3px solid #f38ba8; }
+
+.toast-fade {
+  opacity: 0;
+  transition: opacity 0.3s ease-out;
+}
+
+@keyframes toast-in {
+  from { transform: translateY(20px); opacity: 0; }
+  to   { transform: translateY(0); opacity: 1; }
+}
+
 /* Scrollbar */
 #editor::-webkit-scrollbar {
   width: 10px;

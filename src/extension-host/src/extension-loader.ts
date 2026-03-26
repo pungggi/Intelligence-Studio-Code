@@ -18,7 +18,13 @@ interface ExtensionManifest {
   version: string;
   main?: string;
   activationEvents?: string[];
-  contributes?: Record<string, unknown>;
+  contributes?: {
+    commands?: Array<{ command: string; title: string }>;
+    configuration?: {
+      properties?: Record<string, { type?: string; default?: unknown; description?: string }>;
+    };
+    [key: string]: unknown;
+  };
 }
 
 interface LoadedExtension {
@@ -81,6 +87,15 @@ export class ExtensionLoader {
           isActive: false,
           extensionPath: extPath,
         });
+
+        // Register configuration defaults from this extension
+        const configProps = manifest.contributes?.configuration?.properties;
+        if (configProps) {
+          this.apiShim.registerConfigurationDefaults(configProps);
+          console.log(
+            `[ExtLoader] Registered ${Object.keys(configProps).length} config defaults for ${id}`
+          );
+        }
 
         console.log(
           `[ExtLoader] Discovered: ${id} v${manifest.version}`

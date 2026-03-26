@@ -598,10 +598,183 @@ async function pollExtHostStatus() {
 
 const extHostInterval = setInterval(pollExtHostStatus, 3000);
 
+// --- Notification toasts ---
+
+async function pollNotifications() {
+  try {
+    const notifications = await invoke('get_notifications');
+    for (const n of notifications) {
+      showToast(n.type, n.message);
+    }
+  } catch (err) {
+    // Ignore
+  }
+}
+
+function showToast(type, message) {
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${type}`;
+  toast.textContent = message;
+  document.body.appendChild(toast);
+
+  // Auto-dismiss after 5 seconds
+  setTimeout(() => {
+    toast.classList.add('toast-fade');
+    setTimeout(() => toast.remove(), 300);
+  }, 5000);
+}
+
+const notifInterval = setInterval(pollNotifications, 1000);
+
+// --- QuickPick / InputBox from Extension Host ---
+
+async function pollUiRequests() {
+  try {
+    const requests = await invoke('get_ui_requests');
+    for (const req of requests) {
+      if (req.kind === 'showQuickPick') {
+        handleQuickPick(req);
+      } else if (req.kind === 'showInputBox') {
+        handleInputBox(req);
+      }
+    }
+  } catch (err) {
+    // Ignore
+  }
+}
+
+function handleQuickPick(req) {
+  const items = req.params.items || [];
+  const title = req.params.title || req.params.placeHolder || 'Select an item';
+
+  // Reuse the command palette for QuickPick
+  paletteOpen = true;
+  paletteEl.classList.remove('palette-hidden');
+  paletteInputEl.value = '';
+  paletteInputEl.placeholder = title;
+  paletteSelectedIndex = 0;
+
+  // Override palette with QuickPick items
+  const renderItems = (filter) => {
+    const q = (filter || '').toLowerCase();
+    const filtered = q
+      ? items.filter(i => (i.label || '').toLowerCase().includes(q) || (i.description || '').toLowerCase().includes(q))
+      : items;
+
+    paletteListEl.innerHTML = '';
+    for (let i = 0; i < filtered.length; i++) {
+      const item = document.createElement('div');
+      item.className = 'palette-item' + (i === paletteSelectedIndex ? ' selected' : '');
+      let html = escapeHtml(filtered[i].label || '');
+      if (filtered[i].description) {
+        html += ` <span style="color: var(--fg-dim)">${escapeHtml(filtered[i].description)}</span>`;
+      }
+      item.innerHTML = html;
+      const idx = i;
+      item.addEventListener('click', () => {
+        closePaletteAndRespond(req.request_id, filtered[idx].label);
+      });
+      paletteListEl.appendChild(item);
+    }
+  };
+
+  renderItems('');
+
+  // Temporarily override palette input handler
+  const origHandler = paletteInputEl.oninput;
+  paletteInputEl.oninput = () => {
+    paletteSelectedIndex = 0;
+    renderItems(paletteInputEl.value);
+  };
+
+  const origKeydown = paletteInputEl.onkeydown;
+  paletteInputEl.onkeydown = (e) => {
+    const total = paletteListEl.children.length;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      paletteSelectedIndex = Math.min(paletteSelectedIndex + 1, total - 1);
+      updatePaletteSelection();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      paletteSelectedIndex = Math.max(paletteSelectedIndex - 1, 0);
+      updatePaletteSelection();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      const selected = paletteListEl.querySelectorAll('.palette-item')[paletteSelectedIndex];
+      if (selected) selected.click();
+    } else if (e.key === 'Escape') {
+      closePaletteAndRespond(req.request_id, null);
+    }
+  };
+
+  // Override backdrop close
+  paletteBackdropEl.onclick = () => closePaletteAndRespond(req.request_id, null);
+
+  function closePaletteAndRespond(requestId, value) {
+    paletteOpen = false;
+    paletteEl.classList.add('palette-hidden');
+    paletteInputEl.placeholder = 'Type a command...';
+    paletteInputEl.oninput = origHandler;
+    paletteInputEl.onkeydown = origKeydown;
+    paletteBackdropEl.onclick = closePalette;
+    editorEl.focus();
+    invoke('respond_ui_request', { requestId, value: value });
+  }
+
+  paletteInputEl.focus();
+}
+
+function handleInputBox(req) {
+  const prompt = req.params.prompt || req.params.title || 'Enter a value';
+  const placeholder = req.params.placeHolder || '';
+  const defaultValue = req.params.value || '';
+
+  // Reuse command palette as input box
+  paletteOpen = true;
+  paletteEl.classList.remove('palette-hidden');
+  paletteInputEl.value = defaultValue;
+  paletteInputEl.placeholder = placeholder;
+  paletteListEl.innerHTML = '';
+
+  const hint = document.createElement('div');
+  hint.className = 'palette-item';
+  hint.style.color = 'var(--fg-dim)';
+  hint.textContent = prompt + ' (press Enter to confirm, Escape to cancel)';
+  paletteListEl.appendChild(hint);
+
+  const origKeydown = paletteInputEl.onkeydown;
+  paletteInputEl.onkeydown = (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      closeInputAndRespond(req.request_id, paletteInputEl.value);
+    } else if (e.key === 'Escape') {
+      closeInputAndRespond(req.request_id, null);
+    }
+  };
+
+  paletteBackdropEl.onclick = () => closeInputAndRespond(req.request_id, null);
+
+  function closeInputAndRespond(requestId, value) {
+    paletteOpen = false;
+    paletteEl.classList.add('palette-hidden');
+    paletteInputEl.placeholder = 'Type a command...';
+    paletteInputEl.onkeydown = origKeydown;
+    paletteBackdropEl.onclick = closePalette;
+    editorEl.focus();
+    invoke('respond_ui_request', { requestId, value: value });
+  }
+
+  paletteInputEl.focus();
+}
+
+const uiReqInterval = setInterval(pollUiRequests, 500);
+
 // Cleanup on unload
 window.addEventListener('beforeunload', () => {
   clearInterval(diagnosticsInterval);
   clearInterval(extHostInterval);
+  clearInterval(notifInterval);
+  clearInterval(uiReqInterval);
 });
 
 // --- Init ---
