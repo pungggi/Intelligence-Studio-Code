@@ -1,13 +1,12 @@
 /**
  * VS Code API Shim - Provides a compatible `vscode` namespace to extensions.
  *
- * M3 implements:
- * - vscode.workspace.textDocuments / onDidOpenTextDocument / onDidChangeTextDocument / onDidCloseTextDocument
- * - vscode.workspace.getConfiguration (reads contributes.configuration from extensions)
- * - vscode.languages.createDiagnosticCollection
- * - vscode.commands.registerCommand / executeCommand
- * - vscode.window.showInformationMessage / showWarningMessage / showErrorMessage
- * - vscode.window.showQuickPick / showInputBox
+ * M4 adds:
+ * - vscode.window.createStatusBarItem
+ * - vscode.window.createOutputChannel
+ * - vscode.window.createTextEditorDecorationType
+ * - vscode.Uri
+ * - vscode.Range / vscode.Position
  */
 
 import type { IpcMessage } from "./ipc-server";
@@ -36,6 +35,107 @@ class EventEmitter<T> {
         console.error("[ApiShim] Event listener error:", err);
       }
     }
+  }
+}
+
+// --- Position & Range ---
+
+export class Position {
+  constructor(
+    public readonly line: number,
+    public readonly character: number
+  ) {}
+
+  isEqual(other: Position): boolean {
+    return this.line === other.line && this.character === other.character;
+  }
+
+  isBefore(other: Position): boolean {
+    return (
+      this.line < other.line ||
+      (this.line === other.line && this.character < other.character)
+    );
+  }
+
+  isAfter(other: Position): boolean {
+    return other.isBefore(this);
+  }
+
+  translate(lineDelta: number = 0, characterDelta: number = 0): Position {
+    return new Position(this.line + lineDelta, this.character + characterDelta);
+  }
+}
+
+export class Range {
+  public readonly start: Position;
+  public readonly end: Position;
+
+  constructor(
+    startLine: number | Position,
+    startChar?: number | Position,
+    endLine?: number,
+    endChar?: number
+  ) {
+    if (startLine instanceof Position && startChar instanceof Position) {
+      this.start = startLine;
+      this.end = startChar;
+    } else {
+      this.start = new Position(startLine as number, (startChar as number) ?? 0);
+      this.end = new Position(endLine ?? (startLine as number), endChar ?? (startChar as number) ?? 0);
+    }
+  }
+
+  get isEmpty(): boolean {
+    return this.start.isEqual(this.end);
+  }
+
+  contains(positionOrRange: Position | Range): boolean {
+    if (positionOrRange instanceof Position) {
+      return !positionOrRange.isBefore(this.start) && !positionOrRange.isAfter(this.end);
+    }
+    return this.contains(positionOrRange.start) && this.contains(positionOrRange.end);
+  }
+}
+
+// --- Uri ---
+
+export class Uri {
+  readonly scheme: string;
+  readonly authority: string;
+  readonly path: string;
+  readonly query: string;
+  readonly fragment: string;
+
+  private constructor(scheme: string, authority: string, path: string, query: string, fragment: string) {
+    this.scheme = scheme;
+    this.authority = authority;
+    this.path = path;
+    this.query = query;
+    this.fragment = fragment;
+  }
+
+  static file(path: string): Uri {
+    return new Uri("file", "", path, "", "");
+  }
+
+  static parse(value: string): Uri {
+    try {
+      const url = new URL(value);
+      return new Uri(url.protocol.replace(":", ""), url.hostname, url.pathname, url.search, url.hash);
+    } catch {
+      return new Uri("file", "", value, "", "");
+    }
+  }
+
+  get fsPath(): string {
+    return this.path;
+  }
+
+  toString(): string {
+    if (this.scheme === "file") {
+      return `file://${this.path}`;
+    }
+    return `${this.scheme}://${this.authority}${this.path}${this.query}${this.fragment}`;
   }
 }
 
@@ -123,6 +223,57 @@ export interface InputBoxOptions {
   validateInput?: (value: string) => string | undefined | null;
 }
 
+// --- StatusBarItem ---
+
+export enum StatusBarAlignment {
+  Left = 1,
+  Right = 2,
+}
+
+export interface StatusBarItem {
+  alignment: StatusBarAlignment;
+  priority: number;
+  text: string;
+  tooltip: string | undefined;
+  color: string | undefined;
+  command: string | undefined;
+  show(): void;
+  hide(): void;
+  dispose(): void;
+}
+
+// --- OutputChannel ---
+
+export interface OutputChannel {
+  name: string;
+  append(value: string): void;
+  appendLine(value: string): void;
+  clear(): void;
+  show(): void;
+  hide(): void;
+  dispose(): void;
+}
+
+// --- TextEditorDecorationType ---
+
+export interface DecorationRenderOptions {
+  backgroundColor?: string;
+  border?: string;
+  borderColor?: string;
+  color?: string;
+  fontStyle?: string;
+  fontWeight?: string;
+  textDecoration?: string;
+  overviewRulerColor?: string;
+  after?: { contentText?: string; color?: string };
+  before?: { contentText?: string; color?: string };
+}
+
+export interface TextEditorDecorationType {
+  key: string;
+  dispose(): void;
+}
+
 // --- Configuration ---
 
 interface ConfigurationSection {
@@ -144,17 +295,16 @@ export class VscodeApiShim {
   private documents = new Map<string, TextDocument>();
   private diagnosticCollections: DiagnosticCollection[] = [];
 
-  /** Configuration defaults from extension contributes.configuration */
   private configDefaults = new Map<string, unknown>();
-  /** Runtime configuration overrides */
   private configOverrides = new Map<string, unknown>();
 
-  /** Pending QuickPick/InputBox requests waiting for frontend response */
   private pendingUiRequests = new Map<
     string,
     { resolve: (value: unknown) => void; reject: (err: Error) => void }
   >();
   private uiRequestId = 0;
+  private statusBarItemId = 0;
+  private decorationTypeId = 0;
 
   // Events
   private _onDidOpenTextDocument = new EventEmitter<TextDocument>();
@@ -162,9 +312,6 @@ export class VscodeApiShim {
     new EventEmitter<{ document: TextDocument }>();
   private _onDidCloseTextDocument = new EventEmitter<TextDocument>();
 
-  /**
-   * Register configuration defaults from an extension's package.json.
-   */
   registerConfigurationDefaults(
     properties: Record<string, { default?: unknown }>
   ): void {
@@ -175,9 +322,6 @@ export class VscodeApiShim {
     }
   }
 
-  /**
-   * Handle a message from the native frontend (via IPC).
-   */
   handleFrontendMessage(msg: IpcMessage): void {
     switch (msg.method) {
       case "textDocument/didOpen":
@@ -283,7 +427,6 @@ export class VscodeApiShim {
         return {
           get<T>(key: string, defaultValue?: T): T | undefined {
             const fullKey = section ? `${section}.${key}` : key;
-            // Check overrides first, then defaults
             if (self.configOverrides.has(fullKey)) {
               return self.configOverrides.get(fullKey) as T;
             }
@@ -450,7 +593,6 @@ export class VscodeApiShim {
       ): Promise<string | QuickPickItem | undefined> {
         const requestId = String(++self.uiRequestId);
 
-        // Normalize items to QuickPickItem format
         const normalizedItems: QuickPickItem[] = (items as unknown[]).map(
           (item) =>
             typeof item === "string" ? { label: item } : (item as QuickPickItem)
@@ -472,7 +614,6 @@ export class VscodeApiShim {
             reject,
           });
 
-          // Timeout after 60 seconds
           setTimeout(() => {
             if (self.pendingUiRequests.has(requestId)) {
               self.pendingUiRequests.delete(requestId);
@@ -512,6 +653,128 @@ export class VscodeApiShim {
           }, 60000);
         });
       },
+
+      createStatusBarItem(
+        alignmentOrOptions?: StatusBarAlignment | { alignment?: StatusBarAlignment; id?: string },
+        priority?: number
+      ): StatusBarItem {
+        const id = `sb-${++self.statusBarItemId}`;
+        let align = StatusBarAlignment.Left;
+        let prio = 0;
+
+        if (typeof alignmentOrOptions === "number") {
+          align = alignmentOrOptions;
+          prio = priority ?? 0;
+        } else if (alignmentOrOptions) {
+          align = alignmentOrOptions.alignment ?? StatusBarAlignment.Left;
+        }
+
+        let _text = "";
+        let _tooltip: string | undefined;
+        let _command: string | undefined;
+        let _visible = false;
+
+        const item: StatusBarItem = {
+          alignment: align,
+          priority: prio,
+          get text() { return _text; },
+          set text(v: string) {
+            _text = v;
+            if (_visible) sendUpdate();
+          },
+          get tooltip() { return _tooltip; },
+          set tooltip(v: string | undefined) {
+            _tooltip = v;
+            if (_visible) sendUpdate();
+          },
+          color: undefined,
+          get command() { return _command; },
+          set command(v: string | undefined) {
+            _command = v;
+            if (_visible) sendUpdate();
+          },
+          show() {
+            _visible = true;
+            sendUpdate();
+          },
+          hide() {
+            _visible = false;
+            self.sendOutgoing({
+              method: "removeStatusBarItem",
+              params: { id },
+            });
+          },
+          dispose() {
+            item.hide();
+          },
+        };
+
+        function sendUpdate() {
+          self.sendOutgoing({
+            method: "setStatusBarItem",
+            params: {
+              id,
+              text: _text,
+              tooltip: _tooltip,
+              command: _command,
+              alignment: align === StatusBarAlignment.Left ? "left" : "right",
+              priority: prio,
+            },
+          });
+        }
+
+        return item;
+      },
+
+      createOutputChannel(name: string): OutputChannel {
+        const lines: string[] = [];
+
+        return {
+          name,
+          append(value: string) {
+            lines.push(value);
+            self.sendOutgoing({
+              method: "appendOutput",
+              params: { channel: name, text: value },
+            });
+          },
+          appendLine(value: string) {
+            lines.push(value + "\n");
+            self.sendOutgoing({
+              method: "appendOutput",
+              params: { channel: name, text: value + "\n" },
+            });
+          },
+          clear() {
+            lines.length = 0;
+            self.sendOutgoing({
+              method: "appendOutput",
+              params: { channel: name, text: "\x1b[clear]" },
+            });
+          },
+          show() {
+            // Notify frontend to show output panel
+            self.sendOutgoing({
+              method: "showOutput",
+              params: { channel: name },
+            });
+          },
+          hide() {},
+          dispose() {},
+        };
+      },
+
+      createTextEditorDecorationType(
+        options: DecorationRenderOptions
+      ): TextEditorDecorationType {
+        const key = `dec-${++self.decorationTypeId}`;
+        return {
+          key,
+          dispose() {
+            // Clear all decorations of this type
+          },
+        };
+      },
     };
   }
 
@@ -519,6 +782,10 @@ export class VscodeApiShim {
 
   get DiagnosticSeverity() {
     return DiagnosticSeverity;
+  }
+
+  get StatusBarAlignment() {
+    return StatusBarAlignment;
   }
 
   /**
@@ -531,6 +798,10 @@ export class VscodeApiShim {
       languages: this.languages,
       window: this.window,
       DiagnosticSeverity: this.DiagnosticSeverity,
+      StatusBarAlignment: this.StatusBarAlignment,
+      Uri,
+      Position,
+      Range,
     };
   }
 }

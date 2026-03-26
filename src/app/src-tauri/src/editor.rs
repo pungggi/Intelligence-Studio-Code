@@ -1,7 +1,8 @@
-//! Editor State — Rope text buffer + Tree-sitter syntax highlighting.
+//! Editor State — Rope text buffer + Tree-sitter syntax highlighting + Undo/Redo.
 //!
 //! This is the core editor engine. It owns the text buffer and provides
 //! edit operations that keep the syntax tree in sync incrementally.
+//! M4 adds: undo/redo, selection operations, find/replace, more grammars.
 
 use crate::highlighting;
 use crate::ipc_bridge::IpcHandle;
@@ -14,6 +15,73 @@ use std::path::PathBuf;
 /// Maximum file size that can be opened (50 MB).
 const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
 
+/// Maximum undo history depth.
+const MAX_UNDO_HISTORY: usize = 10_000;
+
+// --- Undo/Redo ---
+
+#[derive(Debug, Clone)]
+enum EditOp {
+    Insert { char_idx: usize, text: String },
+    Delete { char_idx: usize, text: String },
+    /// A group of operations that should be undone/redone as a single unit.
+    Group(Vec<EditOp>),
+}
+
+struct UndoManager {
+    undo_stack: Vec<EditOp>,
+    redo_stack: Vec<EditOp>,
+}
+
+impl UndoManager {
+    fn new() -> Self {
+        Self {
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, op: EditOp) {
+        self.undo_stack.push(op);
+        self.redo_stack.clear();
+        if self.undo_stack.len() > MAX_UNDO_HISTORY {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    fn pop_undo(&mut self) -> Option<EditOp> {
+        self.undo_stack.pop()
+    }
+
+    fn push_redo(&mut self, op: EditOp) {
+        self.redo_stack.push(op);
+    }
+
+    fn pop_redo(&mut self) -> Option<EditOp> {
+        self.redo_stack.pop()
+    }
+
+    fn push_undo_no_clear(&mut self, op: EditOp) {
+        self.undo_stack.push(op);
+    }
+
+    fn clear(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+}
+
+// --- Find matches ---
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FindMatch {
+    pub line: usize,
+    pub col: usize,
+    pub length: usize,
+}
+
+// --- Editor State ---
+
 pub struct EditorState {
     rope: Rope,
     file_path: Option<PathBuf>,
@@ -22,6 +90,7 @@ pub struct EditorState {
     parser: tree_sitter::Parser,
     tree: Option<tree_sitter::Tree>,
     version: u32,
+    undo_mgr: UndoManager,
 }
 
 impl EditorState {
@@ -40,11 +109,11 @@ impl EditorState {
             parser,
             tree,
             version: 0,
+            undo_mgr: UndoManager::new(),
         }
     }
 
     pub fn open_file(&mut self, path: &str) -> Result<()> {
-        // Check file size before reading
         let metadata = fs::metadata(path).context("Failed to stat file")?;
         if metadata.len() > MAX_FILE_SIZE {
             anyhow::bail!(
@@ -58,8 +127,8 @@ impl EditorState {
         self.rope = Rope::from_str(&content);
         self.file_path = Some(PathBuf::from(path));
         self.modified = false;
+        self.undo_mgr.clear();
 
-        // Detect language from extension
         let ext = PathBuf::from(path)
             .extension()
             .and_then(|e| e.to_str())
@@ -69,7 +138,6 @@ impl EditorState {
         self.language = Some(ext.clone());
         self.set_language_from_ext(&ext);
 
-        // Full parse
         let source = self.rope.to_string();
         self.tree = self.parser.parse(&source, None);
 
@@ -87,29 +155,28 @@ impl EditorState {
         Ok(())
     }
 
-    pub fn save_file(&self) -> Result<()> {
+    pub fn save_file(&mut self) -> Result<()> {
         let path = self
             .file_path
             .as_ref()
             .context("No file path set")?;
         fs::write(path, self.rope.to_string()).context("Failed to write file")?;
+        self.modified = false;
         log::info!("Saved {}", path.display());
         Ok(())
     }
 
-    pub fn insert(&mut self, line: usize, col: usize, text: &str) -> Result<()> {
-        let line = line.min(self.rope.len_lines().saturating_sub(1));
-        let line_start = self.rope.line_to_char(line);
-        let line_len = self.rope.line(line).len_chars();
-        let col = col.min(line_len);
-        let char_idx = line_start + col;
+    // --- Raw edit operations (no undo recording) ---
+
+    fn raw_insert_at_char(&mut self, char_idx: usize, text: &str) {
         let byte_idx = self.rope.char_to_byte(char_idx);
+        let line = self.rope.char_to_line(char_idx);
+        let col = char_idx - self.rope.line_to_char(line);
 
         self.rope.insert(char_idx, text);
         self.modified = true;
         self.version += 1;
 
-        // Incremental tree-sitter update
         if let Some(tree) = &mut self.tree {
             let new_end_byte = byte_idx + text.len();
             let new_end_line = self.rope.byte_to_line(new_end_byte);
@@ -129,83 +196,17 @@ impl EditorState {
 
             self.reparse();
         }
-
-        Ok(())
     }
 
-    /// Return the edit metadata for IPC change notifications (line, col, text).
-    pub fn last_edit_info(&self) -> (u32, String) {
-        (self.version, self.rope.to_string())
-    }
-
-    pub fn delete(&mut self, line: usize, col: usize, len: usize) -> Result<()> {
-        let line = line.min(self.rope.len_lines().saturating_sub(1));
-        let line_start = self.rope.line_to_char(line);
-        let line_len = self.rope.line(line).len_chars();
-        let col = col.min(line_len);
-        let char_idx = line_start + col;
-        let end_idx = (char_idx + len).min(self.rope.len_chars());
-
-        if char_idx >= end_idx {
-            return Ok(());
-        }
-
-        let start_byte = self.rope.char_to_byte(char_idx);
-        let end_byte = self.rope.char_to_byte(end_idx);
-
-        self.rope.remove(char_idx..end_idx);
-        self.modified = true;
-        self.version += 1;
-
-        if let Some(tree) = &mut self.tree {
-            let new_line = self.rope.byte_to_line(start_byte.min(self.rope.len_bytes().saturating_sub(1)));
-            let new_col = start_byte.saturating_sub(self.rope.line_to_byte(new_line));
-
-            tree.edit(&tree_sitter::InputEdit {
-                start_byte,
-                old_end_byte: end_byte,
-                new_end_byte: start_byte,
-                start_position: tree_sitter::Point { row: line, column: col },
-                old_end_position: tree_sitter::Point {
-                    row: line,
-                    column: col + len,
-                },
-                new_end_position: tree_sitter::Point {
-                    row: new_line,
-                    column: new_col,
-                },
-            });
-
-            self.reparse();
-        }
-
-        Ok(())
-    }
-
-    pub fn backspace(&mut self, line: usize, col: usize) -> Result<()> {
-        if line == 0 && col == 0 {
-            return Ok(());
-        }
-
-        if col == 0 {
-            // Join with previous line
-            let prev_line = line - 1;
-            let prev_line_len = self.rope.line(prev_line).len_chars();
-            // Delete the newline at end of previous line
-            let nl_pos = self.rope.line_to_char(prev_line) + prev_line_len - 1;
-            self.delete_at_char(nl_pos, 1)?;
-        } else {
-            self.delete(line, col - 1, 1)?;
-        }
-
-        Ok(())
-    }
-
-    fn delete_at_char(&mut self, char_idx: usize, len: usize) -> Result<()> {
+    /// Delete `len` chars starting at `char_idx`. Returns the deleted text.
+    fn raw_delete_at_char(&mut self, char_idx: usize, len: usize) -> String {
         let end_idx = (char_idx + len).min(self.rope.len_chars());
         if char_idx >= end_idx {
-            return Ok(());
+            return String::new();
         }
+
+        // Capture deleted text before removing
+        let deleted: String = self.rope.slice(char_idx..end_idx).to_string();
 
         let start_byte = self.rope.char_to_byte(char_idx);
         let end_byte = self.rope.char_to_byte(end_idx);
@@ -217,7 +218,8 @@ impl EditorState {
         self.version += 1;
 
         if let Some(tree) = &mut self.tree {
-            let new_line = self.rope.byte_to_line(start_byte.min(self.rope.len_bytes().saturating_sub(1)));
+            let safe_byte = start_byte.min(self.rope.len_bytes().saturating_sub(1));
+            let new_line = if self.rope.len_bytes() == 0 { 0 } else { self.rope.byte_to_line(safe_byte) };
             let new_col = start_byte.saturating_sub(self.rope.line_to_byte(new_line));
 
             tree.edit(&tree_sitter::InputEdit {
@@ -238,8 +240,275 @@ impl EditorState {
             self.reparse();
         }
 
+        deleted
+    }
+
+    // --- Public edit operations (with undo recording) ---
+
+    pub fn insert(&mut self, line: usize, col: usize, text: &str) -> Result<()> {
+        let line = line.min(self.rope.len_lines().saturating_sub(1));
+        let line_start = self.rope.line_to_char(line);
+        let line_len = self.rope.line(line).len_chars();
+        let col = col.min(line_len);
+        let char_idx = line_start + col;
+
+        self.raw_insert_at_char(char_idx, text);
+        self.undo_mgr.push(EditOp::Insert {
+            char_idx,
+            text: text.to_string(),
+        });
+
         Ok(())
     }
+
+    pub fn delete(&mut self, line: usize, col: usize, len: usize) -> Result<()> {
+        let line = line.min(self.rope.len_lines().saturating_sub(1));
+        let line_start = self.rope.line_to_char(line);
+        let line_len = self.rope.line(line).len_chars();
+        let col = col.min(line_len);
+        let char_idx = line_start + col;
+
+        let deleted = self.raw_delete_at_char(char_idx, len);
+        if !deleted.is_empty() {
+            self.undo_mgr.push(EditOp::Delete {
+                char_idx,
+                text: deleted,
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn backspace(&mut self, line: usize, col: usize) -> Result<()> {
+        if line == 0 && col == 0 {
+            return Ok(());
+        }
+
+        if col == 0 {
+            let prev_line = line - 1;
+            let prev_line_len = self.rope.line(prev_line).len_chars();
+            let nl_pos = self.rope.line_to_char(prev_line) + prev_line_len - 1;
+            let deleted = self.raw_delete_at_char(nl_pos, 1);
+            if !deleted.is_empty() {
+                self.undo_mgr.push(EditOp::Delete {
+                    char_idx: nl_pos,
+                    text: deleted,
+                });
+            }
+        } else {
+            let line_clamped = line.min(self.rope.len_lines().saturating_sub(1));
+            let line_start = self.rope.line_to_char(line_clamped);
+            let char_idx = line_start + col - 1;
+            let deleted = self.raw_delete_at_char(char_idx, 1);
+            if !deleted.is_empty() {
+                self.undo_mgr.push(EditOp::Delete {
+                    char_idx,
+                    text: deleted,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Replace a range of text (for selection replacement, find/replace).
+    /// Returns the deleted text.
+    pub fn replace_range(
+        &mut self,
+        start_line: usize,
+        start_col: usize,
+        end_line: usize,
+        end_col: usize,
+        new_text: &str,
+    ) -> Result<String> {
+        let start_char = self.line_col_to_char(start_line, start_col);
+        let end_char = self.line_col_to_char(end_line, end_col);
+
+        let (start, end) = if start_char <= end_char {
+            (start_char, end_char)
+        } else {
+            (end_char, start_char)
+        };
+
+        let mut ops = Vec::new();
+
+        // Delete the range
+        let deleted = if end > start {
+            let d = self.raw_delete_at_char(start, end - start);
+            ops.push(EditOp::Delete {
+                char_idx: start,
+                text: d.clone(),
+            });
+            d
+        } else {
+            String::new()
+        };
+
+        // Insert new text
+        if !new_text.is_empty() {
+            self.raw_insert_at_char(start, new_text);
+            ops.push(EditOp::Insert {
+                char_idx: start,
+                text: new_text.to_string(),
+            });
+        }
+
+        if ops.len() == 1 {
+            self.undo_mgr.push(ops.remove(0));
+        } else if ops.len() > 1 {
+            self.undo_mgr.push(EditOp::Group(ops));
+        }
+
+        Ok(deleted)
+    }
+
+    /// Get text in a range (for copy).
+    pub fn get_text_range(
+        &self,
+        start_line: usize,
+        start_col: usize,
+        end_line: usize,
+        end_col: usize,
+    ) -> String {
+        let start_char = self.line_col_to_char(start_line, start_col);
+        let end_char = self.line_col_to_char(end_line, end_col);
+
+        let (start, end) = if start_char <= end_char {
+            (start_char, end_char)
+        } else {
+            (end_char, start_char)
+        };
+
+        let end = end.min(self.rope.len_chars());
+        if start >= end {
+            return String::new();
+        }
+
+        self.rope.slice(start..end).to_string()
+    }
+
+    fn line_col_to_char(&self, line: usize, col: usize) -> usize {
+        let line = line.min(self.rope.len_lines().saturating_sub(1));
+        let line_start = self.rope.line_to_char(line);
+        let line_len = self.rope.line(line).len_chars();
+        let col = col.min(line_len);
+        line_start + col
+    }
+
+    // --- Undo/Redo ---
+
+    pub fn undo(&mut self) -> bool {
+        let op = match self.undo_mgr.pop_undo() {
+            Some(op) => op,
+            None => return false,
+        };
+
+        let reverse = self.apply_reverse(&op);
+        self.undo_mgr.push_redo(reverse);
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let op = match self.undo_mgr.pop_redo() {
+            Some(op) => op,
+            None => return false,
+        };
+
+        let reverse = self.apply_forward(&op);
+        self.undo_mgr.push_undo_no_clear(reverse);
+        true
+    }
+
+    fn apply_reverse(&mut self, op: &EditOp) -> EditOp {
+        match op {
+            EditOp::Insert { char_idx, text } => {
+                let deleted = self.raw_delete_at_char(*char_idx, text.chars().count());
+                EditOp::Insert {
+                    char_idx: *char_idx,
+                    text: deleted,
+                }
+            }
+            EditOp::Delete { char_idx, text } => {
+                self.raw_insert_at_char(*char_idx, text);
+                EditOp::Delete {
+                    char_idx: *char_idx,
+                    text: text.clone(),
+                }
+            }
+            EditOp::Group(ops) => {
+                let mut reverse_ops = Vec::new();
+                for op in ops.iter().rev() {
+                    reverse_ops.push(self.apply_reverse(op));
+                }
+                reverse_ops.reverse();
+                EditOp::Group(reverse_ops)
+            }
+        }
+    }
+
+    fn apply_forward(&mut self, op: &EditOp) -> EditOp {
+        match op {
+            EditOp::Insert { char_idx, text } => {
+                self.raw_insert_at_char(*char_idx, text);
+                EditOp::Insert {
+                    char_idx: *char_idx,
+                    text: text.clone(),
+                }
+            }
+            EditOp::Delete { char_idx, text } => {
+                let deleted = self.raw_delete_at_char(*char_idx, text.chars().count());
+                EditOp::Delete {
+                    char_idx: *char_idx,
+                    text: deleted,
+                }
+            }
+            EditOp::Group(ops) => {
+                let mut forward_ops = Vec::new();
+                for op in ops {
+                    forward_ops.push(self.apply_forward(op));
+                }
+                EditOp::Group(forward_ops)
+            }
+        }
+    }
+
+    // --- Find ---
+
+    pub fn find_all(&self, query: &str, case_sensitive: bool) -> Vec<FindMatch> {
+        if query.is_empty() {
+            return vec![];
+        }
+
+        let mut matches = Vec::new();
+        let text = self.rope.to_string();
+
+        let (search_text, search_query) = if case_sensitive {
+            (text.clone(), query.to_string())
+        } else {
+            (text.to_lowercase(), query.to_lowercase())
+        };
+
+        let mut start = 0;
+        while let Some(pos) = search_text[start..].find(&search_query) {
+            let byte_pos = start + pos;
+            let char_pos = text[..byte_pos].chars().count();
+            let line = self.rope.char_to_line(char_pos);
+            let line_start = self.rope.line_to_char(line);
+            let col = char_pos - line_start;
+
+            matches.push(FindMatch {
+                line,
+                col,
+                length: query.chars().count(),
+            });
+
+            start = byte_pos + search_query.len();
+        }
+
+        matches
+    }
+
+    // --- Internal ---
 
     fn reparse(&mut self) {
         let rope = &self.rope;
@@ -264,12 +533,22 @@ impl EditorState {
             "js" | "jsx" | "mjs" | "cjs" => {
                 let _ = self.parser.set_language(&tree_sitter_javascript::LANGUAGE.into());
             }
+            "ts" => {
+                let _ = self.parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into());
+            }
+            "tsx" => {
+                let _ = self.parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into());
+            }
             "rs" => {
                 let _ = self.parser.set_language(&tree_sitter_rust::LANGUAGE.into());
             }
+            "py" | "pyw" => {
+                let _ = self.parser.set_language(&tree_sitter_python::LANGUAGE.into());
+            }
+            "json" | "jsonc" => {
+                let _ = self.parser.set_language(&tree_sitter_json::LANGUAGE.into());
+            }
             _ => {
-                // Unknown language — keep parser as-is but clear the tree
-                // so we don't produce incorrect highlights
                 self.tree = None;
             }
         }
@@ -294,7 +573,6 @@ impl EditorState {
             })
             .collect();
 
-        // Fetch diagnostics for this file only
         let diagnostics = if let Some(path) = &self.file_path {
             let uri = {
                 let p = path.display().to_string();
@@ -332,5 +610,9 @@ impl EditorState {
 
     pub fn version(&self) -> u32 {
         self.version
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.rope.len_lines()
     }
 }

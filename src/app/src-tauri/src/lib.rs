@@ -18,13 +18,10 @@ struct AppState {
 
 // --- Path validation ---
 
-/// Canonicalize and validate a file path. Returns the canonical path string.
-/// Rejects paths that don't exist or can't be resolved.
 fn validate_path(path: &str) -> Result<String, String> {
     let canonical = std::fs::canonicalize(path)
         .map_err(|e| format!("Invalid path '{}': {}", path, e))?;
 
-    // Ensure path is a file, not a directory
     if canonical.is_dir() {
         return Err(format!("Path is a directory: {}", path));
     }
@@ -32,9 +29,7 @@ fn validate_path(path: &str) -> Result<String, String> {
     Ok(canonical.to_string_lossy().to_string())
 }
 
-/// Build a file:// URI from a canonical path (cross-platform).
 fn path_to_uri(path: &str) -> String {
-    // On Windows, paths start with C:\, need file:///C:/
     #[cfg(target_os = "windows")]
     {
         format!("file:///{}", path.replace('\\', "/"))
@@ -61,7 +56,6 @@ fn open_file(path: String, state: tauri::State<AppState>) -> Result<EditorConten
 
     editor.open_file(&canonical).map_err(|e| e.to_string())?;
 
-    // Notify Extension Host
     let content = editor.get_full_text();
     let language = editor.language().unwrap_or("plaintext".to_string());
     let uri = path_to_uri(&canonical);
@@ -77,7 +71,7 @@ fn open_file(path: String, state: tauri::State<AppState>) -> Result<EditorConten
 
 #[tauri::command]
 fn save_file(state: tauri::State<AppState>) -> Result<(), String> {
-    let editor = state.editor.lock().map_err(|e| e.to_string())?;
+    let mut editor = state.editor.lock().map_err(|e| e.to_string())?;
     editor.save_file().map_err(|e| e.to_string())
 }
 
@@ -145,6 +139,99 @@ fn edit_backspace(
 }
 
 #[tauri::command]
+fn edit_undo(state: tauri::State<AppState>) -> Result<EditorContent, String> {
+    let mut editor = state.editor.lock().map_err(|e| e.to_string())?;
+    editor.undo();
+    notify_change(&editor, &state.ipc);
+    Ok(editor.get_content(&state.ipc))
+}
+
+#[tauri::command]
+fn edit_redo(state: tauri::State<AppState>) -> Result<EditorContent, String> {
+    let mut editor = state.editor.lock().map_err(|e| e.to_string())?;
+    editor.redo();
+    notify_change(&editor, &state.ipc);
+    Ok(editor.get_content(&state.ipc))
+}
+
+#[tauri::command]
+fn edit_replace_range(
+    start_line: usize,
+    start_col: usize,
+    end_line: usize,
+    end_col: usize,
+    text: String,
+    state: tauri::State<AppState>,
+) -> Result<EditorContent, String> {
+    if text.len() > MAX_INSERT_SIZE {
+        return Err(format!(
+            "Replacement too large ({} bytes, max {})",
+            text.len(),
+            MAX_INSERT_SIZE
+        ));
+    }
+    let mut editor = state.editor.lock().map_err(|e| e.to_string())?;
+    editor
+        .replace_range(start_line, start_col, end_line, end_col, &text)
+        .map_err(|e| e.to_string())?;
+    notify_change(&editor, &state.ipc);
+    Ok(editor.get_content(&state.ipc))
+}
+
+#[tauri::command]
+fn get_text_range(
+    start_line: usize,
+    start_col: usize,
+    end_line: usize,
+    end_col: usize,
+    state: tauri::State<AppState>,
+) -> Result<String, String> {
+    let editor = state.editor.lock().map_err(|e| e.to_string())?;
+    Ok(editor.get_text_range(start_line, start_col, end_line, end_col))
+}
+
+#[tauri::command]
+fn find_in_file(
+    query: String,
+    case_sensitive: bool,
+    state: tauri::State<AppState>,
+) -> Result<Vec<editor::FindMatch>, String> {
+    let editor = state.editor.lock().map_err(|e| e.to_string())?;
+    Ok(editor.find_all(&query, case_sensitive))
+}
+
+#[tauri::command]
+fn replace_in_file(
+    query: String,
+    replacement: String,
+    case_sensitive: bool,
+    replace_all: bool,
+    state: tauri::State<AppState>,
+) -> Result<ReplaceResult, String> {
+    let mut editor = state.editor.lock().map_err(|e| e.to_string())?;
+    let matches = editor.find_all(&query, case_sensitive);
+
+    if matches.is_empty() {
+        return Ok(ReplaceResult { count: 0, content: editor.get_content(&state.ipc) });
+    }
+
+    let to_replace = if replace_all { &matches[..] } else { &matches[..1] };
+
+    // Replace in reverse order to preserve positions
+    for m in to_replace.iter().rev() {
+        editor
+            .replace_range(m.line, m.col, m.line, m.col + m.length, &replacement)
+            .map_err(|e| e.to_string())?;
+    }
+
+    notify_change(&editor, &state.ipc);
+    Ok(ReplaceResult {
+        count: to_replace.len(),
+        content: editor.get_content(&state.ipc),
+    })
+}
+
+#[tauri::command]
 fn get_diagnostics(state: tauri::State<AppState>) -> Result<Vec<ipc_bridge::Diagnostic>, String> {
     Ok(state.ipc.get_diagnostics())
 }
@@ -194,6 +281,16 @@ fn respond_ui_request(
     Ok(())
 }
 
+#[tauri::command]
+fn get_status_bar_items(state: tauri::State<AppState>) -> Result<Vec<ipc_bridge::StatusBarItem>, String> {
+    Ok(state.ipc.get_status_bar_items())
+}
+
+#[tauri::command]
+fn get_output_lines(state: tauri::State<AppState>) -> Result<Vec<ipc_bridge::OutputLine>, String> {
+    Ok(state.ipc.drain_output_lines())
+}
+
 /// Notify Extension Host of text changes.
 fn notify_change(editor: &EditorState, ipc: &IpcHandle) {
     if let Some(path) = editor.file_path_str() {
@@ -236,13 +333,18 @@ pub struct ExtHostStatus {
     pub commands: Vec<String>,
 }
 
+#[derive(serde::Serialize)]
+pub struct ReplaceResult {
+    pub count: usize,
+    pub content: EditorContent,
+}
+
 // --- App entry ---
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::init();
 
-    // Start IPC bridge (connects to Extension Host asynchronously)
     let ipc = ipc_bridge::start_ipc_bridge();
 
     tauri::Builder::default()
@@ -261,6 +363,12 @@ pub fn run() {
             edit_delete,
             edit_newline,
             edit_backspace,
+            edit_undo,
+            edit_redo,
+            edit_replace_range,
+            get_text_range,
+            find_in_file,
+            replace_in_file,
             get_diagnostics,
             get_ext_host_status,
             execute_command,
@@ -268,11 +376,12 @@ pub fn run() {
             get_notifications,
             get_ui_requests,
             respond_ui_request,
+            get_status_bar_items,
+            get_output_lines,
         ])
         .setup(|app| {
-            log::info!("CoreCode M2 starting...");
+            log::info!("CoreCode M4 starting...");
 
-            // Start Extension Host as child process
             let app_handle = app.handle().clone();
             std::thread::Builder::new()
                 .name("ext-host-mgr".to_string())

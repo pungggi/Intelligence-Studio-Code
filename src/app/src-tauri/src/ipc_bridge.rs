@@ -108,6 +108,41 @@ pub struct UiRequest {
     pub params: serde_json::Value,
 }
 
+/// A status bar item contributed by an extension.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusBarItem {
+    pub id: String,
+    pub text: String,
+    pub tooltip: Option<String>,
+    pub command: Option<String>,
+    pub alignment: String,
+    pub priority: i32,
+}
+
+/// An output channel line from an extension.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputLine {
+    pub channel: String,
+    pub text: String,
+}
+
+/// A text decoration from an extension.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextDecoration {
+    pub uri: String,
+    pub decoration_type: String,
+    pub ranges: Vec<DecorationRange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecorationRange {
+    pub start_line: usize,
+    pub start_col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+    pub hover_message: Option<String>,
+}
+
 /// Handle to the IPC bridge for sending messages.
 #[derive(Clone)]
 pub struct IpcHandle {
@@ -117,6 +152,9 @@ pub struct IpcHandle {
     commands: Arc<Mutex<Vec<String>>>,
     notifications: Arc<Mutex<Vec<Notification>>>,
     ui_requests: Arc<Mutex<Vec<UiRequest>>>,
+    status_bar_items: Arc<Mutex<Vec<StatusBarItem>>>,
+    output_lines: Arc<Mutex<Vec<OutputLine>>>,
+    decorations: Arc<Mutex<Vec<TextDecoration>>>,
 }
 
 impl IpcHandle {
@@ -159,6 +197,26 @@ impl IpcHandle {
         let mut store = lock_or_default(&self.ui_requests);
         std::mem::take(&mut *store)
     }
+
+    /// Get current status bar items.
+    pub fn get_status_bar_items(&self) -> Vec<StatusBarItem> {
+        lock_or_default(&self.status_bar_items).clone()
+    }
+
+    /// Drain pending output lines.
+    pub fn drain_output_lines(&self) -> Vec<OutputLine> {
+        let mut store = lock_or_default(&self.output_lines);
+        std::mem::take(&mut *store)
+    }
+
+    /// Get decorations for a specific URI.
+    pub fn get_decorations_for_uri(&self, uri: &str) -> Vec<TextDecoration> {
+        lock_or_default(&self.decorations)
+            .iter()
+            .filter(|d| d.uri == uri)
+            .cloned()
+            .collect()
+    }
 }
 
 /// Start the IPC bridge. Returns a handle for sending messages.
@@ -170,6 +228,9 @@ pub fn start_ipc_bridge() -> IpcHandle {
     let commands = Arc::new(Mutex::new(Vec::new()));
     let notifications = Arc::new(Mutex::new(Vec::new()));
     let ui_requests = Arc::new(Mutex::new(Vec::new()));
+    let status_bar_items = Arc::new(Mutex::new(Vec::new()));
+    let output_lines = Arc::new(Mutex::new(Vec::new()));
+    let decorations = Arc::new(Mutex::new(Vec::new()));
 
     let handle = IpcHandle {
         sender: tx,
@@ -178,6 +239,9 @@ pub fn start_ipc_bridge() -> IpcHandle {
         commands: commands.clone(),
         notifications: notifications.clone(),
         ui_requests: ui_requests.clone(),
+        status_bar_items: status_bar_items.clone(),
+        output_lines: output_lines.clone(),
+        decorations: decorations.clone(),
     };
 
     std::thread::Builder::new()
@@ -189,7 +253,7 @@ pub fn start_ipc_bridge() -> IpcHandle {
                 .expect("Failed to create Tokio runtime");
 
             rt.block_on(async move {
-                ipc_loop(rx, diagnostics, connected, commands, notifications, ui_requests).await;
+                ipc_loop(rx, diagnostics, connected, commands, notifications, ui_requests, status_bar_items, output_lines, decorations).await;
             });
         })
         .expect("Failed to spawn IPC bridge thread");
@@ -204,6 +268,9 @@ async fn ipc_loop(
     commands: Arc<Mutex<Vec<String>>>,
     notifications: Arc<Mutex<Vec<Notification>>>,
     ui_requests: Arc<Mutex<Vec<UiRequest>>>,
+    status_bar_items: Arc<Mutex<Vec<StatusBarItem>>>,
+    output_lines: Arc<Mutex<Vec<OutputLine>>>,
+    decorations: Arc<Mutex<Vec<TextDecoration>>>,
 ) {
     let addr = format!("{}:{}", IPC_HOST, IPC_PORT);
     let mut retry_count: u32 = 0;
@@ -228,7 +295,7 @@ async fn ipc_loop(
                 retry_count = 0;
                 delay_ms = INITIAL_RETRY_DELAY_MS;
 
-                if let Err(e) = handle_connection(stream, &mut rx, &diagnostics, &commands, &notifications, &ui_requests).await {
+                if let Err(e) = handle_connection(stream, &mut rx, &diagnostics, &commands, &notifications, &ui_requests, &status_bar_items, &output_lines, &decorations).await {
                     log::warn!("[IPC] Connection lost: {}", e);
                 }
 
@@ -260,6 +327,9 @@ async fn handle_connection(
     commands: &Arc<Mutex<Vec<String>>>,
     notifications: &Arc<Mutex<Vec<Notification>>>,
     ui_requests: &Arc<Mutex<Vec<UiRequest>>>,
+    status_bar_items: &Arc<Mutex<Vec<StatusBarItem>>>,
+    output_lines: &Arc<Mutex<Vec<OutputLine>>>,
+    decorations: &Arc<Mutex<Vec<TextDecoration>>>,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
 
@@ -268,6 +338,9 @@ async fn handle_connection(
     let cmd_clone = commands.clone();
     let notif_clone = notifications.clone();
     let ui_clone = ui_requests.clone();
+    let sb_clone = status_bar_items.clone();
+    let out_clone = output_lines.clone();
+    let dec_clone = decorations.clone();
     let mut read_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         let mut accumulated = Vec::new();
@@ -300,7 +373,7 @@ async fn handle_connection(
 
                         let payload = &accumulated[4..4 + frame_len];
                         match serde_json::from_slice::<IncomingMessage>(payload) {
-                            Ok(msg) => handle_incoming(&msg, &diag_clone, &cmd_clone, &notif_clone, &ui_clone),
+                            Ok(msg) => handle_incoming(&msg, &diag_clone, &cmd_clone, &notif_clone, &ui_clone, &sb_clone, &out_clone, &dec_clone),
                             Err(e) => log::warn!("[IPC] Malformed message: {}", e),
                         }
 
@@ -351,6 +424,9 @@ fn handle_incoming(
     commands: &Arc<Mutex<Vec<String>>>,
     notifications: &Arc<Mutex<Vec<Notification>>>,
     ui_requests: &Arc<Mutex<Vec<UiRequest>>>,
+    status_bar_items: &Arc<Mutex<Vec<StatusBarItem>>>,
+    output_lines: &Arc<Mutex<Vec<OutputLine>>>,
+    decorations: &Arc<Mutex<Vec<TextDecoration>>>,
 ) {
     match msg.method.as_str() {
         "publishDiagnostics" => {
@@ -403,6 +479,43 @@ fn handle_incoming(
                     request_id,
                     params: params.clone(),
                 });
+            }
+        }
+        "setStatusBarItem" => {
+            if let Some(params) = &msg.params {
+                if let Ok(item) = serde_json::from_value::<StatusBarItem>(params.clone()) {
+                    let mut store = lock_or_default(status_bar_items);
+                    store.retain(|i| i.id != item.id);
+                    store.push(item);
+                }
+            }
+        }
+        "removeStatusBarItem" => {
+            if let Some(params) = &msg.params {
+                let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                lock_or_default(status_bar_items).retain(|i| i.id != id);
+            }
+        }
+        "appendOutput" => {
+            if let Some(params) = &msg.params {
+                let channel = params.get("channel").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let mut store = lock_or_default(output_lines);
+                store.push(OutputLine { channel, text });
+                // Cap at 10k lines
+                if store.len() > 10_000 {
+                    let drain_count = store.len() - 10_000;
+                    store.drain(..drain_count);
+                }
+            }
+        }
+        "setDecorations" => {
+            if let Some(params) = &msg.params {
+                if let Ok(dec) = serde_json::from_value::<TextDecoration>(params.clone()) {
+                    let mut store = lock_or_default(decorations);
+                    store.retain(|d| !(d.uri == dec.uri && d.decoration_type == dec.decoration_type));
+                    store.push(dec);
+                }
             }
         }
         _ => {

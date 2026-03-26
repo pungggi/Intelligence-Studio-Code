@@ -126,6 +126,26 @@ body {
   50% { opacity: 0; }
 }
 
+/* Selection highlight */
+.selection-highlight {
+  position: absolute;
+  background: var(--selection);
+  z-index: 5;
+  pointer-events: none;
+}
+
+/* Find match highlight */
+.find-highlight {
+  background: rgba(250, 179, 135, 0.3);
+  border: 1px solid rgba(250, 179, 135, 0.6);
+  border-radius: 2px;
+}
+
+.find-highlight-current {
+  background: rgba(250, 179, 135, 0.6);
+  border: 1px solid #fab387;
+}
+
 /* Syntax highlighting classes */
 .tok-keyword    { color: var(--syn-keyword); font-weight: 500; }
 .tok-string     { color: var(--syn-string); }
@@ -164,6 +184,21 @@ body {
   color: #a6e3a1;
 }
 
+#ext-status-bar-items {
+  display: flex;
+  gap: 12px;
+}
+
+.ext-sb-item {
+  cursor: pointer;
+  padding: 0 4px;
+  border-radius: 3px;
+}
+
+.ext-sb-item:hover {
+  background: #313244;
+}
+
 /* Diagnostic underlines */
 .diag-error {
   text-decoration: wavy underline #f38ba8;
@@ -192,6 +227,140 @@ body {
 
 .gutter-warning {
   color: #fab387;
+}
+
+/* Find/Replace Bar */
+.find-hidden {
+  display: none !important;
+}
+
+#find-bar {
+  background: var(--bg-titlebar);
+  padding: 6px 12px;
+  border-bottom: 1px solid #313244;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+#find-row, #replace-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#find-input, #replace-input {
+  flex: 1;
+  padding: 4px 8px;
+  background: var(--bg);
+  border: 1px solid #45475a;
+  border-radius: 4px;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+}
+
+#find-input:focus, #replace-input:focus {
+  border-color: var(--accent);
+}
+
+#find-count {
+  font-size: 12px;
+  color: var(--fg-dim);
+  min-width: 60px;
+  text-align: center;
+}
+
+#find-bar button {
+  padding: 2px 8px;
+  background: #313244;
+  border: 1px solid #45475a;
+  border-radius: 4px;
+  color: var(--fg);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+#find-bar button:hover {
+  background: #45475a;
+}
+
+#find-case-label {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+
+/* Output Panel */
+.output-hidden {
+  display: none !important;
+}
+
+#output-panel {
+  display: flex;
+  flex-direction: column;
+  height: 200px;
+  border-top: 1px solid #313244;
+}
+
+#output-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 12px;
+  background: var(--bg-titlebar);
+  border-bottom: 1px solid #313244;
+  font-size: 12px;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+#output-title {
+  font-weight: 600;
+  font-size: 12px;
+}
+
+#output-channel-select {
+  background: var(--bg);
+  border: 1px solid #45475a;
+  border-radius: 4px;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 11px;
+  padding: 1px 4px;
+}
+
+#output-header button {
+  padding: 1px 6px;
+  background: transparent;
+  border: none;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 14px;
+}
+
+#output-header button:hover {
+  color: var(--fg);
+}
+
+#output-close {
+  margin-left: auto;
+}
+
+#output-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 12px;
+  background: var(--bg);
+  font-size: 12px;
+  white-space: pre-wrap;
+  font-family: inherit;
+  color: var(--fg-dim);
 }
 
 /* Command Palette */
@@ -273,7 +442,6 @@ body {
 /* Notification toasts */
 .toast {
   position: fixed;
-  bottom: 40px;
   right: 20px;
   padding: 10px 20px;
   border-radius: 6px;
@@ -301,17 +469,21 @@ body {
 }
 
 /* Scrollbar */
-#editor::-webkit-scrollbar {
+#editor::-webkit-scrollbar,
+#output-content::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
-#editor::-webkit-scrollbar-track {
+#editor::-webkit-scrollbar-track,
+#output-content::-webkit-scrollbar-track {
   background: var(--bg);
 }
-#editor::-webkit-scrollbar-thumb {
+#editor::-webkit-scrollbar-thumb,
+#output-content::-webkit-scrollbar-thumb {
   background: #313244;
   border-radius: 5px;
 }
-#editor::-webkit-scrollbar-thumb:hover {
+#editor::-webkit-scrollbar-thumb:hover,
+#output-content::-webkit-scrollbar-thumb:hover {
   background: #45475a;
 }

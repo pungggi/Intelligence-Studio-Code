@@ -63,18 +63,27 @@ fn collect_tokens_in_range(
 
 fn map_kind(kind: &str) -> &'static str {
     match kind {
-        // Keywords
+        // Keywords (JS/TS/Rust/Python)
         "const" | "let" | "var" | "function" | "async" | "await" | "return" | "if" | "else"
         | "for" | "while" | "class" | "extends" | "new" | "import" | "export" | "from"
         | "try" | "catch" | "throw" | "typeof" | "instanceof" | "super" | "this" | "yield"
         | "of" | "in" | "switch" | "case" | "default" | "break" | "continue" | "do"
         | "fn" | "pub" | "mod" | "use" | "struct" | "enum" | "impl" | "trait" | "where"
         | "mut" | "ref" | "self" | "Self" | "crate" | "match" | "loop" | "move"
-        | "static" | "type" | "as" | "unsafe" | "extern" | "dyn" => "keyword",
+        | "static" | "type" | "as" | "unsafe" | "extern" | "dyn"
+        // TypeScript-specific
+        | "interface" | "declare" | "namespace" | "abstract" | "readonly" | "keyof"
+        | "infer" | "asserts" | "override" | "satisfies"
+        // Python-specific
+        | "def" | "elif" | "except" | "finally" | "global" | "lambda"
+        | "nonlocal" | "pass" | "raise" | "with" | "assert" | "del"
+        | "and" | "or" | "not" => "keyword",
 
         // Strings
         "string" | "string_fragment" | "template_string" | "template_literal"
-        | "escape_sequence" | "string_literal" | "char_literal" => "string",
+        | "escape_sequence" | "string_literal" | "char_literal"
+        | "string_content" | "string_start" | "string_end"
+        | "interpolation" => "string",
 
         // Numbers
         "number" | "integer" | "float" | "integer_literal" | "float_literal" => "number",
@@ -83,24 +92,32 @@ fn map_kind(kind: &str) -> &'static str {
         "comment" | "line_comment" | "block_comment" => "comment",
 
         // Properties
-        "property_identifier" | "shorthand_property_identifier" | "field_identifier" => "property",
+        "property_identifier" | "shorthand_property_identifier" | "field_identifier"
+        | "attribute" => "property",
 
-        // Types
-        "type_identifier" | "predefined_type" | "primitive_type" => "type",
+        // Types (Rust, TS, Python)
+        "type_identifier" | "predefined_type" | "primitive_type"
+        | "type_annotation" | "type_parameter" => "type",
 
         // Constants
-        "true" | "false" | "null" | "undefined" | "none" | "boolean" => "constant",
+        "true" | "false" | "null" | "undefined" | "none" | "boolean"
+        | "None" | "True" | "False" => "constant",
 
         // Operators
         "=" | "==" | "===" | "!=" | "!==" | "+" | "-" | "*" | "/" | "%" | "&&" | "||" | "!"
         | ">" | "<" | ">=" | "<=" | "=>" | "..." | "?." | "??" | "+=" | "-=" | "*=" | "/="
-        | "&" | "|" | "^" | "~" | "<<" | ">>" | "->" | "::" => "operator",
+        | "&" | "|" | "^" | "~" | "<<" | ">>" | "->" | "::"
+        // Python operators
+        | "**" | "//" | "**=" | "//=" | "@" | ":=" => "operator",
 
         // Punctuation
         "(" | ")" | "{" | "}" | "[" | "]" | ";" | "," | "." | ":" => "punctuation",
 
         // Identifiers
         "identifier" => "variable",
+
+        // JSON keys
+        "pair" => "plain",
 
         _ => "plain",
     }

@@ -17,10 +17,41 @@
       <div id="gutter"></div>
       <div id="editor" tabindex="0"></div>
     </div>
+
+    <!-- Find/Replace Bar -->
+    <div id="find-bar" class="find-hidden">
+      <div id="find-row">
+        <input id="find-input" type="text" placeholder="Find..." autocomplete="off" />
+        <span id="find-count"></span>
+        <button id="find-prev" title="Previous (Shift+Enter)">&uarr;</button>
+        <button id="find-next" title="Next (Enter)">&darr;</button>
+        <label id="find-case-label"><input id="find-case" type="checkbox" /> Aa</label>
+        <button id="find-toggle-replace" title="Toggle Replace">&#x25BC;</button>
+        <button id="find-close" title="Close (Escape)">&times;</button>
+      </div>
+      <div id="replace-row" class="find-hidden">
+        <input id="replace-input" type="text" placeholder="Replace..." autocomplete="off" />
+        <button id="replace-one" title="Replace">Replace</button>
+        <button id="replace-all" title="Replace All">All</button>
+      </div>
+    </div>
+
+    <!-- Output Panel (toggle with Ctrl+`) -->
+    <div id="output-panel" class="output-hidden">
+      <div id="output-header">
+        <span id="output-title">Output</span>
+        <select id="output-channel-select"></select>
+        <button id="output-clear" title="Clear">Clear</button>
+        <button id="output-close" title="Close">&times;</button>
+      </div>
+      <div id="output-content"></div>
+    </div>
+
     <div id="statusbar">
       <span id="cursor-pos">Ln 1, Col 1</span>
       <span id="file-info"></span>
       <span id="diagnostics-count"></span>
+      <span id="ext-status-bar-items"></span>
       <span id="ext-host-status">Extension Host: Starting...</span>
     </div>
   </div>
