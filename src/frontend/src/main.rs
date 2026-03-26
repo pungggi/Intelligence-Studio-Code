@@ -7,23 +7,20 @@
 //! 4. Tree-sitter for syntax highlighting
 
 mod buffer;
-mod renderer;
-mod ipc_client;
 
 use anyhow::Result;
-use tracing_subscriber;
 
 fn main() -> Result<()> {
-    tracing_subscriber::init();
-    tracing::info!("CoreCode starting...");
+    env_logger::init();
+    log::info!("CoreCode starting...");
 
     let buffer = buffer::TextBuffer::new();
-    tracing::info!("Text buffer initialized");
+    log::info!("Text buffer initialized ({} chars)", buffer.len_chars());
 
     // TODO M1: Initialize wgpu renderer
     // TODO M1: Connect to Extension Host via IPC
     // TODO M1: Start event loop
 
-    tracing::info!("CoreCode ready (scaffold mode)");
+    log::info!("CoreCode ready (scaffold mode)");
     Ok(())
 }
