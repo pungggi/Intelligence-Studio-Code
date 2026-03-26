@@ -20,6 +20,10 @@ path = "src/bin/spike_ipc.rs"
 name = "spike-ext-host"
 path = "src/bin/spike_ext_host.rs"
 
+[[bin]]
+name = "spike-treesitter"
+path = "src/bin/spike_treesitter.rs"
+
 [dependencies]
 # GPU rendering
 wgpu = "22"
@@ -53,3 +57,8 @@ instant = "0.1"
 # Serialization (for IPC spike)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Syntax highlighting
+tree-sitter = "0.24"
+tree-sitter-javascript = "0.23"
+tree-sitter-rust = "0.23"
