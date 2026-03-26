@@ -87,7 +87,7 @@ pub struct IncomingMessage {
 /// Thread-safe helper: lock a mutex, returning a default on poison.
 fn lock_or_default<T: Default>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
-        log::warn!("[IPC] Recovering from poisoned mutex");
+        log::debug!("[IPC] Recovering from poisoned mutex");
         poisoned.into_inner()
     })
 }
@@ -284,8 +284,8 @@ async fn handle_connection(
                             accumulated[..4].try_into().expect("slice is exactly 4 bytes"),
                         ) as usize;
 
-                        // Reject oversized frames
-                        if frame_len > MAX_FRAME_SIZE {
+                        // Reject empty or oversized frames
+                        if frame_len == 0 || frame_len > MAX_FRAME_SIZE {
                             log::error!(
                                 "[IPC] Frame too large ({} bytes, max {}), dropping connection",
                                 frame_len,

@@ -142,9 +142,10 @@ export class ExtensionLoader {
     // Validate the main entry point stays within the extension directory
     const mainPath = resolve(ext.extensionPath, ext.manifest.main);
     const realExtPath = realpathSync(ext.extensionPath);
+    const realMainPath = existsSync(mainPath) ? realpathSync(mainPath) : mainPath;
 
     // Check for path traversal: resolved main must be inside extension dir
-    const rel = relative(realExtPath, mainPath);
+    const rel = relative(realExtPath, realMainPath);
     if (rel.startsWith("..") || isAbsolute(rel)) {
       throw new Error(
         `[ExtLoader] ${extensionId}: main entry '${ext.manifest.main}' escapes extension directory`

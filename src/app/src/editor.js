@@ -317,12 +317,12 @@ async function executePaletteCommand(command) {
   }
 }
 
-paletteInputEl.addEventListener('input', () => {
+function paletteInputHandler() {
   paletteSelectedIndex = 0;
   filterPalette(paletteInputEl.value);
-});
+}
 
-paletteInputEl.addEventListener('keydown', (e) => {
+function paletteKeydownHandler(e) {
   const total = paletteListEl.children.length;
 
   if (e.key === 'ArrowDown') {
@@ -342,8 +342,10 @@ paletteInputEl.addEventListener('keydown', (e) => {
   } else if (e.key === 'Escape') {
     closePalette();
   }
-});
+}
 
+paletteInputEl.addEventListener('input', paletteInputHandler);
+paletteInputEl.addEventListener('keydown', paletteKeydownHandler);
 paletteBackdropEl.addEventListener('click', closePalette);
 
 function updatePaletteSelection() {
@@ -611,17 +613,33 @@ async function pollNotifications() {
   }
 }
 
+let activeToasts = [];
+
 function showToast(type, message) {
   const toast = document.createElement('div');
   toast.className = `toast toast-${type}`;
   toast.textContent = message;
   document.body.appendChild(toast);
+  activeToasts.push(toast);
+  repositionToasts();
 
   // Auto-dismiss after 5 seconds
   setTimeout(() => {
     toast.classList.add('toast-fade');
-    setTimeout(() => toast.remove(), 300);
+    setTimeout(() => {
+      toast.remove();
+      activeToasts = activeToasts.filter(t => t !== toast);
+      repositionToasts();
+    }, 300);
   }, 5000);
+}
+
+function repositionToasts() {
+  let bottom = 40;
+  for (let i = activeToasts.length - 1; i >= 0; i--) {
+    activeToasts[i].style.bottom = `${bottom}px`;
+    bottom += activeToasts[i].offsetHeight + 8;
+  }
 }
 
 const notifInterval = setInterval(pollNotifications, 1000);
@@ -680,15 +698,13 @@ function handleQuickPick(req) {
 
   renderItems('');
 
-  // Temporarily override palette input handler
-  const origHandler = paletteInputEl.oninput;
-  paletteInputEl.oninput = () => {
+  // Temporarily override palette handlers using addEventListener/removeEventListener
+  function onQuickPickInput() {
     paletteSelectedIndex = 0;
     renderItems(paletteInputEl.value);
-  };
+  }
 
-  const origKeydown = paletteInputEl.onkeydown;
-  paletteInputEl.onkeydown = (e) => {
+  function onQuickPickKeydown(e) {
     const total = paletteListEl.children.length;
     if (e.key === 'ArrowDown') {
       e.preventDefault();
@@ -705,18 +721,31 @@ function handleQuickPick(req) {
     } else if (e.key === 'Escape') {
       closePaletteAndRespond(req.request_id, null);
     }
-  };
+  }
 
-  // Override backdrop close
-  paletteBackdropEl.onclick = () => closePaletteAndRespond(req.request_id, null);
+  function onQuickPickBackdropClick() {
+    closePaletteAndRespond(req.request_id, null);
+  }
+
+  // Remove default palette listeners, add QuickPick-specific ones
+  paletteInputEl.removeEventListener('input', paletteInputHandler);
+  paletteInputEl.removeEventListener('keydown', paletteKeydownHandler);
+  paletteBackdropEl.removeEventListener('click', closePalette);
+  paletteInputEl.addEventListener('input', onQuickPickInput);
+  paletteInputEl.addEventListener('keydown', onQuickPickKeydown);
+  paletteBackdropEl.addEventListener('click', onQuickPickBackdropClick);
 
   function closePaletteAndRespond(requestId, value) {
     paletteOpen = false;
     paletteEl.classList.add('palette-hidden');
     paletteInputEl.placeholder = 'Type a command...';
-    paletteInputEl.oninput = origHandler;
-    paletteInputEl.onkeydown = origKeydown;
-    paletteBackdropEl.onclick = closePalette;
+    // Restore original handlers
+    paletteInputEl.removeEventListener('input', onQuickPickInput);
+    paletteInputEl.removeEventListener('keydown', onQuickPickKeydown);
+    paletteBackdropEl.removeEventListener('click', onQuickPickBackdropClick);
+    paletteInputEl.addEventListener('input', paletteInputHandler);
+    paletteInputEl.addEventListener('keydown', paletteKeydownHandler);
+    paletteBackdropEl.addEventListener('click', closePalette);
     editorEl.focus();
     invoke('respond_ui_request', { requestId, value: value });
   }
@@ -742,24 +771,34 @@ function handleInputBox(req) {
   hint.textContent = prompt + ' (press Enter to confirm, Escape to cancel)';
   paletteListEl.appendChild(hint);
 
-  const origKeydown = paletteInputEl.onkeydown;
-  paletteInputEl.onkeydown = (e) => {
+  function onInputBoxKeydown(e) {
     if (e.key === 'Enter') {
       e.preventDefault();
       closeInputAndRespond(req.request_id, paletteInputEl.value);
     } else if (e.key === 'Escape') {
       closeInputAndRespond(req.request_id, null);
     }
-  };
+  }
 
-  paletteBackdropEl.onclick = () => closeInputAndRespond(req.request_id, null);
+  function onInputBoxBackdropClick() {
+    closeInputAndRespond(req.request_id, null);
+  }
+
+  paletteInputEl.removeEventListener('input', paletteInputHandler);
+  paletteInputEl.removeEventListener('keydown', paletteKeydownHandler);
+  paletteBackdropEl.removeEventListener('click', closePalette);
+  paletteInputEl.addEventListener('keydown', onInputBoxKeydown);
+  paletteBackdropEl.addEventListener('click', onInputBoxBackdropClick);
 
   function closeInputAndRespond(requestId, value) {
     paletteOpen = false;
     paletteEl.classList.add('palette-hidden');
     paletteInputEl.placeholder = 'Type a command...';
-    paletteInputEl.onkeydown = origKeydown;
-    paletteBackdropEl.onclick = closePalette;
+    paletteInputEl.removeEventListener('keydown', onInputBoxKeydown);
+    paletteBackdropEl.removeEventListener('click', onInputBoxBackdropClick);
+    paletteInputEl.addEventListener('input', paletteInputHandler);
+    paletteInputEl.addEventListener('keydown', paletteKeydownHandler);
+    paletteBackdropEl.addEventListener('click', closePalette);
     editorEl.focus();
     invoke('respond_ui_request', { requestId, value: value });
   }

@@ -35,10 +35,16 @@ function activate(context) {
     }
   });
 
-  // Lint on text change (debounced via the editor's change notifications)
+  // Lint on text change with debounce
+  let lintTimer = null;
   vscode.workspace.onDidChangeTextDocument((event) => {
     if (isLintable(event.document)) {
-      lintDocument(event.document);
+      if (lintTimer) clearTimeout(lintTimer);
+      const doc = event.document;
+      lintTimer = setTimeout(() => {
+        lintTimer = null;
+        lintDocument(doc);
+      }, 300);
     }
   });
 
@@ -98,7 +104,7 @@ function lintDocument(doc) {
   const diagnostics = [];
 
   const config = vscode.workspace.getConfiguration('simpleLinter');
-  const maxLineLength = config.get('maxLineLength', 120);
+  const maxLineLength = parseInt(config.get('maxLineLength', 120), 10) || 120;
   const warnConsoleLog = config.get('warnConsoleLog', true);
   const warnVar = config.get('warnVar', true);
 
@@ -114,7 +120,7 @@ function lintDocument(doc) {
         diagnostics.push({
           range: {
             start: { line: i, character: col },
-            end: { line: i, character: col + consoleMatch[0].length - 1 },
+            end: { line: i, character: col + consoleMatch[0].length },
           },
           message: `Unexpected console.${consoleMatch[1]} statement`,
           severity: vscode.DiagnosticSeverity.Warning,
@@ -220,7 +226,9 @@ function lintDocument(doc) {
  */
 function isInsideComment(line, pos) {
   const commentStart = line.indexOf('//');
-  return commentStart >= 0 && commentStart < pos;
+  if (commentStart < 0 || commentStart >= pos) return false;
+  // Make sure the // isn't inside a string
+  return !isInsideString(line, commentStart);
 }
 
 /**
@@ -230,10 +238,17 @@ function isInsideString(line, pos) {
   let inSingle = false;
   let inDouble = false;
   let inTemplate = false;
+  let escaped = false;
   for (let i = 0; i < pos; i++) {
     const ch = line[i];
-    const prev = i > 0 ? line[i - 1] : '';
-    if (prev === '\\') continue;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\' && (inSingle || inDouble || inTemplate)) {
+      escaped = true;
+      continue;
+    }
     if (ch === "'" && !inDouble && !inTemplate) inSingle = !inSingle;
     if (ch === '"' && !inSingle && !inTemplate) inDouble = !inDouble;
     if (ch === '`' && !inSingle && !inDouble) inTemplate = !inTemplate;

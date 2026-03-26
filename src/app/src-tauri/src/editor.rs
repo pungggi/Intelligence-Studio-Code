@@ -11,6 +11,9 @@ use ropey::Rope;
 use std::fs;
 use std::path::PathBuf;
 
+/// Maximum file size that can be opened (50 MB).
+const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
+
 pub struct EditorState {
     rope: Rope,
     file_path: Option<PathBuf>,
@@ -24,7 +27,6 @@ pub struct EditorState {
 impl EditorState {
     pub fn new() -> Self {
         let mut parser = tree_sitter::Parser::new();
-        // Default to JavaScript for now
         let _ = parser.set_language(&tree_sitter_javascript::LANGUAGE.into());
 
         let rope = Rope::from_str("// Welcome to CoreCode\n// Open a file to begin editing\n");
@@ -42,6 +44,16 @@ impl EditorState {
     }
 
     pub fn open_file(&mut self, path: &str) -> Result<()> {
+        // Check file size before reading
+        let metadata = fs::metadata(path).context("Failed to stat file")?;
+        if metadata.len() > MAX_FILE_SIZE {
+            anyhow::bail!(
+                "File too large ({:.1} MB, max {:.0} MB)",
+                metadata.len() as f64 / (1024.0 * 1024.0),
+                MAX_FILE_SIZE as f64 / (1024.0 * 1024.0)
+            );
+        }
+
         let content = fs::read_to_string(path).context("Failed to read file")?;
         self.rope = Rope::from_str(&content);
         self.file_path = Some(PathBuf::from(path));
@@ -60,6 +72,10 @@ impl EditorState {
         // Full parse
         let source = self.rope.to_string();
         self.tree = self.parser.parse(&source, None);
+
+        if self.tree.is_none() {
+            log::warn!("Tree-sitter parse returned None for {}", path);
+        }
 
         log::info!(
             "Opened {} ({} lines, language: {})",
@@ -115,6 +131,11 @@ impl EditorState {
         }
 
         Ok(())
+    }
+
+    /// Return the edit metadata for IPC change notifications (line, col, text).
+    pub fn last_edit_info(&self) -> (u32, String) {
+        (self.version, self.rope.to_string())
     }
 
     pub fn delete(&mut self, line: usize, col: usize, len: usize) -> Result<()> {
@@ -232,6 +253,9 @@ impl EditorState {
             },
             self.tree.as_ref(),
         );
+        if new_tree.is_none() {
+            log::warn!("Tree-sitter incremental parse returned None");
+        }
         self.tree = new_tree;
     }
 
@@ -244,7 +268,9 @@ impl EditorState {
                 let _ = self.parser.set_language(&tree_sitter_rust::LANGUAGE.into());
             }
             _ => {
-                // Keep JavaScript as default
+                // Unknown language — keep parser as-is but clear the tree
+                // so we don't produce incorrect highlights
+                self.tree = None;
             }
         }
     }
