@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "spike-renderer"
 path = "src/bin/spike_renderer.rs"
 
+[[bin]]
+name = "spike-ipc"
+path = "src/bin/spike_ipc.rs"
+
 [dependencies]
 # GPU rendering
 wgpu = "22"
@@ -41,3 +45,7 @@ thiserror = "1"
 
 # Time measurement
 instant = "0.1"
+
+# Serialization (for IPC spike)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
