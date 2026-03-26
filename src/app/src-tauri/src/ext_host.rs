@@ -4,54 +4,83 @@
 //! its lifecycle (start, restart on crash, graceful shutdown).
 
 use anyhow::Result;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 use tauri::AppHandle;
 
+/// Maximum number of restart attempts before giving up.
+const MAX_RESTARTS: u32 = 5;
+
 /// Start the Extension Host as a child process.
+/// Automatically restarts on crash with exponential backoff.
 pub fn start_extension_host(_app: &AppHandle) -> Result<()> {
-    let host_script = find_ext_host_script();
-
-    match host_script {
-        Some(script) => {
-            log::info!("Starting Extension Host: {}", script.display());
-
-            let child = Command::new("node")
-                .arg(&script)
-                .env("CORECODE_MODE", "embedded")
-                .env("CORECODE_IPC_HOST", "127.0.0.1")
-                .env("CORECODE_IPC_PORT", "17532")
-                .spawn();
-
-            match child {
-                Ok(mut process) => {
-                    log::info!("Extension Host started (PID: {})", process.id());
-
-                    std::thread::spawn(move || {
-                        match process.wait() {
-                            Ok(status) => {
-                                log::info!("Extension Host exited: {}", status);
-                            }
-                            Err(e) => {
-                                log::error!("Extension Host error: {}", e);
-                            }
-                        }
-                    });
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Could not start Extension Host (Node.js may not be installed): {}",
-                        e
-                    );
-                }
-            }
-        }
+    let host_script = match find_ext_host_script() {
+        Some(script) => script,
         None => {
             log::info!("Extension Host script not found — running without extensions");
+            return Ok(());
         }
-    }
+    };
 
-    Ok(())
+    let mut restarts = 0u32;
+    let mut delay = Duration::from_secs(1);
+
+    loop {
+        log::info!("Starting Extension Host: {}", host_script.display());
+
+        let child = Command::new("node")
+            .arg(&host_script)
+            .env("CORECODE_MODE", "embedded")
+            .env("CORECODE_IPC_HOST", "127.0.0.1")
+            .env("CORECODE_IPC_PORT", "17532")
+            .spawn();
+
+        match child {
+            Ok(mut process) => {
+                let pid = process.id();
+                log::info!("Extension Host started (PID: {})", pid);
+
+                match process.wait() {
+                    Ok(status) => {
+                        if status.success() {
+                            log::info!("Extension Host exited normally");
+                            return Ok(());
+                        }
+                        log::warn!("Extension Host crashed ({})", status);
+                    }
+                    Err(e) => {
+                        log::error!("Extension Host wait error: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "Could not start Extension Host (Node.js may not be installed): {}",
+                    e
+                );
+                return Ok(());
+            }
+        }
+
+        restarts += 1;
+        if restarts >= MAX_RESTARTS {
+            log::error!(
+                "Extension Host crashed {} times, giving up",
+                MAX_RESTARTS
+            );
+            return Ok(());
+        }
+
+        log::info!(
+            "Restarting Extension Host in {:?} (attempt {}/{})",
+            delay,
+            restarts,
+            MAX_RESTARTS
+        );
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(Duration::from_secs(30));
+    }
 }
 
 fn find_ext_host_script() -> Option<PathBuf> {

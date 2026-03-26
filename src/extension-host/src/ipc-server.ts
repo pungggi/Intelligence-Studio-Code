@@ -11,6 +11,9 @@ import { createServer, Server, Socket } from "net";
 const IPC_HOST = "127.0.0.1";
 const IPC_PORT = 17532;
 
+/** Maximum IPC frame size (10 MB). Must match Rust side. */
+const MAX_FRAME_SIZE = 10 * 1024 * 1024;
+
 export interface IpcMessage {
   method: string;
   params?: Record<string, unknown>;
@@ -33,7 +36,7 @@ export class IpcServer {
 
   async start(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.server = createServer((socket) => {
+      this.server = createServer((socket: Socket) => {
         console.log("[IPC] Frontend connected");
         this.client = socket;
         this.buffer = Buffer.alloc(0);
@@ -66,8 +69,19 @@ export class IpcServer {
     // Process complete frames
     while (this.buffer.length >= 4) {
       const frameLen = this.buffer.readUInt32LE(0);
+
+      // Reject oversized frames
+      if (frameLen > MAX_FRAME_SIZE) {
+        console.error(
+          `[IPC] Frame too large (${frameLen} bytes, max ${MAX_FRAME_SIZE}), disconnecting client`
+        );
+        this.client?.destroy();
+        this.buffer = Buffer.alloc(0);
+        return;
+      }
+
       if (this.buffer.length < 4 + frameLen) {
-        break; // Incomplete frame
+        break; // Incomplete frame, wait for more data
       }
 
       const payload = this.buffer.subarray(4, 4 + frameLen);
@@ -78,7 +92,15 @@ export class IpcServer {
         this.messageHandler?.(msg);
       } catch (err) {
         console.error("[IPC] Failed to parse message:", err);
+        // Frame was consumed from buffer, so alignment is preserved
       }
+    }
+
+    // Guard against unbounded accumulation
+    if (this.buffer.length > MAX_FRAME_SIZE + 4) {
+      console.error("[IPC] Accumulated buffer too large, disconnecting client");
+      this.client?.destroy();
+      this.buffer = Buffer.alloc(0);
     }
   }
 
@@ -91,6 +113,12 @@ export class IpcServer {
     if (!this.client || this.client.destroyed) return;
 
     const json = Buffer.from(JSON.stringify(msg), "utf-8");
+
+    if (json.length > MAX_FRAME_SIZE) {
+      console.error(`[IPC] Outgoing message too large (${json.length} bytes), dropping`);
+      return;
+    }
+
     const header = Buffer.alloc(4);
     header.writeUInt32LE(json.length, 0);
     this.client.write(Buffer.concat([header, json]));

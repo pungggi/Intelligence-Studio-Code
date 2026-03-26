@@ -4,7 +4,7 @@
 //! Cross-platform (Linux, macOS, Windows).
 //! Runs on a dedicated Tokio runtime in a background thread.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncReadExt;
@@ -15,9 +15,20 @@ use tokio::sync::mpsc;
 const IPC_HOST: &str = "127.0.0.1";
 const IPC_PORT: u16 = 17532;
 
+/// Maximum IPC frame size (10 MB). Frames larger than this are rejected.
+const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024;
+
+/// Maximum number of connection retries before giving up.
+const MAX_CONNECT_RETRIES: u32 = 60;
+
+/// Initial retry delay in milliseconds, doubles each attempt (capped at 10s).
+const INITIAL_RETRY_DELAY_MS: u64 = 500;
+const MAX_RETRY_DELAY_MS: u64 = 10_000;
+
 /// A diagnostic from the Extension Host (e.g., ESLint error).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diagnostic {
+    pub uri: Option<String>,
     pub line: usize,
     pub col_start: usize,
     pub col_end: usize,
@@ -38,6 +49,7 @@ pub enum DiagnosticSeverity {
 /// Messages sent from the editor to the Extension Host.
 #[derive(Debug, Serialize)]
 #[serde(tag = "method", content = "params")]
+#[allow(dead_code)]
 pub enum OutgoingMessage {
     #[serde(rename = "textDocument/didOpen")]
     DidOpen {
@@ -67,6 +79,14 @@ pub struct IncomingMessage {
     pub params: Option<serde_json::Value>,
 }
 
+/// Thread-safe helper: lock a mutex, returning a default on poison.
+fn lock_or_default<T: Default>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        log::warn!("[IPC] Recovering from poisoned mutex");
+        poisoned.into_inner()
+    })
+}
+
 /// Handle to the IPC bridge for sending messages.
 #[derive(Clone)]
 pub struct IpcHandle {
@@ -82,19 +102,27 @@ impl IpcHandle {
     }
 
     pub fn get_diagnostics(&self) -> Vec<Diagnostic> {
-        self.diagnostics.lock().unwrap().clone()
+        lock_or_default(&self.diagnostics).clone()
     }
 
-    pub fn clear_diagnostics(&self) {
-        self.diagnostics.lock().unwrap().clear();
+    pub fn get_diagnostics_for_uri(&self, uri: &str) -> Vec<Diagnostic> {
+        lock_or_default(&self.diagnostics)
+            .iter()
+            .filter(|d| d.uri.as_deref() == Some(uri))
+            .cloned()
+            .collect()
+    }
+
+    pub fn clear_diagnostics_for_uri(&self, uri: &str) {
+        lock_or_default(&self.diagnostics).retain(|d| d.uri.as_deref() != Some(uri));
     }
 
     pub fn is_connected(&self) -> bool {
-        *self.connected.lock().unwrap()
+        *lock_or_default(&self.connected)
     }
 
     pub fn get_commands(&self) -> Vec<String> {
-        self.commands.lock().unwrap().clone()
+        lock_or_default(&self.commands).clone()
     }
 }
 
@@ -113,16 +141,19 @@ pub fn start_ipc_bridge() -> IpcHandle {
         commands: commands.clone(),
     };
 
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create Tokio runtime");
+    std::thread::Builder::new()
+        .name("ipc-bridge".to_string())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create Tokio runtime");
 
-        rt.block_on(async move {
-            ipc_loop(rx, diagnostics, connected, commands).await;
-        });
-    });
+            rt.block_on(async move {
+                ipc_loop(rx, diagnostics, connected, commands).await;
+            });
+        })
+        .expect("Failed to spawn IPC bridge thread");
 
     handle
 }
@@ -134,27 +165,50 @@ async fn ipc_loop(
     commands: Arc<Mutex<Vec<String>>>,
 ) {
     let addr = format!("{}:{}", IPC_HOST, IPC_PORT);
+    let mut retry_count: u32 = 0;
+    let mut delay_ms = INITIAL_RETRY_DELAY_MS;
 
     loop {
-        log::info!("[IPC] Connecting to Extension Host at {}...", addr);
+        if retry_count >= MAX_CONNECT_RETRIES {
+            log::error!(
+                "[IPC] Giving up after {} connection attempts to {}",
+                MAX_CONNECT_RETRIES,
+                addr
+            );
+            return;
+        }
 
         match TcpStream::connect(&addr).await {
             Ok(stream) => {
-                *connected.lock().unwrap() = true;
-                log::info!("[IPC] Connected to Extension Host");
+                *lock_or_default(&connected) = true;
+                log::info!("[IPC] Connected to Extension Host at {}", addr);
+
+                // Reset backoff on successful connection
+                retry_count = 0;
+                delay_ms = INITIAL_RETRY_DELAY_MS;
 
                 if let Err(e) = handle_connection(stream, &mut rx, &diagnostics, &commands).await {
                     log::warn!("[IPC] Connection lost: {}", e);
                 }
 
-                *connected.lock().unwrap() = false;
+                *lock_or_default(&connected) = false;
             }
-            Err(_) => {
-                // Extension Host not ready yet, retry
+            Err(e) => {
+                if retry_count % 10 == 0 {
+                    log::info!(
+                        "[IPC] Waiting for Extension Host at {} (attempt {}/{}): {}",
+                        addr,
+                        retry_count + 1,
+                        MAX_CONNECT_RETRIES,
+                        e
+                    );
+                }
+                retry_count += 1;
             }
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+        delay_ms = (delay_ms * 2).min(MAX_RETRY_DELAY_MS);
     }
 }
 
@@ -182,19 +236,36 @@ async fn handle_connection(
                     // Process complete frames
                     while accumulated.len() >= 4 {
                         let frame_len = u32::from_le_bytes(
-                            accumulated[..4].try_into().unwrap(),
+                            accumulated[..4].try_into().expect("slice is exactly 4 bytes"),
                         ) as usize;
+
+                        // Reject oversized frames
+                        if frame_len > MAX_FRAME_SIZE {
+                            log::error!(
+                                "[IPC] Frame too large ({} bytes, max {}), dropping connection",
+                                frame_len,
+                                MAX_FRAME_SIZE
+                            );
+                            return;
+                        }
 
                         if accumulated.len() < 4 + frame_len {
                             break;
                         }
 
                         let payload = &accumulated[4..4 + frame_len];
-                        if let Ok(msg) = serde_json::from_slice::<IncomingMessage>(payload) {
-                            handle_incoming(&msg, &diag_clone, &cmd_clone);
+                        match serde_json::from_slice::<IncomingMessage>(payload) {
+                            Ok(msg) => handle_incoming(&msg, &diag_clone, &cmd_clone),
+                            Err(e) => log::warn!("[IPC] Malformed message: {}", e),
                         }
 
                         accumulated = accumulated[4 + frame_len..].to_vec();
+                    }
+
+                    // Guard against unbounded accumulation from incomplete frames
+                    if accumulated.len() > MAX_FRAME_SIZE + 4 {
+                        log::error!("[IPC] Accumulated buffer too large, dropping connection");
+                        return;
                     }
                 }
                 Err(e) => {
@@ -211,7 +282,8 @@ async fn handle_connection(
             msg = rx.recv() => {
                 match msg {
                     Some(msg) => {
-                        let json = serde_json::to_vec(&msg)?;
+                        let json = serde_json::to_vec(&msg)
+                            .context("Failed to serialize outgoing message")?;
                         let len = (json.len() as u32).to_le_bytes();
                         writer.write_all(&len).await?;
                         writer.write_all(&json).await?;
@@ -236,11 +308,29 @@ fn handle_incoming(
     match msg.method.as_str() {
         "publishDiagnostics" => {
             if let Some(params) = &msg.params {
-                if let Ok(diags) = serde_json::from_value::<Vec<Diagnostic>>(
+                let uri = params
+                    .get("uri")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                if let Ok(mut diags) = serde_json::from_value::<Vec<Diagnostic>>(
                     params.get("diagnostics").cloned().unwrap_or_default(),
                 ) {
-                    *diagnostics.lock().unwrap() = diags;
-                    log::info!("[IPC] Received {} diagnostics", diagnostics.lock().unwrap().len());
+                    // Tag each diagnostic with its URI
+                    for d in &mut diags {
+                        if d.uri.is_none() {
+                            d.uri = uri.clone();
+                        }
+                    }
+
+                    let mut store = lock_or_default(diagnostics);
+                    // Replace diagnostics for this URI, keep others
+                    if let Some(ref u) = uri {
+                        store.retain(|d| d.uri.as_deref() != Some(u));
+                    }
+                    let count = diags.len();
+                    store.extend(diags);
+                    log::info!("[IPC] Received {} diagnostics for {:?}", count, uri);
                 }
             }
         }
@@ -249,7 +339,7 @@ fn handle_incoming(
                 if let Ok(cmds) = serde_json::from_value::<Vec<String>>(
                     params.get("commands").cloned().unwrap_or_default(),
                 ) {
-                    *commands.lock().unwrap() = cmds;
+                    *lock_or_default(commands) = cmds;
                 }
             }
         }

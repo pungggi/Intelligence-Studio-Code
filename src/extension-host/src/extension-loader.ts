@@ -3,13 +3,13 @@
  *
  * Responsibilities:
  * - Scan extension directories for package.json manifests
- * - Parse activation events
+ * - Validate extension paths (prevent path traversal)
  * - Create extension contexts with vscode API shim
  * - Manage extension lifecycle (activate/deactivate)
  */
 
-import { readFileSync, readdirSync, existsSync } from "fs";
-import { join, resolve } from "path";
+import { readFileSync, readdirSync, existsSync, realpathSync } from "fs";
+import { join, resolve, relative, isAbsolute } from "path";
 import { VscodeApiShim } from "./vscode-api-shim";
 
 interface ExtensionManifest {
@@ -24,13 +24,17 @@ interface ExtensionManifest {
 interface LoadedExtension {
   id: string;
   manifest: ExtensionManifest;
-  module: { activate?: (ctx: unknown) => unknown; deactivate?: () => void } | null;
+  module: {
+    activate?: (ctx: unknown) => unknown;
+    deactivate?: () => void;
+  } | null;
   isActive: boolean;
   extensionPath: string;
 }
 
 export class ExtensionLoader {
   private extensions = new Map<string, LoadedExtension>();
+  private activationErrors = new Map<string, string>();
 
   constructor(private apiShim: VscodeApiShim) {}
 
@@ -40,7 +44,9 @@ export class ExtensionLoader {
   async scanAndActivate(extensionsDir: string): Promise<void> {
     const absDir = resolve(extensionsDir);
     if (!existsSync(absDir)) {
-      console.warn(`[ExtLoader] Extensions directory not found: ${absDir}`);
+      console.warn(
+        `[ExtLoader] Extensions directory not found: ${absDir}`
+      );
       return;
     }
 
@@ -57,6 +63,15 @@ export class ExtensionLoader {
         const manifest: ExtensionManifest = JSON.parse(
           readFileSync(manifestPath, "utf-8")
         );
+
+        // Validate required fields
+        if (!manifest.name || typeof manifest.name !== "string") {
+          console.warn(
+            `[ExtLoader] Skipping ${entry.name}: missing or invalid 'name'`
+          );
+          continue;
+        }
+
         const id = `${manifest.publisher ?? "unknown"}.${manifest.name}`;
 
         this.extensions.set(id, {
@@ -67,9 +82,14 @@ export class ExtensionLoader {
           extensionPath: extPath,
         });
 
-        console.log(`[ExtLoader] Discovered: ${id} v${manifest.version}`);
+        console.log(
+          `[ExtLoader] Discovered: ${id} v${manifest.version}`
+        );
       } catch (err) {
-        console.error(`[ExtLoader] Failed to parse ${manifestPath}:`, err);
+        console.error(
+          `[ExtLoader] Failed to parse ${manifestPath}:`,
+          err
+        );
       }
     }
 
@@ -78,6 +98,9 @@ export class ExtensionLoader {
       try {
         await this.activate(id);
       } catch (err) {
+        const msg =
+          err instanceof Error ? err.message : String(err);
+        this.activationErrors.set(id, msg);
         console.error(`[ExtLoader] Failed to activate ${id}:`, err);
       }
     }
@@ -95,36 +118,33 @@ export class ExtensionLoader {
     if (ext.isActive) return;
 
     if (!ext.manifest.main) {
-      console.warn(`[ExtLoader] ${extensionId} has no main entry point`);
+      console.warn(
+        `[ExtLoader] ${extensionId} has no main entry point, skipping`
+      );
       return;
     }
 
-    const mainPath = join(ext.extensionPath, ext.manifest.main);
+    // Validate the main entry point stays within the extension directory
+    const mainPath = resolve(ext.extensionPath, ext.manifest.main);
+    const realExtPath = realpathSync(ext.extensionPath);
+
+    // Check for path traversal: resolved main must be inside extension dir
+    const rel = relative(realExtPath, mainPath);
+    if (rel.startsWith("..") || isAbsolute(rel)) {
+      throw new Error(
+        `[ExtLoader] ${extensionId}: main entry '${ext.manifest.main}' escapes extension directory`
+      );
+    }
+
     if (!existsSync(mainPath) && !existsSync(mainPath + ".js")) {
-      console.warn(`[ExtLoader] ${extensionId} main not found: ${mainPath}`);
+      console.warn(
+        `[ExtLoader] ${extensionId} main not found: ${mainPath}`
+      );
       return;
     }
 
     try {
-      // Load the extension module
-      const mod = require(mainPath);
-      ext.module = mod;
-
-      // Create extension context
-      const context = {
-        subscriptions: [] as { dispose: () => void }[],
-        extensionPath: ext.extensionPath,
-        globalState: {
-          get: () => undefined,
-          update: async () => {},
-        },
-        workspaceState: {
-          get: () => undefined,
-          update: async () => {},
-        },
-      };
-
-      // Inject vscode API into the module's require cache
+      // Inject vscode API into the module's require cache before loading
       const vscodeApi = this.apiShim.createVscodeApi();
       const Module = require("module");
       const originalResolve = Module._resolveFilename;
@@ -144,6 +164,24 @@ export class ExtensionLoader {
         exports: vscodeApi,
       } as NodeJS.Module;
 
+      // Load the extension module
+      const mod = require(mainPath);
+      ext.module = mod;
+
+      // Create extension context
+      const context = {
+        subscriptions: [] as { dispose: () => void }[],
+        extensionPath: ext.extensionPath,
+        globalState: {
+          get: () => undefined,
+          update: async () => {},
+        },
+        workspaceState: {
+          get: () => undefined,
+          update: async () => {},
+        },
+      };
+
       // Call activate
       if (typeof mod.activate === "function") {
         await mod.activate(context);
@@ -153,6 +191,7 @@ export class ExtensionLoader {
       console.log(`[ExtLoader] Activated: ${extensionId}`);
     } catch (err) {
       console.error(`[ExtLoader] Error activating ${extensionId}:`, err);
+      throw err;
     }
   }
 
@@ -162,7 +201,11 @@ export class ExtensionLoader {
 
   getActiveExtensions(): string[] {
     return Array.from(this.extensions.entries())
-      .filter(([_, ext]) => ext.isActive)
+      .filter(([, ext]) => ext.isActive)
       .map(([id]) => id);
+  }
+
+  getActivationErrors(): Map<string, string> {
+    return this.activationErrors;
   }
 }

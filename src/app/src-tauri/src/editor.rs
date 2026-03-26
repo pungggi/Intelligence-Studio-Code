@@ -268,13 +268,27 @@ impl EditorState {
             })
             .collect();
 
+        // Fetch diagnostics for this file only
+        let diagnostics = if let Some(path) = &self.file_path {
+            let uri = {
+                let p = path.display().to_string();
+                #[cfg(target_os = "windows")]
+                { format!("file:///{}", p.replace('\\', "/")) }
+                #[cfg(not(target_os = "windows"))]
+                { format!("file://{}", p) }
+            };
+            ipc.get_diagnostics_for_uri(&uri)
+        } else {
+            vec![]
+        };
+
         EditorContent {
             line_count: lines.len(),
             lines,
             file_path: self.file_path.as_ref().map(|p| p.display().to_string()),
             language: self.language.clone(),
             modified: self.modified,
-            diagnostics: ipc.get_diagnostics(),
+            diagnostics,
         }
     }
 

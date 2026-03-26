@@ -7,23 +7,64 @@ use editor::EditorState;
 use ipc_bridge::{IpcHandle, OutgoingMessage};
 use std::sync::Mutex;
 
+/// Maximum text insertion size (1 MB).
+const MAX_INSERT_SIZE: usize = 1024 * 1024;
+
 /// Shared app state accessible from Tauri commands.
 struct AppState {
     editor: Mutex<EditorState>,
     ipc: IpcHandle,
 }
 
+// --- Path validation ---
+
+/// Canonicalize and validate a file path. Returns the canonical path string.
+/// Rejects paths that don't exist or can't be resolved.
+fn validate_path(path: &str) -> Result<String, String> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|e| format!("Invalid path '{}': {}", path, e))?;
+
+    // Ensure path is a file, not a directory
+    if canonical.is_dir() {
+        return Err(format!("Path is a directory: {}", path));
+    }
+
+    Ok(canonical.to_string_lossy().to_string())
+}
+
+/// Build a file:// URI from a canonical path (cross-platform).
+fn path_to_uri(path: &str) -> String {
+    // On Windows, paths start with C:\, need file:///C:/
+    #[cfg(target_os = "windows")]
+    {
+        format!("file:///{}", path.replace('\\', "/"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        format!("file://{}", path)
+    }
+}
+
 // --- Tauri Commands ---
 
 #[tauri::command]
 fn open_file(path: String, state: tauri::State<AppState>) -> Result<EditorContent, String> {
+    let canonical = validate_path(&path)?;
     let mut editor = state.editor.lock().map_err(|e| e.to_string())?;
-    editor.open_file(&path).map_err(|e| e.to_string())?;
+
+    // Send didClose for the previous file
+    if let Some(prev_path) = editor.file_path_str() {
+        let prev_uri = path_to_uri(&prev_path);
+        state.ipc.send(OutgoingMessage::DidClose { uri: prev_uri.clone() });
+        state.ipc.clear_diagnostics_for_uri(&prev_uri);
+    }
+
+    editor.open_file(&canonical).map_err(|e| e.to_string())?;
 
     // Notify Extension Host
     let content = editor.get_full_text();
     let language = editor.language().unwrap_or("plaintext".to_string());
-    let uri = format!("file://{}", path);
+    let uri = path_to_uri(&canonical);
     state.ipc.send(OutgoingMessage::DidOpen {
         uri,
         language_id: language,
@@ -31,7 +72,6 @@ fn open_file(path: String, state: tauri::State<AppState>) -> Result<EditorConten
         text: content,
     });
 
-    state.ipc.clear_diagnostics();
     Ok(editor.get_content(&state.ipc))
 }
 
@@ -54,6 +94,13 @@ fn edit_insert(
     text: String,
     state: tauri::State<AppState>,
 ) -> Result<EditorContent, String> {
+    if text.len() > MAX_INSERT_SIZE {
+        return Err(format!(
+            "Insertion too large ({} bytes, max {})",
+            text.len(),
+            MAX_INSERT_SIZE
+        ));
+    }
     let mut editor = state.editor.lock().map_err(|e| e.to_string())?;
     editor.insert(line, col, &text).map_err(|e| e.to_string())?;
     notify_change(&editor, &state.ipc);
@@ -128,7 +175,7 @@ fn list_commands(state: tauri::State<AppState>) -> Result<Vec<String>, String> {
 fn notify_change(editor: &EditorState, ipc: &IpcHandle) {
     if let Some(path) = editor.file_path_str() {
         ipc.send(OutgoingMessage::DidChange {
-            uri: format!("file://{}", path),
+            uri: path_to_uri(&path),
             version: editor.version(),
             text: editor.get_full_text(),
         });
@@ -201,11 +248,14 @@ pub fn run() {
 
             // Start Extension Host as child process
             let app_handle = app.handle().clone();
-            std::thread::spawn(move || {
-                if let Err(e) = ext_host::start_extension_host(&app_handle) {
-                    log::error!("Failed to start Extension Host: {}", e);
-                }
-            });
+            std::thread::Builder::new()
+                .name("ext-host-mgr".to_string())
+                .spawn(move || {
+                    if let Err(e) = ext_host::start_extension_host(&app_handle) {
+                        log::error!("Failed to start Extension Host: {}", e);
+                    }
+                })
+                .expect("Failed to spawn Extension Host manager thread");
 
             Ok(())
         })

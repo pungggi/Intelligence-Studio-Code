@@ -76,6 +76,12 @@ function renderContent(content) {
     diagCountEl.textContent = '';
   }
 
+  // Clamp cursor to valid range
+  if (lines.length > 0) {
+    cursorLine = Math.max(0, Math.min(cursorLine, lines.length - 1));
+    cursorCol = Math.max(0, Math.min(cursorCol, (lines[cursorLine]?.text || '').length));
+  }
+
   // Build a map of diagnostics per line
   const diagsByLine = new Map();
   for (const d of diagnostics) {
@@ -220,6 +226,9 @@ function measureCharWidth() {
   document.body.removeChild(span);
   return _charWidth;
 }
+
+// Invalidate cached char width on zoom/resize
+window.addEventListener('resize', () => { _charWidth = null; });
 
 function updateStatusBar() {
   cursorPosEl.textContent = `Ln ${cursorLine + 1}, Col ${cursorCol + 1}`;
@@ -568,7 +577,7 @@ async function refreshDiagnostics() {
 }
 
 // Poll diagnostics every 2 seconds (Extension Host may push new ones)
-setInterval(refreshDiagnostics, 2000);
+const diagnosticsInterval = setInterval(refreshDiagnostics, 2000);
 
 // --- Extension Host status polling ---
 
@@ -587,7 +596,13 @@ async function pollExtHostStatus() {
   }
 }
 
-setInterval(pollExtHostStatus, 3000);
+const extHostInterval = setInterval(pollExtHostStatus, 3000);
+
+// Cleanup on unload
+window.addEventListener('beforeunload', () => {
+  clearInterval(diagnosticsInterval);
+  clearInterval(extHostInterval);
+});
 
 // --- Init ---
 
