@@ -1,0 +1,32 @@
+{
+  "name": "hello-world",
+  "displayName": "Hello World Test Extension",
+  "description": "Minimal test extension for CoreCode Spike 3",
+  "version": "0.0.1",
+  "publisher": "corecode-test",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "activationEvents": [
+    "onCommand:corecode.helloWorld",
+    "onCommand:corecode.greet",
+    "onCommand:corecode.add"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "corecode.helloWorld",
+        "title": "Hello World"
+      },
+      {
+        "command": "corecode.greet",
+        "title": "Greet User"
+      },
+      {
+        "command": "corecode.add",
+        "title": "Add Two Numbers"
+      }
+    ]
+  }
+}

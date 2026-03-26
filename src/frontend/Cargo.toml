@@ -16,6 +16,10 @@ path = "src/bin/spike_renderer.rs"
 name = "spike-ipc"
 path = "src/bin/spike_ipc.rs"
 
+[[bin]]
+name = "spike-ext-host"
+path = "src/bin/spike_ext_host.rs"
+
 [dependencies]
 # GPU rendering
 wgpu = "22"
