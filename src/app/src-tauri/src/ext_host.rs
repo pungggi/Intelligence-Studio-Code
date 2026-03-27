@@ -6,8 +6,28 @@
 use anyhow::Result;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tauri::AppHandle;
+
+/// Shared child process PID so it can be killed on app exit.
+static EXT_HOST_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Kill the Extension Host process if it is running.
+pub fn kill_extension_host() {
+    let pid = EXT_HOST_PID.swap(0, Ordering::SeqCst);
+    if pid != 0 {
+        log::info!("Killing Extension Host (PID: {})", pid);
+        #[cfg(target_os = "windows")]
+        {
+            let _ = Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+        }
+    }
+}
 
 /// Maximum number of restart attempts before giving up.
 const MAX_RESTARTS: u32 = 5;
@@ -39,10 +59,12 @@ pub fn start_extension_host(_app: &AppHandle, ipc_port: u16) -> Result<()> {
         match child {
             Ok(mut process) => {
                 let pid = process.id();
+                EXT_HOST_PID.store(pid, Ordering::SeqCst);
                 log::info!("Extension Host started (PID: {})", pid);
 
                 match process.wait() {
                     Ok(status) => {
+                        EXT_HOST_PID.store(0, Ordering::SeqCst);
                         if status.success() {
                             log::info!("Extension Host exited normally");
                             return Ok(());

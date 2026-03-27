@@ -255,6 +255,19 @@ export class ExtensionLoader {
       .map(([id]) => id);
   }
 
+  async deactivateAll(): Promise<void> {
+    for (const [id, ext] of this.extensions.entries()) {
+      if (ext.isActive && ext.module?.deactivate) {
+        try {
+          await ext.module.deactivate();
+          console.log(`[ExtLoader] Deactivated: ${id}`);
+        } catch (err) {
+          console.error(`[ExtLoader] Failed to deactivate ${id}:`, err);
+        }
+      }
+    }
+  }
+
   getActivationErrors(): Map<string, string> {
     return this.activationErrors;
   }

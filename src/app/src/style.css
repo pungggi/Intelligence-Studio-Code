@@ -291,31 +291,41 @@ body {
 #gutter {
   background: var(--bg-gutter);
   color: var(--fg-gutter);
-  padding: 0 12px 0 8px;
-  text-align: right;
   min-width: 50px;
   overflow: hidden;
-  font-size: 14px;
-  line-height: 1.6;
   border-right: 1px solid var(--border);
   -webkit-user-select: none;
   user-select: none;
+  position: relative;
+}
+
+#gutter-canvas {
+  position: sticky;
+  top: 0;
+  display: block;
+  width: 100%;
 }
 
 #editor {
   flex: 1;
-  padding: 0 0 0 12px;
   overflow-y: auto;
   overflow-x: auto;
   outline: none;
   cursor: text;
   position: relative;
-  white-space: pre;
-  tab-size: 4;
 }
 
-.line {
-  min-height: 1.6em;
+#editor-canvas {
+  position: sticky;
+  top: 0;
+  display: block;
+  z-index: 1;
+}
+
+#scroll-sizer {
+  width: 1px;
+  pointer-events: none;
+  position: relative;
 }
 
 .cursor {

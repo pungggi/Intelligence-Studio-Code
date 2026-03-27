@@ -33,6 +33,8 @@ pub struct Diagnostic {
     pub uri: Option<String>,
     pub line: usize,
     pub col_start: usize,
+    #[serde(default)]
+    pub end_line: Option<usize>,
     pub col_end: usize,
     pub severity: DiagnosticSeverity,
     pub message: String,
@@ -114,7 +116,7 @@ pub struct IncomingMessage {
 /// Thread-safe helper: lock a mutex, returning a default on poison.
 fn lock_or_default<T: Default>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
-        log::debug!("[IPC] Recovering from poisoned mutex");
+        log::warn!("[IPC] Recovering from poisoned mutex");
         poisoned.into_inner()
     })
 }
@@ -586,13 +588,17 @@ fn handle_incoming(
             if let Some(params) = &msg.params {
                 let msg_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("info").to_string();
                 let message = params.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                lock_or_default(notifications).push(Notification { msg_type, message });
+                let mut store = lock_or_default(notifications);
+                if store.len() >= 1000 { store.drain(..500); }
+                store.push(Notification { msg_type, message });
             }
         }
         "showQuickPick" | "showInputBox" => {
             if let Some(params) = &msg.params {
                 let request_id = params.get("requestId").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                lock_or_default(ui_requests).push(UiRequest {
+                let mut uir = lock_or_default(ui_requests);
+                if uir.len() >= 100 { uir.drain(..50); }
+                uir.push(UiRequest {
                     kind: msg.method.clone(),
                     request_id,
                     params: params.clone(),

@@ -25,7 +25,8 @@ export class IpcServer {
   private server: Server | null = null;
   private client: Socket | null = null;
   private messageHandler: MessageHandler | null = null;
-  private buffer: Buffer = Buffer.alloc(0);
+  private bufferChunks: Buffer[] = [];
+  private bufferLength: number = 0;
   private host: string;
   private port: number;
 
@@ -38,8 +39,13 @@ export class IpcServer {
     return new Promise((resolve, reject) => {
       this.server = createServer((socket: Socket) => {
         console.log("[IPC] Frontend connected");
+        if (this.client && !this.client.destroyed) {
+          console.warn("[IPC] Closing previous client connection before accepting new one");
+          this.client.destroy();
+        }
         this.client = socket;
-        this.buffer = Buffer.alloc(0);
+        this.bufferChunks = [];
+        this.bufferLength = 0;
 
         socket.on("data", (data: Buffer) => {
           this.onData(data);
@@ -63,12 +69,22 @@ export class IpcServer {
     });
   }
 
+  private compactBuffer(): Buffer {
+    if (this.bufferChunks.length === 0) return Buffer.alloc(0);
+    if (this.bufferChunks.length === 1) return this.bufferChunks[0];
+    const buf = Buffer.concat(this.bufferChunks, this.bufferLength);
+    this.bufferChunks = [buf];
+    return buf;
+  }
+
   private onData(data: Buffer): void {
-    this.buffer = Buffer.concat([this.buffer, data]);
+    this.bufferChunks.push(data);
+    this.bufferLength += data.length;
 
     // Process complete frames
-    while (this.buffer.length >= 4) {
-      const frameLen = this.buffer.readUInt32LE(0);
+    while (this.bufferLength >= 4) {
+      const buffer = this.compactBuffer();
+      const frameLen = buffer.readUInt32LE(0);
 
       // Reject oversized frames
       if (frameLen > MAX_FRAME_SIZE) {
@@ -76,31 +92,34 @@ export class IpcServer {
           `[IPC] Frame too large (${frameLen} bytes, max ${MAX_FRAME_SIZE}), disconnecting client`
         );
         this.client?.destroy();
-        this.buffer = Buffer.alloc(0);
+        this.bufferChunks = [];
+        this.bufferLength = 0;
         return;
       }
 
-      if (this.buffer.length < 4 + frameLen) {
+      if (this.bufferLength < 4 + frameLen) {
         break; // Incomplete frame, wait for more data
       }
 
-      const payload = this.buffer.subarray(4, 4 + frameLen);
-      this.buffer = this.buffer.subarray(4 + frameLen);
+      const payload = buffer.subarray(4, 4 + frameLen);
+      const remaining = buffer.subarray(4 + frameLen);
+      this.bufferChunks = remaining.length > 0 ? [remaining] : [];
+      this.bufferLength = remaining.length;
 
       try {
         const msg: IpcMessage = JSON.parse(payload.toString("utf-8"));
         this.messageHandler?.(msg);
       } catch (err) {
         console.error("[IPC] Failed to parse message:", err);
-        // Frame was consumed from buffer, so alignment is preserved
       }
     }
 
     // Guard against unbounded accumulation
-    if (this.buffer.length > MAX_FRAME_SIZE + 4) {
+    if (this.bufferLength > MAX_FRAME_SIZE + 4) {
       console.error("[IPC] Accumulated buffer too large, disconnecting client");
       this.client?.destroy();
-      this.buffer = Buffer.alloc(0);
+      this.bufferChunks = [];
+      this.bufferLength = 0;
     }
   }
 
@@ -133,8 +152,9 @@ export class IpcServer {
 
   async stop(): Promise<void> {
     this.client?.destroy();
+    if (!this.server) return;
     return new Promise((resolve) => {
-      this.server?.close(() => {
+      this.server!.close(() => {
         resolve();
       });
     });

@@ -49,12 +49,15 @@ async function main(): Promise<void> {
     `[ExtensionHost] Ready — ${active.length} extension(s) active: ${active.join(", ") || "none"}`
   );
 
-  // Keep process alive
-  process.on("SIGTERM", async () => {
+  // Graceful shutdown on SIGTERM and SIGINT
+  const shutdown = async () => {
     console.log("[ExtensionHost] Shutting down...");
+    await extensionLoader.deactivateAll();
     await ipcServer.stop();
     process.exit(0);
-  });
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 }
 
 main().catch((err) => {

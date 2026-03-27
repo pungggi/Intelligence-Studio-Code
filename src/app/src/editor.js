@@ -1,39 +1,107 @@
 /**
- * CoreCode M5 — Multi-file Editor Frontend
+ * CoreCode M7 — Canvas-based Editor Frontend
  *
- * Features carried from M4:
- * - Text editing with syntax highlighting
- * - Diagnostics display (underlines + gutter markers)
- * - Command palette (Ctrl+Shift+P)
- * - Undo/Redo, Selection, Clipboard, Find/Replace
- * - Extension status bar items, Output panel
+ * M7 changes:
+ * - DOM-based line rendering replaced with Canvas2D
+ * - Virtual scrolling: only visible lines fetched/rendered
+ * - Edit commands return lightweight EditResult (no line data)
+ * - O(1) mouse position mapping (arithmetic, no DOM queries)
+ * - Token-colored text drawn directly on canvas
  *
- * New in M5:
- * - Tab bar with open/close/switch, modified indicator, Ctrl+Tab cycling
- * - File explorer sidebar (Ctrl+B toggle)
- * - Multi-document state (per-buffer cursor, selection)
- * - Minimap (scrollbar-side overview)
+ * Carried from M1-M6:
+ * - Syntax highlighting, diagnostics, command palette
+ * - Undo/redo, selection, clipboard, find/replace
+ * - Tabs, file explorer, minimap
+ * - LSP: autocomplete, hover, go-to-def, references, code actions, signature help, symbols, formatting
  */
 
 const { invoke } = window.__TAURI__.core;
 
+// ─── Token Colors (Catppuccin Mocha) ─────────────────────────
+const TOKEN_COLORS = {
+  keyword:     '#cba6f7',
+  string:      '#a6e3a1',
+  number:      '#fab387',
+  comment:     '#585b70',
+  function:    '#89b4fa',
+  variable:    '#cdd6f4',
+  type:        '#f9e2af',
+  property:    '#89dceb',
+  constant:    '#fab387',
+  operator:    '#94e2d5',
+  punctuation: '#6c7086',
+  tag_name:    '#f38ba8',
+  attribute:   '#89dceb',
+  heading:     '#cba6f7',
+  link:        '#89b4fa',
+  plain:       '#cdd6f4',
+};
+
+const DIAG_COLORS = {
+  error:   '#f38ba8',
+  warning: '#fab387',
+  info:    '#89b4fa',
+  hint:    '#a6e3a1',
+};
+
+const BG_COLOR      = '#1e1e2e';
+const GUTTER_BG     = '#181825';
+const GUTTER_FG     = '#45475a';
+const SELECTION_BG   = 'rgba(49, 50, 68, 0.8)';
+const CURSOR_COLOR   = '#f5e0dc';
+const FIND_BG        = 'rgba(250, 179, 135, 0.3)';
+const FIND_BORDER    = 'rgba(250, 179, 135, 0.6)';
+const FIND_CUR_BG    = 'rgba(250, 179, 135, 0.6)';
+const FIND_CUR_BORDER= '#fab387';
+
 // ─── Multi-buffer State ─────────────────────────────────────
 
-/**
- * Per-buffer state stored in the frontend.
- * Keys are canonical file paths (strings).
- * @type {Map<string, {cursorLine: number, cursorCol: number, selAnchorLine: number|null, selAnchorCol: number|null, scrollTop: number}>}
- */
 const bufferStates = new Map();
 let activeBufferPath = null;
 
-// Current active buffer's state (synced with bufferStates on switch)
+// Current active buffer state
 let cursorLine = 0;
 let cursorCol = 0;
-let lines = [];
 let filePath = null;
 let modified = false;
 let diagnostics = [];
+let totalLines = 3; // total lines in document
+
+// Cached visible content (from get_visible_content)
+let cachedLines = [];      // HighlightedLine[] for cached range
+let cachedFirstLine = 0;   // first line index in cache
+let cachedLanguage = null;
+
+// Rendering state
+let cellWidth = 0;     // monospace character width (px)
+let lineHeight = 0;    // line height (px)
+let fontReady = false;
+let cachedFont = '';
+let cachedFontSize = 0;
+const GUTTER_PADDING_LEFT = 8;
+const GUTTER_PADDING_RIGHT = 12;
+const EDITOR_PADDING_LEFT = 12;
+const BUFFER_LINES = 30;  // extra lines to cache above/below viewport
+
+// Serial edit queue — prevents async keystroke interleaving
+let editQueueTail = Promise.resolve();
+function queueEdit(fn) {
+  editQueueTail = editQueueTail.then(fn, fn);
+  return editQueueTail;
+}
+
+// Cursor blink
+let cursorVisible = true;
+let cursorBlinkTimer = null;
+
+function resetCursorBlink() {
+  cursorVisible = true;
+  clearInterval(cursorBlinkTimer);
+  cursorBlinkTimer = setInterval(() => {
+    cursorVisible = !cursorVisible;
+    requestRender();
+  }, 530);
+}
 
 // Palette
 let paletteOpen = false;
@@ -41,7 +109,7 @@ let paletteSelectedIndex = 0;
 let paletteCommands = [];
 let paletteFiltered = [];
 
-// Selection (anchor = where selection started; cursor = moving end)
+// Selection
 let selAnchorLine = null;
 let selAnchorCol = null;
 let isDragging = false;
@@ -65,6 +133,9 @@ let expandedDirs = new Set();
 
 const editorEl = document.getElementById('editor');
 const gutterEl = document.getElementById('gutter');
+const editorCanvas = document.getElementById('editor-canvas');
+const gutterCanvas = document.getElementById('gutter-canvas');
+const scrollSizer = document.getElementById('scroll-sizer');
 const fileNameEl = document.getElementById('file-name');
 const languageBadgeEl = document.getElementById('language-badge');
 const cursorPosEl = document.getElementById('cursor-pos');
@@ -113,6 +184,442 @@ const minimapEl = document.getElementById('minimap');
 const minimapCanvas = document.getElementById('minimap-canvas');
 const minimapViewport = document.getElementById('minimap-viewport');
 
+// ─── Font Measurement ────────────────────────────────────────
+
+function measureFont() {
+  const style = getComputedStyle(document.body);
+  cachedFont = `${style.fontSize} ${style.fontFamily}`;
+  cachedFontSize = parseFloat(style.fontSize);
+
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  ctx.font = cachedFont;
+  const metrics = ctx.measureText('M');
+  cellWidth = metrics.width;
+
+  lineHeight = Math.round(cachedFontSize * 1.6);
+
+  fontReady = cellWidth > 0 && lineHeight > 0;
+}
+
+window.addEventListener('resize', () => {
+  measureFont();
+  resizeCanvases();
+  requestRender();
+});
+
+// ─── Canvas Setup ────────────────────────────────────────────
+
+function resizeCanvases() {
+  if (!fontReady) return;
+  const dpr = window.devicePixelRatio || 1;
+
+  // Editor canvas fills visible area
+  const edW = editorEl.clientWidth;
+  const edH = editorEl.clientHeight;
+  editorCanvas.style.width = edW + 'px';
+  editorCanvas.style.height = edH + 'px';
+  editorCanvas.width = Math.round(edW * dpr);
+  editorCanvas.height = Math.round(edH * dpr);
+
+  // Gutter canvas
+  const gW = gutterEl.clientWidth;
+  const gH = editorEl.clientHeight;
+  gutterCanvas.style.width = gW + 'px';
+  gutterCanvas.style.height = gH + 'px';
+  gutterCanvas.width = Math.round(gW * dpr);
+  gutterCanvas.height = Math.round(gH * dpr);
+
+  // Update scroll sizer height
+  updateScrollSizer();
+}
+
+function updateScrollSizer() {
+  const totalH = totalLines * lineHeight;
+  // Scroll sizer: total height minus the canvas height (canvas is sticky and in-flow)
+  const sizerH = Math.max(0, totalH - editorEl.clientHeight);
+  scrollSizer.style.height = sizerH + 'px';
+}
+
+// ─── Canvas Rendering ────────────────────────────────────────
+
+let renderScheduled = false;
+
+function requestRender() {
+  if (renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(() => {
+    renderScheduled = false;
+    paintAll();
+  });
+}
+
+function paintAll() {
+  if (!fontReady) return;
+  paintEditorCanvas();
+  paintGutterCanvas();
+  renderMinimap();
+}
+
+function getVisibleLineRange() {
+  const scrollTop = editorEl.scrollTop;
+  const first = Math.floor(scrollTop / lineHeight);
+  const count = Math.ceil(editorEl.clientHeight / lineHeight) + 1;
+  return { first: Math.max(0, first), count };
+}
+
+function paintEditorCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const ctx = editorCanvas.getContext('2d');
+  const w = editorCanvas.width;
+  const h = editorCanvas.height;
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w / dpr, h / dpr);
+  ctx.fillStyle = BG_COLOR;
+  ctx.fillRect(0, 0, w / dpr, h / dpr);
+
+  if (!fontReady || cachedLines.length === 0) return;
+
+  ctx.font = cachedFont;
+  ctx.textBaseline = 'top';
+
+  const { first } = getVisibleLineRange();
+  const scrollTop = editorEl.scrollTop;
+  const subPixelOffset = -(scrollTop % lineHeight);
+
+  // Draw selection
+  paintSelection(ctx, first, subPixelOffset);
+
+  // Draw find highlights
+  paintFindHighlights(ctx, first, subPixelOffset);
+
+  // Build diagnostic lookup map (O(1) per line instead of O(n))
+  const diagMap = new Map();
+  for (const d of diagnostics) {
+    if (!diagMap.has(d.line)) diagMap.set(d.line, []);
+    diagMap.get(d.line).push(d);
+  }
+
+  // Draw text lines
+  const fontSize = parseFloat(style.fontSize);
+  const visibleCount = Math.ceil((h / dpr) / lineHeight) + 2;
+  for (let vi = 0; vi < visibleCount; vi++) {
+    const lineIdx = first + vi;
+    if (lineIdx >= totalLines) break;
+
+    const cacheOffset = lineIdx - cachedFirstLine;
+    if (cacheOffset < 0 || cacheOffset >= cachedLines.length) continue;
+
+    const line = cachedLines[cacheOffset];
+    const y = vi * lineHeight + subPixelOffset;
+    const textY = y + (lineHeight - fontSize) / 2;
+
+    if (line.tokens && line.tokens.length > 0) {
+      drawTokenizedLine(ctx, line.text, line.tokens, EDITOR_PADDING_LEFT, textY);
+    } else {
+      ctx.fillStyle = TOKEN_COLORS.plain;
+      ctx.fillText(line.text || '', EDITOR_PADDING_LEFT, textY);
+    }
+
+    // Draw diagnostic underlines
+    const lineDiags = diagMap.get(lineIdx);
+    if (lineDiags) {
+      for (const d of lineDiags) {
+        drawWavyUnderline(ctx,
+          EDITOR_PADDING_LEFT + d.col_start * cellWidth,
+          y + lineHeight - 3,
+          (d.col_end - d.col_start) * cellWidth,
+          DIAG_COLORS[d.severity] || DIAG_COLORS.error
+        );
+      }
+    }
+  }
+
+  // Draw cursor
+  paintCursor(ctx, first, subPixelOffset);
+}
+
+function drawTokenizedLine(ctx, text, tokens, x, y) {
+  if (!text) return;
+  let lastEnd = 0;
+  for (const token of tokens) {
+    // Text before token (plain)
+    if (token.start > lastEnd) {
+      ctx.fillStyle = TOKEN_COLORS.plain;
+      ctx.fillText(text.substring(lastEnd, token.start), x + lastEnd * cellWidth, y);
+    }
+    // Token text
+    ctx.fillStyle = TOKEN_COLORS[token.kind] || TOKEN_COLORS.plain;
+    ctx.fillText(text.substring(token.start, token.end), x + token.start * cellWidth, y);
+    lastEnd = token.end;
+  }
+  // Remaining text
+  if (lastEnd < text.length) {
+    ctx.fillStyle = TOKEN_COLORS.plain;
+    ctx.fillText(text.substring(lastEnd), x + lastEnd * cellWidth, y);
+  }
+}
+
+function paintSelection(ctx, firstVisibleLine, subPixelOffset) {
+  const sel = getSelectionRange();
+  if (!sel) return;
+
+  ctx.fillStyle = SELECTION_BG;
+  const visibleCount = Math.ceil(editorCanvas.height / (window.devicePixelRatio || 1) / lineHeight) + 2;
+
+  for (let vi = 0; vi < visibleCount; vi++) {
+    const lineIdx = firstVisibleLine + vi;
+    if (lineIdx < sel.startLine || lineIdx > sel.endLine) continue;
+    if (lineIdx >= totalLines) break;
+
+    const lineText = getLineText(lineIdx);
+    const lineLen = lineText.length;
+
+    const colStart = (lineIdx === sel.startLine) ? sel.startCol : 0;
+    let colEnd = (lineIdx === sel.endLine) ? sel.endCol : lineLen;
+    if (lineIdx !== sel.endLine) colEnd = Math.max(colEnd, lineLen) + 1;
+    if (colStart >= colEnd) continue;
+
+    const y = vi * lineHeight + subPixelOffset;
+    const x = EDITOR_PADDING_LEFT + colStart * cellWidth;
+    const w = Math.max((colEnd - colStart) * cellWidth, cellWidth * 0.5);
+    ctx.fillRect(x, y, w, lineHeight);
+  }
+}
+
+function paintFindHighlights(ctx, firstVisibleLine, subPixelOffset) {
+  if (!findOpen || findMatches.length === 0) return;
+
+  for (let mi = 0; mi < findMatches.length; mi++) {
+    const m = findMatches[mi];
+    const vi = m.line - firstVisibleLine;
+    if (vi < -1 || vi > Math.ceil(editorCanvas.height / (window.devicePixelRatio || 1) / lineHeight) + 2) continue;
+
+    const y = vi * lineHeight + subPixelOffset;
+    const x = EDITOR_PADDING_LEFT + m.col * cellWidth;
+    const w = m.length * cellWidth;
+
+    if (mi === findCurrentIdx) {
+      ctx.fillStyle = FIND_CUR_BG;
+      ctx.fillRect(x, y, w, lineHeight);
+      ctx.strokeStyle = FIND_CUR_BORDER;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x + 0.5, y + 0.5, w - 1, lineHeight - 1);
+    } else {
+      ctx.fillStyle = FIND_BG;
+      ctx.fillRect(x, y, w, lineHeight);
+      ctx.strokeStyle = FIND_BORDER;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x + 0.5, y + 0.5, w - 1, lineHeight - 1);
+    }
+  }
+}
+
+function paintCursor(ctx, firstVisibleLine, subPixelOffset) {
+  if (!cursorVisible) return;
+  const vi = cursorLine - firstVisibleLine;
+  const visH = editorCanvas.height / (window.devicePixelRatio || 1);
+  if (vi < 0 || vi * lineHeight + subPixelOffset > visH) return;
+
+  const y = vi * lineHeight + subPixelOffset;
+  const x = EDITOR_PADDING_LEFT + cursorCol * cellWidth;
+
+  ctx.fillStyle = CURSOR_COLOR;
+  ctx.fillRect(x, y, 2, lineHeight);
+}
+
+function drawWavyUnderline(ctx, x, y, width, color) {
+  if (width <= 0) return;
+  ctx.beginPath();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1;
+  const amplitude = 2;
+  const wavelength = 4;
+  for (let i = 0; i <= width; i += 0.5) {
+    const dy = Math.sin((i / wavelength) * Math.PI * 2) * amplitude;
+    if (i === 0) ctx.moveTo(x + i, y + dy);
+    else ctx.lineTo(x + i, y + dy);
+  }
+  ctx.stroke();
+}
+
+function paintGutterCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const ctx = gutterCanvas.getContext('2d');
+  const w = gutterCanvas.width / dpr;
+  const h = gutterCanvas.height / dpr;
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = GUTTER_BG;
+  ctx.fillRect(0, 0, w, h);
+
+  if (!fontReady) return;
+
+  ctx.font = cachedFont;
+  ctx.textBaseline = 'top';
+  ctx.textAlign = 'right';
+
+  const { first } = getVisibleLineRange();
+  const scrollTop = editorEl.scrollTop;
+  const subPixelOffset = -(scrollTop % lineHeight);
+
+  // Build diagnostic line set for O(1) lookup
+  const diagLineMap = new Map();
+  for (const d of diagnostics) {
+    if (!diagLineMap.has(d.line)) diagLineMap.set(d.line, d);
+  }
+
+  const visibleCount = Math.ceil(h / lineHeight) + 2;
+  const gutterTextX = w - GUTTER_PADDING_RIGHT;
+
+  for (let vi = 0; vi < visibleCount; vi++) {
+    const lineIdx = first + vi;
+    if (lineIdx >= totalLines) break;
+
+    const y = vi * lineHeight + subPixelOffset;
+    const textY = y + (lineHeight - cachedFontSize) / 2;
+
+    // Check for diagnostic markers on this line
+    const lineDiag = diagLineMap.get(lineIdx);
+    if (lineDiag) {
+      ctx.fillStyle = DIAG_COLORS[lineDiag.severity] || GUTTER_FG;
+    } else {
+      ctx.fillStyle = GUTTER_FG;
+    }
+
+    ctx.fillText(String(lineIdx + 1), gutterTextX, textY);
+  }
+}
+
+// ─── Content Fetching ────────────────────────────────────────
+
+async function fetchVisibleContent() {
+  const { first, count } = getVisibleLineRange();
+  const fetchFirst = Math.max(0, first - BUFFER_LINES);
+  const fetchCount = count + BUFFER_LINES * 2;
+
+  try {
+    const vc = await invoke('get_visible_content', {
+      firstLine: fetchFirst,
+      lineCount: fetchCount,
+    });
+    cachedLines = vc.lines;
+    cachedFirstLine = vc.first_line;
+    totalLines = vc.total_lines;
+    filePath = vc.file_path || filePath;
+    modified = vc.modified;
+    cachedLanguage = vc.language;
+    diagnostics = vc.diagnostics || [];
+    updateScrollSizer();
+  } catch (err) {
+    console.error('fetchVisibleContent error:', err);
+  }
+}
+
+function getLineText(lineIdx) {
+  const offset = lineIdx - cachedFirstLine;
+  if (offset >= 0 && offset < cachedLines.length) {
+    return cachedLines[offset]?.text || '';
+  }
+  return '';
+}
+
+// ─── Update Helpers ──────────────────────────────────────────
+
+/**
+ * Called after file open / switch / close (which still return EditorContent).
+ * Uses the full content for initial metadata, then fetches visible for canvas.
+ */
+async function updateFromEditorContent(content) {
+  filePath = content.file_path;
+  modified = content.modified;
+  totalLines = content.line_count;
+  diagnostics = content.diagnostics || [];
+  cachedLanguage = content.language;
+
+  // Populate cache from full content (for the visible range)
+  cachedLines = content.lines || [];
+  cachedFirstLine = 0;
+
+  if (filePath) {
+    activeBufferPath = filePath;
+  }
+
+  updateMetadataUI();
+  updateScrollSizer();
+  resizeCanvases();
+  ensureCursorVisible();
+  await fetchVisibleContent();
+  requestRender();
+}
+
+/**
+ * Called after edit commands (which now return EditResult).
+ */
+async function updateFromEditResult(result) {
+  totalLines = result.total_lines;
+  modified = result.modified;
+  updateMetadataUI();
+  updateScrollSizer();
+  ensureCursorVisible();
+  await fetchVisibleContent();
+  requestRender();
+}
+
+function updateMetadataUI() {
+  if (filePath) {
+    const name = filePath.split(/[/\\]/).pop();
+    fileNameEl.textContent = (modified ? '● ' : '') + name;
+  } else {
+    fileNameEl.textContent = 'CoreCode';
+  }
+
+  if (cachedLanguage) {
+    languageBadgeEl.textContent = cachedLanguage;
+    languageBadgeEl.style.display = '';
+  } else {
+    languageBadgeEl.style.display = 'none';
+  }
+
+  fileInfoEl.textContent = `${totalLines} lines`;
+
+  const errorCount = diagnostics.filter(d => d.severity === 'error').length;
+  const warnCount = diagnostics.filter(d => d.severity === 'warning').length;
+  if (errorCount || warnCount) {
+    const parts = [];
+    if (errorCount) parts.push(`${errorCount} error${errorCount > 1 ? 's' : ''}`);
+    if (warnCount) parts.push(`${warnCount} warning${warnCount > 1 ? 's' : ''}`);
+    diagCountEl.textContent = parts.join(', ');
+  } else {
+    diagCountEl.textContent = '';
+  }
+
+  cursorLine = Math.max(0, Math.min(cursorLine, totalLines - 1));
+  cursorCol = Math.max(0, Math.min(cursorCol, getLineText(cursorLine).length));
+}
+
+function ensureCursorVisible() {
+  const cursorTop = cursorLine * lineHeight;
+  const cursorBottom = cursorTop + lineHeight;
+  if (cursorBottom > editorEl.scrollTop + editorEl.clientHeight) {
+    editorEl.scrollTop = cursorBottom - editorEl.clientHeight;
+  } else if (cursorTop < editorEl.scrollTop) {
+    editorEl.scrollTop = cursorTop;
+  }
+}
+
+function updateStatusBar() {
+  let pos = `Ln ${cursorLine + 1}, Col ${cursorCol + 1}`;
+  if (hasSelection()) {
+    const sel = getSelectionRange();
+    const selLines = sel.endLine - sel.startLine + 1;
+    pos += ` (${selLines} line${selLines > 1 ? 's' : ''} selected)`;
+  }
+  cursorPosEl.textContent = pos;
+}
+
 // ─── Buffer State Management ─────────────────────────────────
 
 function saveBufferState() {
@@ -133,7 +640,6 @@ function restoreBufferState(path) {
     cursorCol = state.cursorCol;
     selAnchorLine = state.selAnchorLine;
     selAnchorCol = state.selAnchorCol;
-    // scrollTop restored after render
   } else {
     cursorLine = 0;
     cursorCol = 0;
@@ -202,7 +708,7 @@ async function switchTab(path) {
     const content = await invoke('switch_buffer', { path });
     activeBufferPath = path;
     restoreBufferState(path);
-    renderContent(content);
+    await updateFromEditorContent(content);
     renderTabs();
     const scrollState = bufferStates.get(path);
     if (scrollState) editorEl.scrollTop = scrollState.scrollTop;
@@ -219,14 +725,14 @@ async function closeTab(path) {
     if (result) {
       activeBufferPath = result.file_path;
       restoreBufferState(activeBufferPath);
-      renderContent(result);
+      await updateFromEditorContent(result);
     } else {
       activeBufferPath = null;
       cursorLine = 0;
       cursorCol = 0;
       clearSelection();
       const content = await invoke('get_content');
-      renderContent(content);
+      await updateFromEditorContent(content);
     }
     renderTabs();
   } catch (err) {
@@ -264,289 +770,38 @@ function ensureAnchor() {
   }
 }
 
-// ─── Mouse Helpers ───────────────────────────────────────────
+// ─── Mouse Helpers (O(1) arithmetic) ─────────────────────────
 
 function posFromMouse(e) {
-  const lineEls = editorEl.querySelectorAll('.line');
-  const charWidth = measureCharWidth();
-  const editorRect = editorEl.getBoundingClientRect();
+  const rect = editorCanvas.getBoundingClientRect();
+  const scrollTop = editorEl.scrollTop;
+  const y = e.clientY - rect.top + scrollTop;
+  const x = e.clientX - rect.left - EDITOR_PADDING_LEFT + editorEl.scrollLeft;
 
-  let line = lines.length - 1;
-  for (let i = 0; i < lineEls.length; i++) {
-    const rect = lineEls[i].getBoundingClientRect();
-    if (i === 0 && e.clientY < rect.top) { line = 0; break; }
-    if (e.clientY >= rect.top && e.clientY < rect.bottom) { line = i; break; }
-  }
-  line = Math.max(0, Math.min(line, lines.length - 1));
-
-  const relativeX = e.clientX - editorRect.left - 12 + editorEl.scrollLeft;
-  const col = Math.max(0, Math.min(
-    Math.round(relativeX / charWidth),
-    (lines[line]?.text || '').length
-  ));
+  const line = Math.max(0, Math.min(Math.floor(y / lineHeight), totalLines - 1));
+  const lineText = getLineText(line);
+  const col = Math.max(0, Math.min(Math.round(x / cellWidth), lineText.length));
 
   return { line, col };
 }
 
-// ─── Rendering ───────────────────────────────────────────────
+// ─── Popup Positioning (arithmetic, no DOM line queries) ─────
 
-function renderContent(content) {
-  lines = content.lines || [];
-  filePath = content.file_path;
-  modified = content.modified;
-  diagnostics = content.diagnostics || [];
-
-  if (filePath) {
-    activeBufferPath = filePath;
-    const name = filePath.split(/[/\\]/).pop();
-    fileNameEl.textContent = (modified ? '● ' : '') + name;
-  } else {
-    fileNameEl.textContent = 'CoreCode';
-  }
-
-  if (content.language) {
-    languageBadgeEl.textContent = content.language;
-    languageBadgeEl.style.display = '';
-  } else {
-    languageBadgeEl.style.display = 'none';
-  }
-
-  fileInfoEl.textContent = `${content.line_count} lines`;
-
-  const errorCount = diagnostics.filter(d => d.severity === 'error').length;
-  const warnCount = diagnostics.filter(d => d.severity === 'warning').length;
-  if (errorCount || warnCount) {
-    const parts = [];
-    if (errorCount) parts.push(`${errorCount} error${errorCount > 1 ? 's' : ''}`);
-    if (warnCount) parts.push(`${warnCount} warning${warnCount > 1 ? 's' : ''}`);
-    diagCountEl.textContent = parts.join(', ');
-  } else {
-    diagCountEl.textContent = '';
-  }
-
-  if (lines.length > 0) {
-    cursorLine = Math.max(0, Math.min(cursorLine, lines.length - 1));
-    cursorCol = Math.max(0, Math.min(cursorCol, (lines[cursorLine]?.text || '').length));
-  }
-
-  const diagsByLine = new Map();
-  for (const d of diagnostics) {
-    if (!diagsByLine.has(d.line)) diagsByLine.set(d.line, []);
-    diagsByLine.get(d.line).push(d);
-  }
-
-  // Build DOM in fragments for a single reflow instead of N reflows
-  const editorFrag = document.createDocumentFragment();
-  const gutterFrag = document.createDocumentFragment();
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const lineDiags = diagsByLine.get(i) || [];
-
-    const gutterLine = document.createElement('div');
-    gutterLine.className = 'line';
-    if (lineDiags.some(d => d.severity === 'error')) {
-      gutterLine.classList.add('gutter-error');
-    } else if (lineDiags.some(d => d.severity === 'warning')) {
-      gutterLine.classList.add('gutter-warning');
-    }
-    gutterLine.textContent = String(i + 1);
-    gutterFrag.appendChild(gutterLine);
-
-    const editorLine = document.createElement('div');
-    editorLine.className = 'line';
-    editorLine.dataset.line = i;
-
-    if (line.tokens && line.tokens.length > 0) {
-      editorLine.innerHTML = applyTokensAndDiags(line.text, line.tokens, lineDiags);
-    } else if (lineDiags.length > 0) {
-      editorLine.innerHTML = applyDiags(line.text || '', lineDiags);
-    } else {
-      editorLine.textContent = line.text || '';
-    }
-
-    editorFrag.appendChild(editorLine);
-  }
-
-  editorEl.innerHTML = '';
-  gutterEl.innerHTML = '';
-  editorEl.appendChild(editorFrag);
-  gutterEl.appendChild(gutterFrag);
-
-  renderCursor();
-  renderSelection();
-  renderFindHighlights();
-  updateStatusBar();
-  renderMinimap();
-}
-
-function applyTokensAndDiags(text, tokens, diags) {
-  if (!text) return '';
-  let html = '';
-  let lastEnd = 0;
-  for (const token of tokens) {
-    if (token.start > lastEnd) {
-      html += wrapDiagSpans(escapeHtml(text.substring(lastEnd, token.start)), lastEnd, token.start, diags);
-    }
-    const tokenText = text.substring(token.start, token.end);
-    const diagClass = getDiagClass(token.start, token.end, diags);
-    html += `<span class="tok-${token.kind}${diagClass ? ' ' + diagClass : ''}">${escapeHtml(tokenText)}</span>`;
-    lastEnd = token.end;
-  }
-  if (lastEnd < text.length) {
-    html += wrapDiagSpans(escapeHtml(text.substring(lastEnd)), lastEnd, text.length, diags);
-  }
-  return html;
-}
-
-function applyDiags(text, diags) {
-  if (!diags.length) return escapeHtml(text);
-  return wrapDiagSpans(escapeHtml(text), 0, text.length, diags);
-}
-
-function getDiagClass(start, end, diags) {
-  for (const d of diags) {
-    if (d.col_start < end && d.col_end > start) return `diag-${d.severity}`;
-  }
-  return '';
-}
-
-function wrapDiagSpans(html, textStart, textEnd, diags) {
-  for (const d of diags) {
-    if (d.col_start < textEnd && d.col_end > textStart) {
-      return `<span class="diag-${d.severity}">${html}</span>`;
-    }
-  }
-  return html;
-}
-
-function escapeHtml(text) {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-function renderCursor() {
-  const existing = document.querySelector('.cursor');
-  if (existing) existing.remove();
-
-  const lineEls = editorEl.querySelectorAll('.line');
-  if (cursorLine >= lineEls.length) return;
-
-  const lineEl = lineEls[cursorLine];
-  const lineRect = lineEl.getBoundingClientRect();
-  const charWidth = measureCharWidth();
-  const lineHeight = lineRect.height;
-
-  const cursor = document.createElement('div');
-  cursor.className = 'cursor';
-  cursor.style.left = `${12 + cursorCol * charWidth}px`;
-  cursor.style.top = `${lineEl.offsetTop}px`;
-  cursor.style.height = `${lineHeight}px`;
-  editorEl.appendChild(cursor);
-
-  const cursorTop = lineEl.offsetTop;
-  const cursorBottom = cursorTop + lineHeight;
-  if (cursorBottom > editorEl.scrollTop + editorEl.clientHeight) {
-    editorEl.scrollTop = cursorBottom - editorEl.clientHeight;
-  } else if (cursorTop < editorEl.scrollTop) {
-    editorEl.scrollTop = cursorTop;
-  }
-}
-
-function renderSelection() {
-  editorEl.querySelectorAll('.selection-highlight').forEach(el => el.remove());
-  const sel = getSelectionRange();
-  if (!sel) return;
-
-  const charWidth = measureCharWidth();
-  const lineEls = editorEl.querySelectorAll('.line');
-
-  for (let i = sel.startLine; i <= sel.endLine && i < lineEls.length; i++) {
-    const lineEl = lineEls[i];
-    const lineText = lines[i]?.text || '';
-    const lineLen = lineText.length;
-
-    const colStart = (i === sel.startLine) ? sel.startCol : 0;
-    let colEnd = (i === sel.endLine) ? sel.endCol : lineLen;
-
-    if (i !== sel.endLine) colEnd = Math.max(colEnd, lineLen) + 1;
-
-    if (colStart >= colEnd) continue;
-
-    const overlay = document.createElement('div');
-    overlay.className = 'selection-highlight';
-    overlay.style.left = `${12 + colStart * charWidth}px`;
-    overlay.style.top = `${lineEl.offsetTop}px`;
-    overlay.style.width = `${Math.max((colEnd - colStart) * charWidth, charWidth * 0.5)}px`;
-    overlay.style.height = `${lineEl.offsetHeight}px`;
-    editorEl.appendChild(overlay);
-  }
-}
-
-function renderFindHighlights() {
-  editorEl.querySelectorAll('.find-match-overlay').forEach(el => el.remove());
-  if (!findOpen || findMatches.length === 0) return;
-
-  const charWidth = measureCharWidth();
-  const lineEls = editorEl.querySelectorAll('.line');
-
-  for (let mi = 0; mi < findMatches.length; mi++) {
-    const m = findMatches[mi];
-    if (m.line >= lineEls.length) continue;
-    const lineEl = lineEls[m.line];
-
-    const overlay = document.createElement('div');
-    overlay.className = 'find-match-overlay';
-    overlay.style.position = 'absolute';
-    overlay.style.left = `${12 + m.col * charWidth}px`;
-    overlay.style.top = `${lineEl.offsetTop}px`;
-    overlay.style.width = `${m.length * charWidth}px`;
-    overlay.style.height = `${lineEl.offsetHeight}px`;
-    overlay.style.pointerEvents = 'none';
-    overlay.style.zIndex = '4';
-    overlay.style.borderRadius = '2px';
-
-    if (mi === findCurrentIdx) {
-      overlay.style.background = 'rgba(250, 179, 135, 0.6)';
-      overlay.style.border = '1px solid #fab387';
-    } else {
-      overlay.style.background = 'rgba(250, 179, 135, 0.3)';
-      overlay.style.border = '1px solid rgba(250, 179, 135, 0.6)';
-    }
-    editorEl.appendChild(overlay);
-  }
-}
-
-let _charWidth = null;
-function measureCharWidth() {
-  if (_charWidth) return _charWidth;
-  const span = document.createElement('span');
-  span.style.fontFamily = getComputedStyle(editorEl).fontFamily;
-  span.style.fontSize = getComputedStyle(editorEl).fontSize;
-  span.style.position = 'absolute';
-  span.style.visibility = 'hidden';
-  span.textContent = 'M';
-  document.body.appendChild(span);
-  _charWidth = span.getBoundingClientRect().width;
-  document.body.removeChild(span);
-  return _charWidth;
-}
-
-window.addEventListener('resize', () => { _charWidth = null; });
-
-function updateStatusBar() {
-  let pos = `Ln ${cursorLine + 1}, Col ${cursorCol + 1}`;
-  if (hasSelection()) {
-    const sel = getSelectionRange();
-    const selLines = sel.endLine - sel.startLine + 1;
-    pos += ` (${selLines} line${selLines > 1 ? 's' : ''} selected)`;
-  }
-  cursorPosEl.textContent = pos;
+function getLineBoundsOnScreen(lineIdx) {
+  const rect = editorCanvas.getBoundingClientRect();
+  const scrollTop = editorEl.scrollTop;
+  const { first } = getVisibleLineRange();
+  const subPixelOffset = -(scrollTop % lineHeight);
+  const vi = lineIdx - first;
+  const top = rect.top + vi * lineHeight + subPixelOffset;
+  const bottom = top + lineHeight;
+  return { top, bottom, left: rect.left };
 }
 
 // ─── Minimap ──────────────────────────────────────────────────
 
 function renderMinimap() {
-  if (lines.length < 50) {
+  if (totalLines < 50) {
     minimapEl.classList.add('minimap-hidden');
     return;
   }
@@ -555,21 +810,26 @@ function renderMinimap() {
   const scale = 2;
   const lineH = scale;
   const width = 80;
-  const height = Math.min(lines.length * lineH, editorEl.clientHeight);
+  const height = Math.min(totalLines * lineH, editorEl.clientHeight);
 
-  minimapCanvas.width = width;
-  minimapCanvas.height = height;
+  const dpr = window.devicePixelRatio || 1;
+  minimapCanvas.style.width = width + 'px';
+  minimapCanvas.style.height = height + 'px';
+  minimapCanvas.width = Math.round(width * dpr);
+  minimapCanvas.height = Math.round(height * dpr);
   const ctx = minimapCanvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, width, height);
 
-  const ratio = height / (lines.length * lineH);
+  const ratio = height / (totalLines * lineH);
 
-  for (let i = 0; i < lines.length; i++) {
-    const text = lines[i]?.text || '';
-    const y = Math.floor(i * lineH * ratio);
+  // Draw from cached lines
+  for (let i = 0; i < cachedLines.length; i++) {
+    const lineIdx = cachedFirstLine + i;
+    const text = cachedLines[i]?.text || '';
+    const y = Math.floor(lineIdx * lineH * ratio);
     if (y >= height) break;
 
-    // Draw a thin representation of text
     const indent = text.length - text.trimStart().length;
     const textLen = Math.min(text.trim().length, 60);
     if (textLen > 0) {
@@ -579,11 +839,7 @@ function renderMinimap() {
   }
 
   // Viewport indicator
-  const computedLH = parseFloat(getComputedStyle(editorEl).lineHeight);
-  const lineHeightPx = Number.isNaN(computedLH)
-    ? parseFloat(getComputedStyle(editorEl).fontSize) * 1.5
-    : computedLH;
-  const totalH = lines.length * lineHeightPx;
+  const totalH = totalLines * lineHeight;
   const vpFraction = editorEl.clientHeight / totalH;
   const vpTop = (editorEl.scrollTop / totalH) * height;
   const vpH = Math.max(vpFraction * height, 10);
@@ -592,8 +848,24 @@ function renderMinimap() {
   minimapViewport.style.height = `${vpH}px`;
 }
 
+// ─── Scroll Handler ──────────────────────────────────────────
+
+let scrollFetchPending = false;
+
 editorEl.addEventListener('scroll', () => {
-  renderMinimap();
+  // Immediate repaint from cache
+  requestRender();
+
+  // Fetch new content if scrolled outside cached range
+  if (scrollFetchPending) return;
+  const { first, count } = getVisibleLineRange();
+  if (first < cachedFirstLine || first + count > cachedFirstLine + cachedLines.length) {
+    scrollFetchPending = true;
+    fetchVisibleContent().then(() => {
+      scrollFetchPending = false;
+      requestRender();
+    });
+  }
 });
 
 // ─── File Explorer ────────────────────────────────────────────
@@ -602,18 +874,18 @@ function toggleSidebar() {
   sidebarOpen = !sidebarOpen;
   if (sidebarOpen) {
     sidebarEl.classList.remove('sidebar-hidden');
-    if (!explorerRoot) {
-      // Ask user to open a folder
-      openFolderDialog();
-    }
+    if (!explorerRoot) openFolderDialog();
   } else {
     sidebarEl.classList.add('sidebar-hidden');
   }
+  // Resize canvases after sidebar toggle
+  setTimeout(() => { resizeCanvases(); requestRender(); }, 50);
 }
 
 function closeSidebar() {
   sidebarOpen = false;
   sidebarEl.classList.add('sidebar-hidden');
+  setTimeout(() => { resizeCanvases(); requestRender(); }, 50);
 }
 
 sidebarCloseBtn.addEventListener('click', closeSidebar);
@@ -651,7 +923,6 @@ async function renderDirContents(dirPath, depth, parentEl) {
       item.className = 'tree-item';
       if (entry.path === activeBufferPath) item.classList.add('active');
 
-      // Indent
       if (depth > 0) {
         const indent = document.createElement('span');
         indent.className = 'tree-indent';
@@ -729,7 +1000,7 @@ async function openFileFromExplorer(path) {
     }
     findMatches = [];
     findCurrentIdx = -1;
-    renderContent(content);
+    await updateFromEditorContent(content);
     renderTabs();
     renderFileTree();
     statusEl.textContent = '';
@@ -869,36 +1140,32 @@ function updatePaletteSelection() {
 
 // ─── Keyboard Input ──────────────────────────────────────────
 
-document.addEventListener('keydown', async (e) => {
-  // Ctrl+Shift+P: Command Palette
+document.addEventListener('keydown', (e) => {
+  resetCursorBlink();
+
   if (e.ctrlKey && e.shiftKey && e.key === 'P') {
     e.preventDefault();
     paletteOpen ? closePalette() : openPalette();
     return;
   }
 
-  // Don't handle editor keys when palette is open
   if (paletteOpen) return;
-
-  // M6: Don't handle editor keys when symbols palette is open
   if (symbolsOpen) return;
 
-  // M6: Autocomplete navigation when popup is open
+  // M6: Autocomplete navigation
   if (acOpen) {
     if (e.key === 'ArrowDown') {
       e.preventDefault();
       acSelectedIdx = Math.min(acSelectedIdx + 1, autocompleteList.children.length - 1);
       updateAcSelection();
-      const items = autocompleteList.querySelectorAll('.ac-item');
-      if (items[acSelectedIdx]) showAcDetail(acItems[acSelectedIdx]);
+      if (acItems[acSelectedIdx]) showAcDetail(acItems[acSelectedIdx]);
       return;
     }
     if (e.key === 'ArrowUp') {
       e.preventDefault();
       acSelectedIdx = Math.max(acSelectedIdx - 1, 0);
       updateAcSelection();
-      const items = autocompleteList.querySelectorAll('.ac-item');
-      if (items[acSelectedIdx]) showAcDetail(acItems[acSelectedIdx]);
+      if (acItems[acSelectedIdx]) showAcDetail(acItems[acSelectedIdx]);
       return;
     }
     if (e.key === 'Enter' || e.key === 'Tab') {
@@ -911,7 +1178,6 @@ document.addEventListener('keydown', async (e) => {
       closeAutocomplete();
       return;
     }
-    // Let other keys fall through to typing (will update filter)
   }
 
   // M6: Code actions navigation
@@ -942,116 +1208,34 @@ document.addEventListener('keydown', async (e) => {
     }
   }
 
-  // M6: Escape closes LSP popups
   if (e.key === 'Escape' && (hoverOpen || sigHelpOpen || refsOpen)) {
     e.preventDefault();
     closeLspPopups();
     return;
   }
 
-  // M6: Ctrl+Shift+O — Document symbols
-  if (e.ctrlKey && e.shiftKey && e.key === 'O') {
-    e.preventDefault();
-    openSymbolOutline();
-    return;
-  }
+  if (e.ctrlKey && e.shiftKey && e.key === 'O') { e.preventDefault(); openSymbolOutline(); return; }
+  if (e.ctrlKey && e.shiftKey && e.key === 'F') { e.preventDefault(); formatDocument(); return; }
+  if (e.ctrlKey && e.key === ' ') { e.preventDefault(); triggerAutocomplete(null); return; }
+  if (e.key === 'F12' && !e.shiftKey && !e.ctrlKey) { e.preventDefault(); goToDefinition(); return; }
+  if (e.key === 'F12' && e.shiftKey && !e.ctrlKey) { e.preventDefault(); findReferences(); return; }
+  if (e.ctrlKey && e.key === '.') { e.preventDefault(); requestCodeActions(); return; }
 
-  // M6: Ctrl+Shift+F — Format document
-  if (e.ctrlKey && e.shiftKey && e.key === 'F') {
-    e.preventDefault();
-    formatDocument();
-    return;
-  }
-
-  // M6: Ctrl+Space — Trigger autocomplete
-  if (e.ctrlKey && e.key === ' ') {
-    e.preventDefault();
-    triggerAutocomplete(null);
-    return;
-  }
-
-  // M6: F12 — Go to definition
-  if (e.key === 'F12' && !e.shiftKey && !e.ctrlKey) {
-    e.preventDefault();
-    goToDefinition();
-    return;
-  }
-
-  // M6: Shift+F12 — Find references
-  if (e.key === 'F12' && e.shiftKey && !e.ctrlKey) {
-    e.preventDefault();
-    findReferences();
-    return;
-  }
-
-  // M6: Ctrl+. — Code actions
-  if (e.ctrlKey && e.key === '.') {
-    e.preventDefault();
-    requestCodeActions();
-    return;
-  }
-
-  // ── Find bar keys (when find inputs are focused) ──
+  // Find bar keys
   if (findOpen && (document.activeElement === findInputEl || document.activeElement === replaceInputEl)) {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      closeFindBar();
-      return;
-    }
-    if (e.key === 'Enter' && document.activeElement === findInputEl) {
-      e.preventDefault();
-      e.shiftKey ? findPrev() : findNext();
-      return;
-    }
-    if (e.key === 'Enter' && document.activeElement === replaceInputEl) {
-      e.preventDefault();
-      replaceOne();
-      return;
-    }
+    if (e.key === 'Escape') { e.preventDefault(); closeFindBar(); return; }
+    if (e.key === 'Enter' && document.activeElement === findInputEl) { e.preventDefault(); e.shiftKey ? findPrev() : findNext(); return; }
+    if (e.key === 'Enter' && document.activeElement === replaceInputEl) { e.preventDefault(); replaceOne(); return; }
     return;
   }
 
-  // ── Global shortcuts ──
-
-  // Ctrl+B: Toggle sidebar
-  if (e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'b') {
-    e.preventDefault();
-    toggleSidebar();
-    return;
-  }
-
-  // Ctrl+Tab / Ctrl+Shift+Tab: Cycle tabs
-  if (e.ctrlKey && e.key === 'Tab') {
-    e.preventDefault();
-    await cycleTab(e.shiftKey ? -1 : 1);
-    return;
-  }
-
-  // Ctrl+W: Close current tab
-  if (e.ctrlKey && e.key.toLowerCase() === 'w') {
-    e.preventDefault();
-    if (activeBufferPath) await closeTab(activeBufferPath);
-    return;
-  }
-
-  if (e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'f') {
-    e.preventDefault();
-    openFindBar(false);
-    return;
-  }
-
-  if (e.ctrlKey && e.key.toLowerCase() === 'h') {
-    e.preventDefault();
-    openFindBar(true);
-    return;
-  }
-
-  if (e.ctrlKey && e.key === '`') {
-    e.preventDefault();
-    toggleOutputPanel();
-    return;
-  }
-
+  // Global shortcuts
+  if (e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'b') { e.preventDefault(); toggleSidebar(); return; }
+  if (e.ctrlKey && e.key === 'Tab') { e.preventDefault(); cycleTab(e.shiftKey ? -1 : 1); return; }
+  if (e.ctrlKey && e.key.toLowerCase() === 'w') { e.preventDefault(); if (activeBufferPath) closeTab(activeBufferPath); return; }
+  if (e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'f') { e.preventDefault(); openFindBar(false); return; }
+  if (e.ctrlKey && e.key.toLowerCase() === 'h') { e.preventDefault(); openFindBar(true); return; }
+  if (e.ctrlKey && e.key === '`') { e.preventDefault(); toggleOutputPanel(); return; }
   if (e.key === 'Escape') {
     if (findOpen) { closeFindBar(); return; }
     if (outputOpen) { closeOutputPanel(); return; }
@@ -1060,49 +1244,51 @@ document.addEventListener('keydown', async (e) => {
   // Only handle editor keys when editor is focused
   if (document.activeElement !== editorEl) return;
 
-  // ── Undo / Redo ──
-
+  // Undo / Redo
   if (e.ctrlKey && ((e.shiftKey && e.key.toLowerCase() === 'z') || (!e.shiftKey && e.key.toLowerCase() === 'y'))) {
     e.preventDefault();
     clearSelection();
-    const content = await invoke('edit_redo');
-    renderContent(content);
+    queueEdit(async () => {
+      const result = await invoke('edit_redo');
+      await updateFromEditResult(result);
+    });
     return;
   }
 
   if (e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'z') {
     e.preventDefault();
     clearSelection();
-    const content = await invoke('edit_undo');
-    renderContent(content);
+    queueEdit(async () => {
+      const result = await invoke('edit_undo');
+      await updateFromEditResult(result);
+    });
     return;
   }
 
-  // ── Select All ──
-
+  // Select All
   if (e.ctrlKey && e.key.toLowerCase() === 'a') {
     e.preventDefault();
     selAnchorLine = 0;
     selAnchorCol = 0;
-    cursorLine = lines.length - 1;
-    cursorCol = (lines[cursorLine]?.text || '').length;
-    renderCursor();
-    renderSelection();
+    cursorLine = totalLines - 1;
+    cursorCol = getLineText(cursorLine).length;
+    requestRender();
     updateStatusBar();
     return;
   }
 
-  // ── Clipboard ──
-
+  // Clipboard
   if (e.ctrlKey && e.key.toLowerCase() === 'c') {
     e.preventDefault();
     if (hasSelection()) {
       const sel = getSelectionRange();
-      const text = await invoke('get_text_range', {
-        startLine: sel.startLine, startCol: sel.startCol,
-        endLine: sel.endLine, endCol: sel.endCol,
+      queueEdit(async () => {
+        const text = await invoke('get_text_range', {
+          startLine: sel.startLine, startCol: sel.startCol,
+          endLine: sel.endLine, endCol: sel.endCol,
+        });
+        await navigator.clipboard.writeText(text);
       });
-      await navigator.clipboard.writeText(text);
     }
     return;
   }
@@ -1111,102 +1297,84 @@ document.addEventListener('keydown', async (e) => {
     e.preventDefault();
     if (hasSelection()) {
       const sel = getSelectionRange();
-      const text = await invoke('get_text_range', {
-        startLine: sel.startLine, startCol: sel.startCol,
-        endLine: sel.endLine, endCol: sel.endCol,
-      });
-      await navigator.clipboard.writeText(text);
-      const content = await invoke('edit_replace_range', {
-        startLine: sel.startLine, startCol: sel.startCol,
-        endLine: sel.endLine, endCol: sel.endCol,
-        text: '',
-      });
+      clearSelection();
       cursorLine = sel.startLine;
       cursorCol = sel.startCol;
-      clearSelection();
-      renderContent(content);
+      queueEdit(async () => {
+        const text = await invoke('get_text_range', {
+          startLine: sel.startLine, startCol: sel.startCol,
+          endLine: sel.endLine, endCol: sel.endCol,
+        });
+        await navigator.clipboard.writeText(text);
+        const result = await invoke('edit_replace_range', {
+          startLine: sel.startLine, startCol: sel.startCol,
+          endLine: sel.endLine, endCol: sel.endCol, text: '',
+        });
+        await updateFromEditResult(result);
+      });
     }
     return;
   }
 
   if (e.ctrlKey && e.key.toLowerCase() === 'v') {
     e.preventDefault();
-    try {
-      const clipText = await navigator.clipboard.readText();
-      if (!clipText) return;
-      const MAX_PASTE_SIZE = 1024 * 1024; // 1 MB, matches backend MAX_INSERT_SIZE
-      if (clipText.length > MAX_PASTE_SIZE) {
-        statusEl.textContent = `Paste too large (${(clipText.length / 1024 / 1024).toFixed(1)} MB, max 1 MB)`;
-        return;
+    const snapLine = cursorLine, snapCol = cursorCol;
+    const sel = hasSelection() ? getSelectionRange() : null;
+    if (sel) clearSelection();
+    queueEdit(async () => {
+      try {
+        const clipText = await navigator.clipboard.readText();
+        if (!clipText) return;
+        if (clipText.length > 1024 * 1024) {
+          statusEl.textContent = `Paste too large (${(clipText.length / 1024 / 1024).toFixed(1)} MB, max 1 MB)`;
+          return;
+        }
+        if (sel) {
+          const result = await invoke('edit_replace_range', {
+            startLine: sel.startLine, startCol: sel.startCol,
+            endLine: sel.endLine, endCol: sel.endCol, text: clipText,
+          });
+          setCursorAfterInsert(sel.startLine, sel.startCol, clipText);
+          await updateFromEditResult(result);
+        } else {
+          const result = await invoke('edit_insert', {
+            line: snapLine, col: snapCol, text: clipText,
+          });
+          setCursorAfterInsert(snapLine, snapCol, clipText);
+          await updateFromEditResult(result);
+        }
+      } catch (err) {
+        console.error('Paste error:', err);
       }
-
-      let startLine, startCol;
-      if (hasSelection()) {
-        const sel = getSelectionRange();
-        startLine = sel.startLine;
-        startCol = sel.startCol;
-        const content = await invoke('edit_replace_range', {
-          startLine: sel.startLine, startCol: sel.startCol,
-          endLine: sel.endLine, endCol: sel.endCol,
-          text: clipText,
-        });
-        clearSelection();
-        setCursorAfterInsert(startLine, startCol, clipText);
-        renderContent(content);
-      } else {
-        startLine = cursorLine;
-        startCol = cursorCol;
-        const content = await invoke('edit_insert', {
-          line: cursorLine, col: cursorCol, text: clipText,
-        });
-        setCursorAfterInsert(startLine, startCol, clipText);
-        renderContent(content);
-      }
-    } catch (err) {
-      console.error('Paste error:', err);
-    }
+    });
     return;
   }
 
-  // ── Ctrl+O: Open file ──
-  if (e.ctrlKey && e.key.toLowerCase() === 'o') {
-    e.preventDefault();
-    await openFileDialog();
-    return;
-  }
+  if (e.ctrlKey && e.key.toLowerCase() === 'o') { e.preventDefault(); openFileDialog(); return; }
+  if (e.ctrlKey && e.key.toLowerCase() === 's') { e.preventDefault(); saveFile(); return; }
 
-  // ── Ctrl+S: Save ──
-  if (e.ctrlKey && e.key.toLowerCase() === 's') {
-    e.preventDefault();
-    await saveFile();
-    return;
-  }
-
-  // ── Navigation (Shift = extend selection) ──
-
+  // Navigation
   if (e.key === 'ArrowUp') {
     e.preventDefault();
-    if (e.shiftKey) ensureAnchor();
-    else if (hasSelection()) clearSelection();
+    if (e.shiftKey) ensureAnchor(); else if (hasSelection()) clearSelection();
     if (cursorLine > 0) {
       cursorLine--;
-      cursorCol = Math.min(cursorCol, (lines[cursorLine]?.text || '').length);
+      cursorCol = Math.min(cursorCol, getLineText(cursorLine).length);
     }
     if (!e.shiftKey) clearSelection();
-    renderCursor(); renderSelection(); updateStatusBar();
+    ensureCursorVisible(); requestRender(); updateStatusBar();
     return;
   }
 
   if (e.key === 'ArrowDown') {
     e.preventDefault();
-    if (e.shiftKey) ensureAnchor();
-    else if (hasSelection()) clearSelection();
-    if (cursorLine < lines.length - 1) {
+    if (e.shiftKey) ensureAnchor(); else if (hasSelection()) clearSelection();
+    if (cursorLine < totalLines - 1) {
       cursorLine++;
-      cursorCol = Math.min(cursorCol, (lines[cursorLine]?.text || '').length);
+      cursorCol = Math.min(cursorCol, getLineText(cursorLine).length);
     }
     if (!e.shiftKey) clearSelection();
-    renderCursor(); renderSelection(); updateStatusBar();
+    ensureCursorVisible(); requestRender(); updateStatusBar();
     return;
   }
 
@@ -1215,17 +1383,16 @@ document.addEventListener('keydown', async (e) => {
     if (e.shiftKey) {
       ensureAnchor();
       if (cursorCol > 0) cursorCol--;
-      else if (cursorLine > 0) { cursorLine--; cursorCol = (lines[cursorLine]?.text || '').length; }
+      else if (cursorLine > 0) { cursorLine--; cursorCol = getLineText(cursorLine).length; }
     } else if (hasSelection()) {
       const sel = getSelectionRange();
-      cursorLine = sel.startLine;
-      cursorCol = sel.startCol;
+      cursorLine = sel.startLine; cursorCol = sel.startCol;
       clearSelection();
     } else {
       if (cursorCol > 0) cursorCol--;
-      else if (cursorLine > 0) { cursorLine--; cursorCol = (lines[cursorLine]?.text || '').length; }
+      else if (cursorLine > 0) { cursorLine--; cursorCol = getLineText(cursorLine).length; }
     }
-    renderCursor(); renderSelection(); updateStatusBar();
+    ensureCursorVisible(); requestRender(); updateStatusBar();
     return;
   }
 
@@ -1233,20 +1400,19 @@ document.addEventListener('keydown', async (e) => {
     e.preventDefault();
     if (e.shiftKey) {
       ensureAnchor();
-      const lineLen = (lines[cursorLine]?.text || '').length;
+      const lineLen = getLineText(cursorLine).length;
       if (cursorCol < lineLen) cursorCol++;
-      else if (cursorLine < lines.length - 1) { cursorLine++; cursorCol = 0; }
+      else if (cursorLine < totalLines - 1) { cursorLine++; cursorCol = 0; }
     } else if (hasSelection()) {
       const sel = getSelectionRange();
-      cursorLine = sel.endLine;
-      cursorCol = sel.endCol;
+      cursorLine = sel.endLine; cursorCol = sel.endCol;
       clearSelection();
     } else {
-      const lineLen = (lines[cursorLine]?.text || '').length;
+      const lineLen = getLineText(cursorLine).length;
       if (cursorCol < lineLen) cursorCol++;
-      else if (cursorLine < lines.length - 1) { cursorLine++; cursorCol = 0; }
+      else if (cursorLine < totalLines - 1) { cursorLine++; cursorCol = 0; }
     }
-    renderCursor(); renderSelection(); updateStatusBar();
+    ensureCursorVisible(); requestRender(); updateStatusBar();
     return;
   }
 
@@ -1255,38 +1421,42 @@ document.addEventListener('keydown', async (e) => {
     if (e.shiftKey) ensureAnchor();
     cursorCol = 0;
     if (!e.shiftKey) clearSelection();
-    renderCursor(); renderSelection(); updateStatusBar();
+    ensureCursorVisible(); requestRender(); updateStatusBar();
     return;
   }
 
   if (e.key === 'End') {
     e.preventDefault();
     if (e.shiftKey) ensureAnchor();
-    cursorCol = (lines[cursorLine]?.text || '').length;
+    cursorCol = getLineText(cursorLine).length;
     if (!e.shiftKey) clearSelection();
-    renderCursor(); renderSelection(); updateStatusBar();
+    ensureCursorVisible(); requestRender(); updateStatusBar();
     return;
   }
 
-  // ── Editing keys ──
-
+  // Editing keys
   if (e.key === 'Enter') {
     e.preventDefault();
     if (hasSelection()) {
       const sel = getSelectionRange();
-      const content = await invoke('edit_replace_range', {
-        startLine: sel.startLine, startCol: sel.startCol,
-        endLine: sel.endLine, endCol: sel.endCol, text: '\n',
-      });
       cursorLine = sel.startLine + 1;
       cursorCol = 0;
       clearSelection();
-      renderContent(content);
+      queueEdit(async () => {
+        const result = await invoke('edit_replace_range', {
+          startLine: sel.startLine, startCol: sel.startCol,
+          endLine: sel.endLine, endCol: sel.endCol, text: '\n',
+        });
+        await updateFromEditResult(result);
+      });
     } else {
-      const content = await invoke('edit_newline', { line: cursorLine, col: cursorCol });
+      const snapLine = cursorLine, snapCol = cursorCol;
       cursorLine++;
       cursorCol = 0;
-      renderContent(content);
+      queueEdit(async () => {
+        const result = await invoke('edit_newline', { line: snapLine, col: snapCol });
+        await updateFromEditResult(result);
+      });
     }
     return;
   }
@@ -1295,33 +1465,34 @@ document.addEventListener('keydown', async (e) => {
     e.preventDefault();
     if (hasSelection()) {
       const sel = getSelectionRange();
-      const content = await invoke('edit_replace_range', {
-        startLine: sel.startLine, startCol: sel.startCol,
-        endLine: sel.endLine, endCol: sel.endCol, text: '',
-      });
       cursorLine = sel.startLine;
       cursorCol = sel.startCol;
       clearSelection();
-      renderContent(content);
+      queueEdit(async () => {
+        const result = await invoke('edit_replace_range', {
+          startLine: sel.startLine, startCol: sel.startCol,
+          endLine: sel.endLine, endCol: sel.endCol, text: '',
+        });
+        await updateFromEditResult(result);
+      });
     } else {
       if (cursorLine === 0 && cursorCol === 0) return;
-      const content = await invoke('edit_backspace', { line: cursorLine, col: cursorCol });
+      const prevLineLen = cursorCol === 0 && cursorLine > 0 ? getLineText(cursorLine - 1).length : 0;
+      const snapLine = cursorLine, snapCol = cursorCol;
       if (cursorCol > 0) {
         cursorCol--;
       } else if (cursorLine > 0) {
         cursorLine--;
-        cursorCol = (content.lines[cursorLine]?.text || '').length;
+        cursorCol = prevLineLen;
       }
-      renderContent(content);
+      queueEdit(async () => {
+        const result = await invoke('edit_backspace', { line: snapLine, col: snapCol });
+        await updateFromEditResult(result);
+      });
     }
-    // M6: Update autocomplete filter on backspace
     if (acOpen) {
-      if (acFilterText.length > 0) {
-        acFilterText = acFilterText.slice(0, -1);
-        renderAutocomplete();
-      } else {
-        closeAutocomplete();
-      }
+      if (acFilterText.length > 0) { acFilterText = acFilterText.slice(0, -1); renderAutocomplete(); }
+      else closeAutocomplete();
     }
     return;
   }
@@ -1330,17 +1501,22 @@ document.addEventListener('keydown', async (e) => {
     e.preventDefault();
     if (hasSelection()) {
       const sel = getSelectionRange();
-      const content = await invoke('edit_replace_range', {
-        startLine: sel.startLine, startCol: sel.startCol,
-        endLine: sel.endLine, endCol: sel.endCol, text: '',
-      });
       cursorLine = sel.startLine;
       cursorCol = sel.startCol;
       clearSelection();
-      renderContent(content);
+      queueEdit(async () => {
+        const result = await invoke('edit_replace_range', {
+          startLine: sel.startLine, startCol: sel.startCol,
+          endLine: sel.endLine, endCol: sel.endCol, text: '',
+        });
+        await updateFromEditResult(result);
+      });
     } else {
-      const content = await invoke('edit_delete', { line: cursorLine, col: cursorCol, len: 1 });
-      renderContent(content);
+      const snapLine = cursorLine, snapCol = cursorCol;
+      queueEdit(async () => {
+        const result = await invoke('edit_delete', { line: snapLine, col: snapCol, len: 1 });
+        await updateFromEditResult(result);
+      });
     }
     return;
   }
@@ -1348,19 +1524,24 @@ document.addEventListener('keydown', async (e) => {
   if (e.key === 'Tab') {
     e.preventDefault();
     if (hasSelection()) {
+      // Indent all lines in selection
       const sel = getSelectionRange();
-      const content = await invoke('edit_replace_range', {
-        startLine: sel.startLine, startCol: sel.startCol,
-        endLine: sel.endLine, endCol: sel.endCol, text: '    ',
-      });
-      cursorLine = sel.startLine;
+      const startL = sel.startLine, endL = sel.endLine;
       cursorCol = sel.startCol + 4;
-      clearSelection();
-      renderContent(content);
+      queueEdit(async () => {
+        // Insert 4 spaces at the beginning of each selected line (reverse order)
+        for (let l = endL; l >= startL; l--) {
+          const r = await invoke('edit_insert', { line: l, col: 0, text: '    ' });
+          if (l === startL) await updateFromEditResult(r);
+        }
+      });
     } else {
-      const content = await invoke('edit_insert', { line: cursorLine, col: cursorCol, text: '    ' });
+      const snapLine = cursorLine, snapCol = cursorCol;
       cursorCol += 4;
-      renderContent(content);
+      queueEdit(async () => {
+        const result = await invoke('edit_insert', { line: snapLine, col: snapCol, text: '    ' });
+        await updateFromEditResult(result);
+      });
     }
     return;
   }
@@ -1368,44 +1549,39 @@ document.addEventListener('keydown', async (e) => {
   // Regular character input
   if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
     e.preventDefault();
+    const ch = e.key;
     if (hasSelection()) {
       const sel = getSelectionRange();
-      const content = await invoke('edit_replace_range', {
-        startLine: sel.startLine, startCol: sel.startCol,
-        endLine: sel.endLine, endCol: sel.endCol, text: e.key,
-      });
       cursorLine = sel.startLine;
       cursorCol = sel.startCol + 1;
       clearSelection();
-      renderContent(content);
+      queueEdit(async () => {
+        const result = await invoke('edit_replace_range', {
+          startLine: sel.startLine, startCol: sel.startCol,
+          endLine: sel.endLine, endCol: sel.endCol, text: ch,
+        });
+        await updateFromEditResult(result);
+      });
     } else {
-      const content = await invoke('edit_insert', { line: cursorLine, col: cursorCol, text: e.key });
+      const snapLine = cursorLine, snapCol = cursorCol;
       cursorCol++;
-      renderContent(content);
+      queueEdit(async () => {
+        const result = await invoke('edit_insert', { line: snapLine, col: snapCol, text: ch });
+        await updateFromEditResult(result);
+      });
     }
 
-    // M6: Trigger signature help on ( and ,
-    if (e.key === '(' || e.key === ',') {
-      requestSignatureHelp(e.key);
-    } else if (e.key === ')') {
-      closeSignatureHelp();
-    }
-
-    // M6: Trigger/update autocomplete on . and word characters
-    if (e.key === '.') {
-      triggerAutocomplete('.');
-    } else if (acOpen && /[a-zA-Z0-9_$]/.test(e.key)) {
-      acFilterText += e.key;
-      renderAutocomplete();
-    } else if (acOpen && e.key === ' ') {
-      closeAutocomplete();
-    }
+    // M6: LSP triggers
+    if (ch === '(' || ch === ',') requestSignatureHelp(ch);
+    else if (ch === ')') closeSignatureHelp();
+    if (ch === '.') triggerAutocomplete('.');
+    else if (acOpen && /[a-zA-Z0-9_$]/.test(ch)) { acFilterText += ch; renderAutocomplete(); }
+    else if (acOpen && ch === ' ') closeAutocomplete();
 
     return;
   }
 });
 
-// Helper: position cursor at end of inserted text
 function setCursorAfterInsert(startLine, startCol, text) {
   const pastedLines = text.split('\n');
   if (pastedLines.length === 1) {
@@ -1423,7 +1599,6 @@ async function cycleTab(direction) {
   try {
     const buffers = await invoke('list_open_buffers');
     if (buffers.length < 2) return;
-
     const currentIdx = buffers.findIndex(b => b.active);
     let nextIdx = (currentIdx + direction + buffers.length) % buffers.length;
     await switchTab(buffers[nextIdx].path);
@@ -1436,6 +1611,7 @@ async function cycleTab(direction) {
 
 editorEl.addEventListener('mousedown', (e) => {
   if (e.button !== 0) return;
+  resetCursorBlink();
   const pos = posFromMouse(e);
 
   if (e.shiftKey) {
@@ -1450,8 +1626,7 @@ editorEl.addEventListener('mousedown', (e) => {
   }
 
   isDragging = true;
-  renderCursor();
-  renderSelection();
+  requestRender();
   updateStatusBar();
   editorEl.focus();
 });
@@ -1461,8 +1636,7 @@ document.addEventListener('mousemove', (e) => {
   const pos = posFromMouse(e);
   cursorLine = pos.line;
   cursorCol = pos.col;
-  renderCursor();
-  renderSelection();
+  requestRender();
   updateStatusBar();
 });
 
@@ -1471,7 +1645,7 @@ document.addEventListener('mouseup', () => {
   isDragging = false;
   if (selAnchorLine === cursorLine && selAnchorCol === cursorCol) {
     clearSelection();
-    renderSelection();
+    requestRender();
   }
 });
 
@@ -1500,7 +1674,7 @@ async function openFileDialog() {
       }
       findMatches = [];
       findCurrentIdx = -1;
-      renderContent(content);
+      await updateFromEditorContent(content);
       renderTabs();
       statusEl.textContent = '';
     }
@@ -1514,8 +1688,10 @@ async function saveFile() {
   try {
     statusEl.textContent = 'Saving...';
     await invoke('save_file');
-    const content = await invoke('get_content');
-    renderContent(content);
+    modified = false;
+    await fetchVisibleContent();
+    updateMetadataUI();
+    requestRender();
     renderTabs();
     statusEl.textContent = 'Saved';
     setTimeout(() => { statusEl.textContent = ''; }, 2000);
@@ -1535,7 +1711,7 @@ function openFindBar(withReplace) {
   if (hasSelection()) {
     const sel = getSelectionRange();
     if (sel.startLine === sel.endLine) {
-      const lineText = lines[sel.startLine]?.text || '';
+      const lineText = getLineText(sel.startLine);
       findInputEl.value = lineText.substring(sel.startCol, sel.endCol);
     }
   }
@@ -1551,7 +1727,7 @@ function closeFindBar() {
   findMatches = [];
   findCurrentIdx = -1;
   findCountEl.textContent = '';
-  renderFindHighlights();
+  requestRender();
   editorEl.focus();
 }
 
@@ -1561,7 +1737,7 @@ async function runFind() {
     findMatches = [];
     findCurrentIdx = -1;
     findCountEl.textContent = '';
-    renderFindHighlights();
+    requestRender();
     return;
   }
   const caseSensitive = findCaseEl.checked;
@@ -1571,8 +1747,7 @@ async function runFind() {
     for (let i = 0; i < findMatches.length; i++) {
       const m = findMatches[i];
       if (m.line > cursorLine || (m.line === cursorLine && m.col >= cursorCol)) {
-        findCurrentIdx = i;
-        break;
+        findCurrentIdx = i; break;
       }
     }
     findCountEl.textContent = `${findCurrentIdx + 1} of ${findMatches.length}`;
@@ -1580,7 +1755,7 @@ async function runFind() {
     findCurrentIdx = -1;
     findCountEl.textContent = 'No results';
   }
-  renderFindHighlights();
+  requestRender();
 }
 
 function findNext() {
@@ -1603,9 +1778,8 @@ function scrollToMatch() {
   cursorLine = m.line;
   cursorCol = m.col + m.length;
   findCountEl.textContent = `${findCurrentIdx + 1} of ${findMatches.length}`;
-  renderCursor();
-  renderSelection();
-  renderFindHighlights();
+  ensureCursorVisible();
+  requestRender();
   updateStatusBar();
 }
 
@@ -1617,7 +1791,8 @@ async function replaceOne() {
   const result = await invoke('replace_in_file', {
     query, replacement, caseSensitive, replaceAll: false,
   });
-  renderContent(result.content);
+  // replace_in_file still returns ReplaceResult with content
+  await updateFromEditorContent(result.content);
   await runFind();
 }
 
@@ -1629,11 +1804,11 @@ async function replaceAll() {
   const result = await invoke('replace_in_file', {
     query, replacement, caseSensitive, replaceAll: true,
   });
-  renderContent(result.content);
+  await updateFromEditorContent(result.content);
   findMatches = [];
   findCurrentIdx = -1;
   findCountEl.textContent = `Replaced ${result.count}`;
-  renderFindHighlights();
+  requestRender();
 }
 
 findInputEl.addEventListener('input', () => runFind());
@@ -1647,15 +1822,17 @@ findToggleReplaceBtn.addEventListener('click', () => {
 replaceOneBtn.addEventListener('click', replaceOne);
 replaceAllBtn.addEventListener('click', replaceAll);
 
+// ─── Visibility-gated polling ────────────────────────────────
+// Skip IPC calls when window is hidden/minimized to save CPU
+function isPageVisible() { return document.visibilityState === 'visible'; }
+
 // ─── Status Bar Extension Items ──────────────────────────────
 
 async function pollStatusBarItems() {
+  if (!isPageVisible()) return;
   try {
     const items = await invoke('get_status_bar_items');
-    if (!items || items.length === 0) {
-      extStatusBarEl.innerHTML = '';
-      return;
-    }
+    if (!items || items.length === 0) { extStatusBarEl.innerHTML = ''; return; }
     items.sort((a, b) => (b.priority || 0) - (a.priority || 0));
     extStatusBarEl.innerHTML = '';
     for (const item of items) {
@@ -1663,61 +1840,37 @@ async function pollStatusBarItems() {
       span.className = 'ext-sb-item';
       span.textContent = item.text;
       if (item.tooltip) span.title = item.tooltip;
-      if (item.command) {
-        span.addEventListener('click', () => {
-          invoke('execute_command', { command: item.command });
-        });
-      }
+      if (item.command) span.addEventListener('click', () => invoke('execute_command', { command: item.command }));
       extStatusBarEl.appendChild(span);
     }
-  } catch (err) {
-    // Ignore
-  }
+  } catch (err) { /* Ignore */ }
 }
 
 const statusBarInterval = setInterval(pollStatusBarItems, 2000);
 
 // ─── Output Panel ────────────────────────────────────────────
 
-function toggleOutputPanel() {
-  outputOpen ? closeOutputPanel() : openOutputPanel();
-}
-
-function openOutputPanel() {
-  outputOpen = true;
-  outputPanelEl.classList.remove('output-hidden');
-}
-
-function closeOutputPanel() {
-  outputOpen = false;
-  outputPanelEl.classList.add('output-hidden');
-}
+function toggleOutputPanel() { outputOpen ? closeOutputPanel() : openOutputPanel(); }
+function openOutputPanel() { outputOpen = true; outputPanelEl.classList.remove('output-hidden'); }
+function closeOutputPanel() { outputOpen = false; outputPanelEl.classList.add('output-hidden'); }
 
 async function pollOutputLines() {
-  if (!outputOpen) return;
+  if (!isPageVisible() || !outputOpen) return;
   try {
     const newLines = await invoke('get_output_lines');
     if (!newLines || newLines.length === 0) return;
     outputAllLines.push(...newLines);
-
+    if (outputAllLines.length > 10000) outputAllLines.splice(0, outputAllLines.length - 10000);
     const channels = [...new Set(outputAllLines.map(l => l.channel))];
-    if (!outputSelectedChannel && channels.length > 0) {
-      outputSelectedChannel = channels[0];
-    }
-
+    if (!outputSelectedChannel && channels.length > 0) outputSelectedChannel = channels[0];
     outputChannelSelect.innerHTML = '';
     for (const ch of channels) {
       const opt = document.createElement('option');
-      opt.value = ch;
-      opt.textContent = ch;
-      opt.selected = ch === outputSelectedChannel;
+      opt.value = ch; opt.textContent = ch; opt.selected = ch === outputSelectedChannel;
       outputChannelSelect.appendChild(opt);
     }
-
     renderOutputContent();
-  } catch (err) {
-    // Ignore
-  }
+  } catch (err) { /* Ignore */ }
 }
 
 function renderOutputContent() {
@@ -1726,16 +1879,8 @@ function renderOutputContent() {
   outputContentEl.scrollTop = outputContentEl.scrollHeight;
 }
 
-outputChannelSelect.addEventListener('change', (e) => {
-  outputSelectedChannel = e.target.value;
-  renderOutputContent();
-});
-
-outputClearBtn.addEventListener('click', () => {
-  outputAllLines = outputAllLines.filter(l => l.channel !== outputSelectedChannel);
-  renderOutputContent();
-});
-
+outputChannelSelect.addEventListener('change', (e) => { outputSelectedChannel = e.target.value; renderOutputContent(); });
+outputClearBtn.addEventListener('click', () => { outputAllLines = outputAllLines.filter(l => l.channel !== outputSelectedChannel); renderOutputContent(); });
 outputCloseBtn.addEventListener('click', closeOutputPanel);
 
 const outputInterval = setInterval(pollOutputLines, 1000);
@@ -1743,12 +1888,12 @@ const outputInterval = setInterval(pollOutputLines, 1000);
 // ─── Diagnostics Polling ─────────────────────────────────────
 
 async function refreshDiagnostics() {
+  if (!isPageVisible()) return;
   try {
-    const content = await invoke('get_content');
-    renderContent(content);
-  } catch (err) {
-    // Ignore
-  }
+    await fetchVisibleContent();
+    updateMetadataUI();
+    requestRender();
+  } catch (err) { /* Ignore */ }
 }
 
 const diagnosticsInterval = setInterval(refreshDiagnostics, 2000);
@@ -1756,6 +1901,7 @@ const diagnosticsInterval = setInterval(refreshDiagnostics, 2000);
 // ─── Extension Host Status Polling ───────────────────────────
 
 async function pollExtHostStatus() {
+  if (!isPageVisible()) return;
   try {
     const status = await invoke('get_ext_host_status');
     if (status.running) {
@@ -1775,12 +1921,11 @@ const extHostInterval = setInterval(pollExtHostStatus, 3000);
 // ─── Notification Toasts ─────────────────────────────────────
 
 async function pollNotifications() {
+  if (!isPageVisible()) return;
   try {
     const notifications = await invoke('get_notifications');
     for (const n of notifications) showToast(n.type, n.message);
-  } catch (err) {
-    // Ignore
-  }
+  } catch (err) { /* Ignore */ }
 }
 
 let activeToasts = [];
@@ -1794,11 +1939,7 @@ function showToast(type, message) {
   repositionToasts();
   setTimeout(() => {
     toast.classList.add('toast-fade');
-    setTimeout(() => {
-      toast.remove();
-      activeToasts = activeToasts.filter(t => t !== toast);
-      repositionToasts();
-    }, 300);
+    setTimeout(() => { toast.remove(); activeToasts = activeToasts.filter(t => t !== toast); repositionToasts(); }, 300);
   }, 5000);
 }
 
@@ -1815,21 +1956,19 @@ const notifInterval = setInterval(pollNotifications, 1000);
 // ─── QuickPick / InputBox from Extension Host ────────────────
 
 async function pollUiRequests() {
+  if (!isPageVisible()) return;
   try {
     const requests = await invoke('get_ui_requests');
     for (const req of requests) {
       if (req.kind === 'showQuickPick') handleQuickPick(req);
       else if (req.kind === 'showInputBox') handleInputBox(req);
     }
-  } catch (err) {
-    // Ignore
-  }
+  } catch (err) { /* Ignore */ }
 }
 
 function handleQuickPick(req) {
   const items = req.params.items || [];
   const title = req.params.title || req.params.placeHolder || 'Select an item';
-
   paletteOpen = true;
   paletteEl.classList.remove('palette-hidden');
   paletteInputEl.value = '';
@@ -1838,10 +1977,7 @@ function handleQuickPick(req) {
 
   const renderItems = (filter) => {
     const q = (filter || '').toLowerCase();
-    const filtered = q
-      ? items.filter(i => (i.label || '').toLowerCase().includes(q) || (i.description || '').toLowerCase().includes(q))
-      : items;
-
+    const filtered = q ? items.filter(i => (i.label || '').toLowerCase().includes(q) || (i.description || '').toLowerCase().includes(q)) : items;
     paletteListEl.innerHTML = '';
     for (let i = 0; i < filtered.length; i++) {
       const item = document.createElement('div');
@@ -1856,57 +1992,32 @@ function handleQuickPick(req) {
         item.appendChild(descSpan);
       }
       const idx = i;
-      item.addEventListener('click', () => {
-        closePaletteAndRespond(req.request_id, filtered[idx].label);
-      });
+      item.addEventListener('click', () => closePaletteAndRespond(req.request_id, filtered[idx].label));
       paletteListEl.appendChild(item);
     }
   };
 
   renderItems('');
 
-  function onQuickPickInput() {
-    paletteSelectedIndex = 0;
-    renderItems(paletteInputEl.value);
-  }
-
-  function onQuickPickKeydown(e) {
-    const total = paletteListEl.children.length;
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      paletteSelectedIndex = Math.min(paletteSelectedIndex + 1, total - 1);
-      updatePaletteSelection();
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      paletteSelectedIndex = Math.max(paletteSelectedIndex - 1, 0);
-      updatePaletteSelection();
-    } else if (e.key === 'Enter') {
-      e.preventDefault();
-      const selected = paletteListEl.querySelectorAll('.palette-item')[paletteSelectedIndex];
-      if (selected) selected.click();
-    } else if (e.key === 'Escape') {
-      closePaletteAndRespond(req.request_id, null);
-    }
-  }
-
-  function onQuickPickBackdropClick() {
-    closePaletteAndRespond(req.request_id, null);
-  }
-
-  // Use AbortController to cleanly remove all temporary listeners at once
   const qpAbort = new AbortController();
   paletteInputEl.removeEventListener('input', paletteInputHandler);
   paletteInputEl.removeEventListener('keydown', paletteKeydownHandler);
   paletteBackdropEl.removeEventListener('click', closePalette);
-  paletteInputEl.addEventListener('input', onQuickPickInput, { signal: qpAbort.signal });
-  paletteInputEl.addEventListener('keydown', onQuickPickKeydown, { signal: qpAbort.signal });
-  paletteBackdropEl.addEventListener('click', onQuickPickBackdropClick, { signal: qpAbort.signal });
+  paletteInputEl.addEventListener('input', () => { paletteSelectedIndex = 0; renderItems(paletteInputEl.value); }, { signal: qpAbort.signal });
+  paletteInputEl.addEventListener('keydown', (e) => {
+    const total = paletteListEl.children.length;
+    if (e.key === 'ArrowDown') { e.preventDefault(); paletteSelectedIndex = Math.min(paletteSelectedIndex + 1, total - 1); updatePaletteSelection(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); paletteSelectedIndex = Math.max(paletteSelectedIndex - 1, 0); updatePaletteSelection(); }
+    else if (e.key === 'Enter') { e.preventDefault(); const sel = paletteListEl.querySelectorAll('.palette-item')[paletteSelectedIndex]; if (sel) sel.click(); }
+    else if (e.key === 'Escape') closePaletteAndRespond(req.request_id, null);
+  }, { signal: qpAbort.signal });
+  paletteBackdropEl.addEventListener('click', () => closePaletteAndRespond(req.request_id, null), { signal: qpAbort.signal });
 
   function closePaletteAndRespond(requestId, value) {
     paletteOpen = false;
     paletteEl.classList.add('palette-hidden');
     paletteInputEl.placeholder = 'Type a command...';
-    qpAbort.abort(); // Remove all temporary listeners at once
+    qpAbort.abort();
     paletteInputEl.addEventListener('input', paletteInputHandler);
     paletteInputEl.addEventListener('keydown', paletteKeydownHandler);
     paletteBackdropEl.addEventListener('click', closePalette);
@@ -1921,45 +2032,32 @@ function handleInputBox(req) {
   const prompt = req.params.prompt || req.params.title || 'Enter a value';
   const placeholder = req.params.placeHolder || '';
   const defaultValue = req.params.value || '';
-
   paletteOpen = true;
   paletteEl.classList.remove('palette-hidden');
   paletteInputEl.value = defaultValue;
   paletteInputEl.placeholder = placeholder;
   paletteListEl.innerHTML = '';
-
   const hint = document.createElement('div');
   hint.className = 'palette-item';
   hint.style.color = 'var(--fg-dim)';
   hint.textContent = prompt + ' (press Enter to confirm, Escape to cancel)';
   paletteListEl.appendChild(hint);
 
-  function onInputBoxKeydown(e) {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      closeInputAndRespond(req.request_id, paletteInputEl.value);
-    } else if (e.key === 'Escape') {
-      closeInputAndRespond(req.request_id, null);
-    }
-  }
-
-  function onInputBoxBackdropClick() {
-    closeInputAndRespond(req.request_id, null);
-  }
-
-  // Use AbortController to cleanly remove all temporary listeners at once
   const ibAbort = new AbortController();
   paletteInputEl.removeEventListener('input', paletteInputHandler);
   paletteInputEl.removeEventListener('keydown', paletteKeydownHandler);
   paletteBackdropEl.removeEventListener('click', closePalette);
-  paletteInputEl.addEventListener('keydown', onInputBoxKeydown, { signal: ibAbort.signal });
-  paletteBackdropEl.addEventListener('click', onInputBoxBackdropClick, { signal: ibAbort.signal });
+  paletteInputEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); closeInputAndRespond(req.request_id, paletteInputEl.value); }
+    else if (e.key === 'Escape') closeInputAndRespond(req.request_id, null);
+  }, { signal: ibAbort.signal });
+  paletteBackdropEl.addEventListener('click', () => closeInputAndRespond(req.request_id, null), { signal: ibAbort.signal });
 
   function closeInputAndRespond(requestId, value) {
     paletteOpen = false;
     paletteEl.classList.add('palette-hidden');
     paletteInputEl.placeholder = 'Type a command...';
-    ibAbort.abort(); // Remove all temporary listeners at once
+    ibAbort.abort();
     paletteInputEl.addEventListener('input', paletteInputHandler);
     paletteInputEl.addEventListener('keydown', paletteKeydownHandler);
     paletteBackdropEl.addEventListener('click', closePalette);
@@ -1974,7 +2072,6 @@ const uiReqInterval = setInterval(pollUiRequests, 500);
 
 // ─── M6: LSP Features ────────────────────────────────────────
 
-// --- M6: DOM References ---
 const autocompletePopup = document.getElementById('autocomplete-popup');
 const autocompleteList = document.getElementById('autocomplete-list');
 const autocompleteDetail = document.getElementById('autocomplete-detail');
@@ -1995,7 +2092,6 @@ const symbolsPanel = document.getElementById('symbols-panel');
 const symbolsInput = document.getElementById('symbols-input');
 const symbolsList = document.getElementById('symbols-list');
 
-// --- M6: State ---
 let acOpen = false;
 let acItems = [];
 let acSelectedIdx = 0;
@@ -2013,40 +2109,32 @@ let symbolSelectedIdx = 0;
 
 function getActiveUri() {
   if (!activeBufferPath) return null;
-  // Windows path → file URI
-  if (activeBufferPath.match(/^[a-zA-Z]:\\/)) {
-    return 'file:///' + activeBufferPath.replace(/\\/g, '/');
-  }
+  if (activeBufferPath.match(/^[a-zA-Z]:\\/)) return 'file:///' + activeBufferPath.replace(/\\/g, '/');
   return 'file://' + activeBufferPath;
 }
 
-// --- M6: Autocomplete ---
+function escapeHtml(text) {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// --- Autocomplete ---
 
 async function triggerAutocomplete(triggerChar) {
   const uri = getActiveUri();
   if (!uri) return;
   try {
     const result = await invoke('lsp_completion', {
-      uri,
-      line: cursorLine,
-      character: cursorCol,
-      triggerKind: triggerChar ? 2 : 1,
-      triggerCharacter: triggerChar || null,
+      uri, line: cursorLine, character: cursorCol,
+      triggerKind: triggerChar ? 2 : 1, triggerCharacter: triggerChar || null,
     });
-    if (!result || !result.items || result.items.length === 0) {
-      closeAutocomplete();
-      return;
-    }
+    if (!result || !result.items || result.items.length === 0) { closeAutocomplete(); return; }
     acItems = result.items;
     acSelectedIdx = 0;
     acFilterText = '';
     acOpen = true;
     renderAutocomplete();
     positionAutocomplete();
-  } catch (err) {
-    // No provider or timeout — silently close
-    closeAutocomplete();
-  }
+  } catch { closeAutocomplete(); }
 }
 
 function renderAutocomplete() {
@@ -2059,30 +2147,22 @@ function renderAutocomplete() {
     const item = filtered[i];
     const div = document.createElement('div');
     div.className = 'ac-item' + (i === acSelectedIdx ? ' selected' : '');
-
     const icon = document.createElement('span');
     icon.className = 'ac-icon ' + acKindClass(item.kind);
     icon.textContent = acKindLetter(item.kind);
     div.appendChild(icon);
-
     const label = document.createElement('span');
     label.className = 'ac-label';
     label.textContent = item.label || '';
     div.appendChild(label);
-
     if (item.detail) {
       const detail = document.createElement('span');
       detail.className = 'ac-detail';
       detail.textContent = item.detail;
       div.appendChild(detail);
     }
-
     div.addEventListener('click', () => acceptCompletion(item));
-    div.addEventListener('mouseenter', () => {
-      acSelectedIdx = i;
-      updateAcSelection();
-      showAcDetail(item);
-    });
+    div.addEventListener('mouseenter', () => { acSelectedIdx = i; updateAcSelection(); showAcDetail(item); });
     autocompleteList.appendChild(div);
   }
   if (max > 0) showAcDetail(filtered[acSelectedIdx]);
@@ -2092,30 +2172,17 @@ function renderAutocomplete() {
 function updateAcSelection() {
   const items = autocompleteList.querySelectorAll('.ac-item');
   items.forEach((el, i) => el.classList.toggle('selected', i === acSelectedIdx));
-  if (items[acSelectedIdx]) {
-    items[acSelectedIdx].scrollIntoView({ block: 'nearest' });
-  }
+  if (items[acSelectedIdx]) items[acSelectedIdx].scrollIntoView({ block: 'nearest' });
 }
 
-function showAcDetail(item) {
-  autocompleteDetail.textContent = item.documentation || item.detail || '';
-}
+function showAcDetail(item) { autocompleteDetail.textContent = item.documentation || item.detail || ''; }
 
 function positionAutocomplete() {
-  const charWidth = measureCharWidth();
-  const lineEls = editorEl.querySelectorAll('.line');
-  if (cursorLine >= lineEls.length) return;
-  const lineEl = lineEls[cursorLine];
-  const editorRect = editorEl.getBoundingClientRect();
-  const lineRect = lineEl.getBoundingClientRect();
-
-  let left = editorRect.left + 12 + cursorCol * charWidth - editorEl.scrollLeft;
-  let top = lineRect.bottom;
-
-  // Ensure popup stays in viewport
+  const bounds = getLineBoundsOnScreen(cursorLine);
+  let left = bounds.left + EDITOR_PADDING_LEFT + cursorCol * cellWidth - editorEl.scrollLeft;
+  let top = bounds.bottom;
   if (left + 450 > window.innerWidth) left = window.innerWidth - 460;
-  if (top + 250 > window.innerHeight) top = lineRect.top - 250;
-
+  if (top + 250 > window.innerHeight) top = bounds.top - 250;
   autocompletePopup.style.left = `${Math.max(0, left)}px`;
   autocompletePopup.style.top = `${Math.max(0, top)}px`;
 }
@@ -2124,69 +2191,43 @@ async function acceptCompletion(item) {
   closeAutocomplete();
   const insertText = item.insertText || item.label || '';
   if (!insertText) return;
-
-  // Delete any filter text already typed
   if (acFilterText) {
-    const content = await invoke('edit_replace_range', {
+    const result = await invoke('edit_replace_range', {
       startLine: cursorLine, startCol: cursorCol - acFilterText.length,
-      endLine: cursorLine, endCol: cursorCol,
-      text: insertText,
+      endLine: cursorLine, endCol: cursorCol, text: insertText,
     });
     cursorCol = cursorCol - acFilterText.length + insertText.length;
-    renderContent(content);
+    await updateFromEditResult(result);
   } else {
-    const content = await invoke('edit_insert', { line: cursorLine, col: cursorCol, text: insertText });
+    const result = await invoke('edit_insert', { line: cursorLine, col: cursorCol, text: insertText });
     cursorCol += insertText.length;
-    renderContent(content);
+    await updateFromEditResult(result);
   }
 }
 
-function closeAutocomplete() {
-  acOpen = false;
-  acItems = [];
-  acFilterText = '';
-  autocompletePopup.classList.add('lsp-hidden');
-  autocompleteDetail.textContent = '';
-}
+function closeAutocomplete() { acOpen = false; acItems = []; acFilterText = ''; autocompletePopup.classList.add('lsp-hidden'); autocompleteDetail.textContent = ''; }
 
 function acKindClass(kind) {
-  const map = { 1: 'ac-icon-method', 2: 'ac-icon-function', 3: 'ac-icon-function',
-    4: 'ac-icon-field', 5: 'ac-icon-variable', 6: 'ac-icon-class',
-    7: 'ac-icon-interface', 8: 'ac-icon-module', 9: 'ac-icon-property',
-    12: 'ac-icon-enum', 13: 'ac-icon-keyword', 14: 'ac-icon-snippet',
-    16: 'ac-icon-file', 18: 'ac-icon-folder', 20: 'ac-icon-constant' };
+  const map = { 1: 'ac-icon-method', 2: 'ac-icon-function', 3: 'ac-icon-function', 4: 'ac-icon-field', 5: 'ac-icon-variable', 6: 'ac-icon-class', 7: 'ac-icon-interface', 8: 'ac-icon-module', 9: 'ac-icon-property', 12: 'ac-icon-enum', 13: 'ac-icon-keyword', 14: 'ac-icon-snippet', 16: 'ac-icon-file', 18: 'ac-icon-folder', 20: 'ac-icon-constant' };
   return map[kind] || 'ac-icon-text';
 }
 
 function acKindLetter(kind) {
-  const map = { 1: 'M', 2: 'F', 3: 'C', 4: 'F', 5: 'V', 6: 'C', 7: 'I', 8: 'M',
-    9: 'P', 12: 'E', 13: 'K', 14: 'S', 16: '📄', 18: '📁', 20: 'C' };
+  const map = { 1: 'M', 2: 'F', 3: 'C', 4: 'F', 5: 'V', 6: 'C', 7: 'I', 8: 'M', 9: 'P', 12: 'E', 13: 'K', 14: 'S', 16: 'F', 18: 'D', 20: 'C' };
   return map[kind] || 'T';
 }
 
-// --- M6: Hover ---
+// --- Hover ---
 
-function scheduleHover(line, col) {
-  cancelHover();
-  hoverTimer = setTimeout(() => requestHover(line, col), 500);
-}
-
-function cancelHover() {
-  if (hoverTimer) {
-    clearTimeout(hoverTimer);
-    hoverTimer = null;
-  }
-}
+function scheduleHover(line, col) { cancelHover(); hoverTimer = setTimeout(() => requestHover(line, col), 500); }
+function cancelHover() { if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; } }
 
 async function requestHover(line, col) {
   const uri = getActiveUri();
   if (!uri) return;
   try {
     const result = await invoke('lsp_hover', { uri, line, character: col });
-    if (!result || !result.contents) {
-      closeHover();
-      return;
-    }
+    if (!result || !result.contents) { closeHover(); return; }
     hoverContent.textContent = '';
     const text = typeof result.contents === 'string' ? result.contents
       : Array.isArray(result.contents) ? result.contents.map(c => typeof c === 'string' ? c : c.value || '').join('\n')
@@ -2195,61 +2236,37 @@ async function requestHover(line, col) {
     hoverOpen = true;
     hoverTooltip.classList.remove('lsp-hidden');
     positionHover(line);
-  } catch {
-    closeHover();
-  }
+  } catch { closeHover(); }
 }
 
 function positionHover(line) {
-  const charWidth = measureCharWidth();
-  const lineEls = editorEl.querySelectorAll('.line');
-  if (line >= lineEls.length) return;
-  const lineEl = lineEls[line];
-  const editorRect = editorEl.getBoundingClientRect();
-  const lineRect = lineEl.getBoundingClientRect();
-
-  let left = editorRect.left + 12;
-  let top = lineRect.top - 10;
-
-  // Show above the line
+  const bounds = getLineBoundsOnScreen(line);
+  let left = bounds.left + EDITOR_PADDING_LEFT;
+  let top = bounds.top - 10;
   const tooltipHeight = hoverTooltip.offsetHeight || 100;
-  if (top - tooltipHeight < 0) top = lineRect.bottom + 4;
+  if (top - tooltipHeight < 0) top = bounds.bottom + 4;
   else top = top - tooltipHeight;
-
   hoverTooltip.style.left = `${Math.max(0, left)}px`;
   hoverTooltip.style.top = `${Math.max(0, top)}px`;
 }
 
-function closeHover() {
-  hoverOpen = false;
-  hoverTooltip.classList.add('lsp-hidden');
-}
+function closeHover() { hoverOpen = false; hoverTooltip.classList.add('lsp-hidden'); }
 
-// Mouse hover on editor lines
 editorEl.addEventListener('mousemove', (e) => {
   if (isDragging || acOpen) return;
   const pos = posFromMouse(e);
-  if (e.ctrlKey) {
-    // Ctrl+hover: show link underline
-    cancelHover();
-    closeHover();
-    return;
-  }
+  if (e.ctrlKey) { cancelHover(); closeHover(); return; }
   scheduleHover(pos.line, pos.col);
 });
 
 editorEl.addEventListener('mouseleave', () => {
   cancelHover();
-  setTimeout(() => {
-    if (!hoverTooltip.matches(':hover')) closeHover();
-  }, 200);
+  setTimeout(() => { if (!hoverTooltip.matches(':hover')) closeHover(); }, 200);
 });
 
-hoverTooltip.addEventListener('mouseleave', () => {
-  closeHover();
-});
+hoverTooltip.addEventListener('mouseleave', () => closeHover());
 
-// --- M6: Go-to-definition (Ctrl+Click / F12) ---
+// --- Go-to-definition ---
 
 async function goToDefinition() {
   const uri = getActiveUri();
@@ -2264,25 +2281,21 @@ async function goToDefinition() {
     }
     const locations = Array.isArray(result) ? result : [result];
     const loc = locations[0];
-    if (loc.uri && loc.range) {
-      await navigateToLocation(loc.uri, loc.range.start.line, loc.range.start.character);
-    }
+    if (loc.uri && loc.range) await navigateToLocation(loc.uri, loc.range.start.line, loc.range.start.character);
     statusEl.textContent = '';
-  } catch (err) {
+  } catch {
     statusEl.textContent = 'Definition unavailable';
     setTimeout(() => { statusEl.textContent = ''; }, 2000);
   }
 }
 
 async function navigateToLocation(uri, line, col) {
-  // Convert URI to file path
   let path = uri;
   if (path.startsWith('file:///')) path = path.substring(8);
   else if (path.startsWith('file://')) path = path.substring(7);
-  // On Windows, handle /C:/... → C:\...
   if (path.match(/^\/[a-zA-Z]:\//)) path = path.substring(1);
-  // Only convert to backslashes on Windows
-  if (navigator.platform.startsWith('Win')) path = path.replace(/\//g, '\\');
+  const isWindows = navigator.userAgentData?.platform === 'Windows' || /Win/.test(navigator.platform || '');
+  if (isWindows) path = path.replace(/\//g, '\\');
 
   try {
     saveBufferState();
@@ -2291,7 +2304,7 @@ async function navigateToLocation(uri, line, col) {
     cursorLine = line;
     cursorCol = col;
     clearSelection();
-    renderContent(content);
+    await updateFromEditorContent(content);
     renderTabs();
     editorEl.focus();
   } catch (err) {
@@ -2300,7 +2313,6 @@ async function navigateToLocation(uri, line, col) {
   }
 }
 
-// Ctrl+Click handler
 editorEl.addEventListener('click', async (e) => {
   if (e.ctrlKey && e.button === 0) {
     e.preventDefault();
@@ -2311,7 +2323,7 @@ editorEl.addEventListener('click', async (e) => {
   }
 });
 
-// --- M6: Find References (Shift+F12) ---
+// --- Find References ---
 
 async function findReferences() {
   const uri = getActiveUri();
@@ -2326,7 +2338,7 @@ async function findReferences() {
     }
     statusEl.textContent = '';
     showReferencesPanel(result);
-  } catch (err) {
+  } catch {
     statusEl.textContent = 'References unavailable';
     setTimeout(() => { statusEl.textContent = ''; }, 2000);
   }
@@ -2336,63 +2348,44 @@ function showReferencesPanel(locations) {
   refsOpen = true;
   referencesList.innerHTML = '';
   referencesTitle.textContent = `${locations.length} Reference${locations.length !== 1 ? 's' : ''}`;
-
   for (const loc of locations) {
     const div = document.createElement('div');
     div.className = 'ref-item';
-
     let path = loc.uri || '';
     if (path.startsWith('file:///')) path = path.substring(8);
     else if (path.startsWith('file://')) path = path.substring(7);
     const name = path.split(/[/\\]/).pop() || path;
-
     const fileSpan = document.createElement('span');
     fileSpan.className = 'ref-file';
     fileSpan.textContent = name;
     div.appendChild(fileSpan);
-
     const locSpan = document.createElement('span');
     locSpan.className = 'ref-location';
     const line = loc.range?.start?.line ?? 0;
     const col = loc.range?.start?.character ?? 0;
     locSpan.textContent = `:${line + 1}:${col + 1}`;
     div.appendChild(locSpan);
-
-    div.addEventListener('click', () => {
-      closeReferences();
-      navigateToLocation(loc.uri, line, col);
-    });
+    div.addEventListener('click', () => { closeReferences(); navigateToLocation(loc.uri, line, col); });
     referencesList.appendChild(div);
   }
   referencesPanel.classList.remove('lsp-hidden');
 }
 
-function closeReferences() {
-  refsOpen = false;
-  referencesPanel.classList.add('lsp-hidden');
-}
-
+function closeReferences() { refsOpen = false; referencesPanel.classList.add('lsp-hidden'); }
 referencesClose.addEventListener('click', closeReferences);
 
-// --- M6: Code Actions (Ctrl+.) ---
+// --- Code Actions ---
 
 async function requestCodeActions() {
   const uri = getActiveUri();
   if (!uri) return;
-
   let startLine = cursorLine, startChar = cursorCol, endLine = cursorLine, endChar = cursorCol;
   if (hasSelection()) {
     const sel = getSelectionRange();
-    startLine = sel.startLine;
-    startChar = sel.startCol;
-    endLine = sel.endLine;
-    endChar = sel.endCol;
+    startLine = sel.startLine; startChar = sel.startCol; endLine = sel.endLine; endChar = sel.endCol;
   }
-
   try {
-    const result = await invoke('lsp_code_action', {
-      uri, startLine, startCharacter: startChar, endLine, endCharacter: endChar,
-    });
+    const result = await invoke('lsp_code_action', { uri, startLine, startCharacter: startChar, endLine, endCharacter: endChar });
     if (!result || (Array.isArray(result) && result.length === 0)) {
       statusEl.textContent = 'No code actions available';
       setTimeout(() => { statusEl.textContent = ''; }, 2000);
@@ -2414,8 +2407,7 @@ function renderCodeActions() {
   for (let i = 0; i < caItems.length; i++) {
     const action = caItems[i];
     const div = document.createElement('div');
-    div.className = 'ca-item' + (i === caSelectedIdx ? ' selected' : '') +
-      (action.isPreferred ? ' ca-item-preferred' : '');
+    div.className = 'ca-item' + (i === caSelectedIdx ? ' selected' : '') + (action.isPreferred ? ' ca-item-preferred' : '');
     div.textContent = action.title || 'Unnamed action';
     div.addEventListener('click', () => executeCodeAction(action));
     codeActionsList.appendChild(div);
@@ -2424,16 +2416,9 @@ function renderCodeActions() {
 }
 
 function positionCodeActions() {
-  const charWidth = measureCharWidth();
-  const lineEls = editorEl.querySelectorAll('.line');
-  if (cursorLine >= lineEls.length) return;
-  const lineEl = lineEls[cursorLine];
-  const editorRect = editorEl.getBoundingClientRect();
-  const lineRect = lineEl.getBoundingClientRect();
-
-  let left = editorRect.left + 12 + cursorCol * charWidth - editorEl.scrollLeft;
-  let top = lineRect.bottom + 2;
-
+  const bounds = getLineBoundsOnScreen(cursorLine);
+  let left = bounds.left + EDITOR_PADDING_LEFT + cursorCol * cellWidth - editorEl.scrollLeft;
+  let top = bounds.bottom + 2;
   codeActionsMenu.style.left = `${Math.max(0, left)}px`;
   codeActionsMenu.style.top = `${Math.max(0, top)}px`;
 }
@@ -2444,102 +2429,90 @@ async function executeCodeAction(action) {
     await invoke('execute_command', { command: action.command.command || action.command });
     setTimeout(refreshDiagnostics, 500);
   }
-  if (action.edit && action.edit.changes) {
-    // Apply workspace edits — sort end-to-start to preserve positions
-    for (const [uri, edits] of Object.entries(action.edit.changes)) {
-      const sorted = edits.slice().sort((a, b) => {
-        if (b.range.start.line !== a.range.start.line) return b.range.start.line - a.range.start.line;
-        return b.range.start.character - a.range.start.character;
-      });
-      for (const edit of sorted) {
-        const r = edit.range;
-        await invoke('edit_replace_range', {
-          startLine: r.start.line, startCol: r.start.character,
-          endLine: r.end.line, endCol: r.end.character,
-          text: edit.newText,
-        });
+  if (action.edit) {
+    // Support both `changes` and `documentChanges` (LSP 3.x)
+    let allEdits = [];
+    if (action.edit.changes) {
+      for (const [uri, edits] of Object.entries(action.edit.changes)) {
+        for (const edit of edits) allEdits.push(edit);
       }
     }
-    const content = await invoke('get_content');
-    renderContent(content);
+    if (action.edit.documentChanges) {
+      for (const dc of action.edit.documentChanges) {
+        if (dc.edits) {
+          for (const edit of dc.edits) allEdits.push(edit);
+        }
+      }
+    }
+    // Apply in reverse order to preserve positions
+    allEdits.sort((a, b) => {
+      if (b.range.start.line !== a.range.start.line) return b.range.start.line - a.range.start.line;
+      return b.range.start.character - a.range.start.character;
+    });
+    for (const edit of allEdits) {
+      const r = edit.range;
+      await invoke('edit_replace_range', {
+        startLine: r.start.line, startCol: r.start.character,
+        endLine: r.end.line, endCol: r.end.character, text: edit.newText,
+      });
+    }
+    await fetchVisibleContent();
+    updateMetadataUI();
+    requestRender();
   }
 }
 
-function closeCodeActions() {
-  codeActionsOpen = false;
-  codeActionsMenu.classList.add('lsp-hidden');
-}
+function closeCodeActions() { codeActionsOpen = false; codeActionsMenu.classList.add('lsp-hidden'); }
 
-// --- M6: Signature Help ---
+// --- Signature Help ---
 
 async function requestSignatureHelp(triggerChar) {
   const uri = getActiveUri();
   if (!uri) return;
   try {
-    const result = await invoke('lsp_signature_help', {
-      uri, line: cursorLine, character: cursorCol, triggerCharacter: triggerChar || null,
-    });
-    if (!result || !result.signatures || result.signatures.length === 0) {
-      closeSignatureHelp();
-      return;
-    }
+    const result = await invoke('lsp_signature_help', { uri, line: cursorLine, character: cursorCol, triggerCharacter: triggerChar || null });
+    if (!result || !result.signatures || result.signatures.length === 0) { closeSignatureHelp(); return; }
     sigHelpOpen = true;
     const sig = result.signatures[result.activeSignature ?? 0];
-    signatureLabel.innerHTML = escapeHtml(sig.label);
-
-    // Highlight active parameter
+    signatureLabel.textContent = sig.label;
     if (sig.parameters && sig.parameters.length > 0) {
       const activeParam = sig.parameters[result.activeParameter ?? 0];
       if (activeParam) {
         const paramLabel = typeof activeParam.label === 'string' ? activeParam.label : sig.label.substring(activeParam.label[0], activeParam.label[1]);
         const idx = sig.label.indexOf(paramLabel);
         if (idx !== -1) {
-          signatureLabel.innerHTML =
-            escapeHtml(sig.label.substring(0, idx)) +
-            '<span class="sig-active-param">' + escapeHtml(paramLabel) + '</span>' +
-            escapeHtml(sig.label.substring(idx + paramLabel.length));
+          signatureLabel.textContent = '';
+          signatureLabel.appendChild(document.createTextNode(sig.label.substring(0, idx)));
+          const span = document.createElement('span');
+          span.className = 'sig-active-param';
+          span.textContent = paramLabel;
+          signatureLabel.appendChild(span);
+          signatureLabel.appendChild(document.createTextNode(sig.label.substring(idx + paramLabel.length)));
         }
       }
     }
-
-    const docText = typeof sig.documentation === 'string' ? sig.documentation :
-      sig.documentation?.value || '';
-    signatureDocs.textContent = docText;
-
+    signatureDocs.textContent = typeof sig.documentation === 'string' ? sig.documentation : sig.documentation?.value || '';
     signatureHelp.classList.remove('lsp-hidden');
     positionSignatureHelp();
-  } catch {
-    closeSignatureHelp();
-  }
+  } catch { closeSignatureHelp(); }
 }
 
 function positionSignatureHelp() {
-  const charWidth = measureCharWidth();
-  const lineEls = editorEl.querySelectorAll('.line');
-  if (cursorLine >= lineEls.length) return;
-  const lineEl = lineEls[cursorLine];
-  const editorRect = editorEl.getBoundingClientRect();
-  const lineRect = lineEl.getBoundingClientRect();
-
-  let left = editorRect.left + 12 + cursorCol * charWidth - editorEl.scrollLeft;
-  let top = lineRect.top - signatureHelp.offsetHeight - 4;
-  if (top < 0) top = lineRect.bottom + 4;
-
+  const bounds = getLineBoundsOnScreen(cursorLine);
+  let left = bounds.left + EDITOR_PADDING_LEFT + cursorCol * cellWidth - editorEl.scrollLeft;
+  let top = bounds.top - signatureHelp.offsetHeight - 4;
+  if (top < 0) top = bounds.bottom + 4;
   signatureHelp.style.left = `${Math.max(0, left)}px`;
   signatureHelp.style.top = `${Math.max(0, top)}px`;
 }
 
-function closeSignatureHelp() {
-  sigHelpOpen = false;
-  signatureHelp.classList.add('lsp-hidden');
-}
+function closeSignatureHelp() { sigHelpOpen = false; signatureHelp.classList.add('lsp-hidden'); }
 
-// --- M6: Document Symbols (Ctrl+Shift+O) ---
+// --- Document Symbols ---
 
 async function openSymbolOutline() {
   const uri = getActiveUri();
   if (!uri) { statusEl.textContent = 'No file open'; return; }
-
   try {
     statusEl.textContent = 'Loading symbols...';
     const result = await invoke('lsp_document_symbols', { uri });
@@ -2556,7 +2529,7 @@ async function openSymbolOutline() {
     symbolsPalette.classList.remove('palette-hidden');
     symbolsInput.value = '';
     symbolsInput.focus();
-  } catch (err) {
+  } catch {
     statusEl.textContent = 'Symbols unavailable';
     setTimeout(() => { statusEl.textContent = ''; }, 2000);
   }
@@ -2569,9 +2542,7 @@ function flattenSymbols(symbols, prefix = '') {
     const line = sym.range?.start?.line ?? sym.selectionRange?.start?.line ?? sym.location?.range?.start?.line ?? 0;
     const col = sym.range?.start?.character ?? sym.selectionRange?.start?.character ?? sym.location?.range?.start?.character ?? 0;
     result.push({ name, detail: sym.detail || '', kind: sym.kind, line, col });
-    if (sym.children) {
-      result.push(...flattenSymbols(sym.children, name));
-    }
+    if (sym.children) result.push(...flattenSymbols(sym.children, name));
   }
   return result;
 }
@@ -2584,78 +2555,40 @@ function renderSymbolList(query) {
     const sym = filtered[i];
     const div = document.createElement('div');
     div.className = 'symbol-item' + (i === symbolSelectedIdx ? ' selected' : '');
-
     const icon = document.createElement('span');
     icon.className = 'symbol-icon ' + symbolKindClass(sym.kind);
     icon.textContent = symbolKindLetter(sym.kind);
     div.appendChild(icon);
-
     const name = document.createElement('span');
     name.className = 'symbol-name';
     name.textContent = sym.name;
     div.appendChild(name);
-
-    if (sym.detail) {
-      const detail = document.createElement('span');
-      detail.className = 'symbol-detail';
-      detail.textContent = sym.detail;
-      div.appendChild(detail);
-    }
-
+    if (sym.detail) { const detail = document.createElement('span'); detail.className = 'symbol-detail'; detail.textContent = sym.detail; div.appendChild(detail); }
     div.addEventListener('click', () => {
       closeSymbolOutline();
       cursorLine = sym.line;
       cursorCol = sym.col;
       clearSelection();
-      renderCursor();
+      ensureCursorVisible();
+      requestRender();
       updateStatusBar();
     });
     symbolsList.appendChild(div);
   }
 }
 
-function symbolKindClass(kind) {
-  const map = { 5: 'symbol-icon-method', 11: 'symbol-icon-function', 4: 'symbol-icon-class',
-    10: 'symbol-icon-interface', 12: 'symbol-icon-variable', 6: 'symbol-icon-property',
-    13: 'symbol-icon-constant', 9: 'symbol-icon-enum', 1: 'symbol-icon-module' };
-  return map[kind] || 'symbol-icon-variable';
-}
+function symbolKindClass(kind) { const map = { 5: 'symbol-icon-method', 11: 'symbol-icon-function', 4: 'symbol-icon-class', 10: 'symbol-icon-interface', 12: 'symbol-icon-variable', 6: 'symbol-icon-property', 13: 'symbol-icon-constant', 9: 'symbol-icon-enum', 1: 'symbol-icon-module' }; return map[kind] || 'symbol-icon-variable'; }
+function symbolKindLetter(kind) { const map = { 5: 'M', 11: 'F', 4: 'C', 10: 'I', 12: 'V', 6: 'P', 13: 'K', 9: 'E', 1: 'M' }; return map[kind] || 'S'; }
+function closeSymbolOutline() { symbolsOpen = false; symbolsPalette.classList.add('palette-hidden'); editorEl.focus(); }
 
-function symbolKindLetter(kind) {
-  const map = { 5: 'M', 11: 'F', 4: 'C', 10: 'I', 12: 'V', 6: 'P', 13: 'K', 9: 'E', 1: 'M' };
-  return map[kind] || 'S';
-}
-
-function closeSymbolOutline() {
-  symbolsOpen = false;
-  symbolsPalette.classList.add('palette-hidden');
-  editorEl.focus();
-}
-
-symbolsInput.addEventListener('input', () => {
-  symbolSelectedIdx = 0;
-  renderSymbolList(symbolsInput.value);
-});
-
+symbolsInput.addEventListener('input', () => { symbolSelectedIdx = 0; renderSymbolList(symbolsInput.value); });
 symbolsInput.addEventListener('keydown', (e) => {
   const total = symbolsList.children.length;
-  if (e.key === 'ArrowDown') {
-    e.preventDefault();
-    symbolSelectedIdx = Math.min(symbolSelectedIdx + 1, total - 1);
-    updateSymbolSelection();
-  } else if (e.key === 'ArrowUp') {
-    e.preventDefault();
-    symbolSelectedIdx = Math.max(symbolSelectedIdx - 1, 0);
-    updateSymbolSelection();
-  } else if (e.key === 'Enter') {
-    e.preventDefault();
-    const items = symbolsList.querySelectorAll('.symbol-item');
-    if (items[symbolSelectedIdx]) items[symbolSelectedIdx].click();
-  } else if (e.key === 'Escape') {
-    closeSymbolOutline();
-  }
+  if (e.key === 'ArrowDown') { e.preventDefault(); symbolSelectedIdx = Math.min(symbolSelectedIdx + 1, total - 1); updateSymbolSelection(); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); symbolSelectedIdx = Math.max(symbolSelectedIdx - 1, 0); updateSymbolSelection(); }
+  else if (e.key === 'Enter') { e.preventDefault(); const items = symbolsList.querySelectorAll('.symbol-item'); if (items[symbolSelectedIdx]) items[symbolSelectedIdx].click(); }
+  else if (e.key === 'Escape') closeSymbolOutline();
 });
-
 symbolsBackdrop.addEventListener('click', closeSymbolOutline);
 
 function updateSymbolSelection() {
@@ -2664,7 +2597,7 @@ function updateSymbolSelection() {
   if (items[symbolSelectedIdx]) items[symbolSelectedIdx].scrollIntoView({ block: 'nearest' });
 }
 
-// --- M6: Formatting (Ctrl+Shift+F) ---
+// --- Formatting ---
 
 async function formatDocument() {
   const uri = getActiveUri();
@@ -2673,7 +2606,6 @@ async function formatDocument() {
     statusEl.textContent = 'Formatting...';
     const result = await invoke('lsp_format', { uri, tabSize: 2, insertSpaces: true });
     if (result && Array.isArray(result) && result.length > 0) {
-      // Apply edits from end to start to preserve positions
       const edits = result.slice().sort((a, b) => {
         if (b.range.start.line !== a.range.start.line) return b.range.start.line - a.range.start.line;
         return b.range.start.character - a.range.start.character;
@@ -2681,24 +2613,24 @@ async function formatDocument() {
       for (const edit of edits) {
         await invoke('edit_replace_range', {
           startLine: edit.range.start.line, startCol: edit.range.start.character,
-          endLine: edit.range.end.line, endCol: edit.range.end.character,
-          text: edit.newText,
+          endLine: edit.range.end.line, endCol: edit.range.end.character, text: edit.newText,
         });
       }
-      const content = await invoke('get_content');
-      renderContent(content);
+      await fetchVisibleContent();
+      updateMetadataUI();
+      requestRender();
       statusEl.textContent = 'Formatted';
     } else {
       statusEl.textContent = 'No formatting changes';
     }
     setTimeout(() => { statusEl.textContent = ''; }, 2000);
-  } catch (err) {
+  } catch {
     statusEl.textContent = 'Formatting unavailable';
     setTimeout(() => { statusEl.textContent = ''; }, 2000);
   }
 }
 
-// --- M6: Global close on Escape ---
+// --- Global close ---
 
 function closeLspPopups() {
   if (acOpen) closeAutocomplete();
@@ -2709,7 +2641,6 @@ function closeLspPopups() {
   if (symbolsOpen) closeSymbolOutline();
 }
 
-// Close popups when clicking outside
 document.addEventListener('click', (e) => {
   if (acOpen && !autocompletePopup.contains(e.target) && e.target !== editorEl) closeAutocomplete();
   if (codeActionsOpen && !codeActionsMenu.contains(e.target)) closeCodeActions();
@@ -2717,7 +2648,6 @@ document.addEventListener('click', (e) => {
 
 // ─── Cleanup ─────────────────────────────────────────────────
 
-// Track all polling intervals so they can be cleaned up on reload
 const _ccIntervals = [statusBarInterval, outputInterval, diagnosticsInterval, extHostInterval, notifInterval, uiReqInterval];
 
 window.addEventListener('beforeunload', () => {
@@ -2727,15 +2657,18 @@ window.addEventListener('beforeunload', () => {
 // ─── Init ────────────────────────────────────────────────────
 
 async function init() {
-  // Clear stale intervals from previous hot-reload (beforeunload may not fire in Tauri)
   if (window._ccPrevIntervals) {
     window._ccPrevIntervals.forEach(id => clearInterval(id));
   }
   window._ccPrevIntervals = _ccIntervals;
 
   try {
+    measureFont();
+    resizeCanvases();
+    resetCursorBlink();
+
     const content = await invoke('get_content');
-    renderContent(content);
+    await updateFromEditorContent(content);
     renderTabs();
     editorEl.focus();
     statusEl.textContent = 'Ready — Ctrl+O open, Ctrl+B explorer, Ctrl+Space autocomplete, F12 go-to-def';

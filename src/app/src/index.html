@@ -31,8 +31,11 @@
 
       <div id="editor-area">
         <div id="editor-container">
-          <div id="gutter"></div>
-          <div id="editor" tabindex="0"></div>
+          <div id="gutter"><canvas id="gutter-canvas"></canvas></div>
+          <div id="editor" tabindex="0">
+            <canvas id="editor-canvas"></canvas>
+            <div id="scroll-sizer"></div>
+          </div>
         </div>
 
         <!-- M5: Minimap -->

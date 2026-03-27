@@ -122,7 +122,7 @@ export class LanguageClient {
   private clientOptions: ClientOptions;
   private process: ChildProcess | null = null;
   private nextRequestId = 1;
-  private pendingRequests = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  private pendingRequests = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer?: ReturnType<typeof setTimeout> }>();
   private buffer = Buffer.alloc(0);
   private contentLength = -1;
   private started = false;
@@ -231,19 +231,17 @@ export class LanguageClient {
       }
       const id = this.nextRequestId++;
       const msg: JsonRpcRequest = { jsonrpc: "2.0", id, method, params };
-      this.pendingRequests.set(id, { resolve, reject });
-
-      const json = JSON.stringify(msg);
-      const header = `Content-Length: ${Buffer.byteLength(json)}\r\n\r\n`;
-      this.process.stdin.write(header + json);
-
-      // Timeout after 30s
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         if (this.pendingRequests.has(id)) {
           this.pendingRequests.delete(id);
           reject(new Error(`LSP request ${method} timed out`));
         }
       }, 30000);
+      this.pendingRequests.set(id, { resolve, reject, timer });
+
+      const json = JSON.stringify(msg);
+      const header = `Content-Length: ${Buffer.byteLength(json)}\r\n\r\n`;
+      this.process.stdin.write(header + json);
     });
   }
 
@@ -271,6 +269,12 @@ export class LanguageClient {
           continue;
         }
         this.contentLength = parseInt(match[1], 10);
+        if (this.contentLength > 50 * 1024 * 1024) {
+          console.error(`[LanguageClient:${this.id}] Content-Length too large (${this.contentLength}), resetting`);
+          this.buffer = Buffer.alloc(0);
+          this.contentLength = -1;
+          return;
+        }
         this.buffer = this.buffer.subarray(headerEnd + 4);
       }
 
@@ -296,6 +300,7 @@ export class LanguageClient {
   private handleResponse(msg: JsonRpcResponse): void {
     const pending = this.pendingRequests.get(msg.id);
     if (pending) {
+      if (pending.timer) clearTimeout(pending.timer);
       this.pendingRequests.delete(msg.id);
       if (msg.error) {
         pending.reject(new Error(`LSP error ${msg.error.code}: ${msg.error.message}`));

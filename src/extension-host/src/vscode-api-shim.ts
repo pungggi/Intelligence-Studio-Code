@@ -39,7 +39,7 @@ class EventEmitter<T> {
   };
 
   fire(data: T): void {
-    for (const listener of this.listeners) {
+    for (const listener of [...this.listeners]) {
       try {
         listener(data);
       } catch (err) {
@@ -140,6 +140,10 @@ export class Uri {
   }
 
   get fsPath(): string {
+    // On Windows, URL paths like /C:/foo need the leading slash stripped
+    if (/^\/[a-zA-Z]:/.test(this.path)) {
+      return this.path.substring(1).replace(/\//g, "\\");
+    }
     return this.path;
   }
 
@@ -481,7 +485,7 @@ export class VscodeApiShim {
 
   private pendingUiRequests = new Map<
     string,
-    { resolve: (value: unknown) => void; reject: (err: Error) => void }
+    { resolve: (value: unknown) => void; reject: (err: Error) => void; timer?: ReturnType<typeof setTimeout> }
   >();
   private uiRequestId = 0;
   private statusBarItemId = 0;
@@ -526,12 +530,25 @@ export class VscodeApiShim {
       case "textDocument/didClose":
         this.handleDidClose(msg.params as { uri: string });
         break;
-      case "executeCommand":
+      case "executeCommand": {
+        const ecParams = msg.params as Record<string, unknown>;
         this.executeCommand(
-          (msg.params as Record<string, unknown>).command as string,
-          ...((msg.params as Record<string, unknown>).args as unknown[] ?? [])
-        );
+          ecParams.command as string,
+          ...((ecParams.args as unknown[]) ?? [])
+        ).then((result) => {
+          this.sendOutgoing({
+            method: "commandResult",
+            params: { command: ecParams.command, result: result ?? null },
+          });
+        }).catch((err) => {
+          console.error(`[ExtHost] executeCommand error:`, err);
+          this.sendOutgoing({
+            method: "commandResult",
+            params: { command: ecParams.command, error: String(err) },
+          });
+        });
         break;
+      }
       case "listCommands":
         this.sendOutgoing({
           method: "registeredCommands",
@@ -544,6 +561,7 @@ export class VscodeApiShim {
         const reqId = p.requestId as string;
         const pending = this.pendingUiRequests.get(reqId);
         if (pending) {
+          if (pending.timer) clearTimeout(pending.timer);
           this.pendingUiRequests.delete(reqId);
           pending.resolve(p.value ?? undefined);
         }
@@ -1067,6 +1085,7 @@ export class VscodeApiShim {
     const mapped = diagnostics.map((d) => ({
       line: d.range.start.line,
       col_start: d.range.start.character,
+      end_line: d.range.end.line,
       col_end: d.range.end.character,
       severity: severityToString(d.severity),
       message: d.message,
@@ -1139,17 +1158,17 @@ export class VscodeApiShim {
         });
 
         return new Promise((resolve, reject) => {
-          self.pendingUiRequests.set(requestId, {
-            resolve: resolve as (value: unknown) => void,
-            reject,
-          });
-
-          setTimeout(() => {
+          const timer = setTimeout(() => {
             if (self.pendingUiRequests.has(requestId)) {
               self.pendingUiRequests.delete(requestId);
               resolve(undefined);
             }
           }, 60000);
+          self.pendingUiRequests.set(requestId, {
+            resolve: resolve as (value: unknown) => void,
+            reject,
+            timer,
+          });
         });
       },
       async showInputBox(
@@ -1170,17 +1189,17 @@ export class VscodeApiShim {
         });
 
         return new Promise((resolve, reject) => {
-          self.pendingUiRequests.set(requestId, {
-            resolve: resolve as (value: unknown) => void,
-            reject,
-          });
-
-          setTimeout(() => {
+          const timer = setTimeout(() => {
             if (self.pendingUiRequests.has(requestId)) {
               self.pendingUiRequests.delete(requestId);
               resolve(undefined);
             }
           }, 60000);
+          self.pendingUiRequests.set(requestId, {
+            resolve: resolve as (value: unknown) => void,
+            reject,
+            timer,
+          });
         });
       },
 

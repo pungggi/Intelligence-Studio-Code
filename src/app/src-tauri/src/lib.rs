@@ -30,14 +30,18 @@ fn validate_path(path: &str) -> Result<String, String> {
     Ok(canonical.to_string_lossy().to_string())
 }
 
-fn path_to_uri(path: &str) -> String {
+pub(crate) fn path_to_uri(path: &str) -> String {
+    let encoded = path
+        .replace('\\', "/")
+        .replace(' ', "%20")
+        .replace('#', "%23");
     #[cfg(target_os = "windows")]
     {
-        format!("file:///{}", path.replace('\\', "/"))
+        format!("file:///{}", encoded)
     }
     #[cfg(not(target_os = "windows"))]
     {
-        format!("file://{}", path)
+        format!("file://{}", encoded)
     }
 }
 
@@ -101,7 +105,7 @@ fn open_file(path: String, state: tauri::State<AppState>) -> Result<EditorConten
 #[tauri::command]
 fn close_buffer(path: String, state: tauri::State<AppState>) -> Result<Option<EditorContent>, String> {
     let mut ws = state.workspace.lock().map_err(|e| e.to_string())?;
-    let path_buf = PathBuf::from(&path);
+    let path_buf = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
 
     // Send didClose for this buffer
     let uri = path_to_uri(&path);
@@ -120,7 +124,7 @@ fn close_buffer(path: String, state: tauri::State<AppState>) -> Result<Option<Ed
 #[tauri::command]
 fn switch_buffer(path: String, state: tauri::State<AppState>) -> Result<EditorContent, String> {
     let mut ws = state.workspace.lock().map_err(|e| e.to_string())?;
-    let path_buf = PathBuf::from(&path);
+    let path_buf = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
 
     if !ws.switch_buffer(&path_buf) {
         return Err(format!("Buffer not open: {}", path));
@@ -144,7 +148,9 @@ fn list_open_buffers(state: tauri::State<AppState>) -> Result<Vec<editor::Buffer
 /// Read directory contents for the file explorer.
 #[tauri::command]
 fn read_directory(path: String) -> Result<Vec<editor::DirEntry>, String> {
-    editor::read_directory(&path).map_err(|e| e.to_string())
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|e| format!("Invalid directory path '{}': {}", path, e))?;
+    editor::read_directory(&canonical.to_string_lossy()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -183,13 +189,53 @@ fn get_content(state: tauri::State<AppState>) -> Result<EditorContent, String> {
     }
 }
 
+/// M7: Get only the visible line range (virtualized rendering).
+#[tauri::command]
+fn get_visible_content(
+    first_line: usize,
+    line_count: usize,
+    state: tauri::State<AppState>,
+) -> Result<VisibleContent, String> {
+    let ws = state.workspace.lock().map_err(|e| e.to_string())?;
+    match ws.active() {
+        Some(buf) => Ok(buf.get_visible_content(first_line, line_count, &state.ipc)),
+        None => Ok(VisibleContent {
+            lines: vec![
+                HighlightedLine { text: "// Welcome to CoreCode".to_string(), tokens: vec![] },
+                HighlightedLine { text: "// Open a file to begin editing (Ctrl+O)".to_string(), tokens: vec![] },
+            ],
+            first_line: 0,
+            total_lines: 2,
+            file_path: None,
+            language: None,
+            modified: false,
+            diagnostics: vec![],
+        }),
+    }
+}
+
+/// Helper: perform an edit, notify extension host, reparse, return lightweight result.
+fn do_edit(ws: &mut WorkspaceState, ipc: &IpcHandle) -> Result<EditResult, String> {
+    let buf = ws.active().ok_or("No active buffer")?;
+    let path_str = buf.file_path_str();
+    let version = buf.version();
+    let full_text = buf.get_full_text();
+    notify_change(&path_str, version, &full_text, ipc);
+    ws.reparse_active();
+    let buf = ws.active().ok_or("No active buffer after reparse")?;
+    Ok(EditResult {
+        total_lines: buf.line_count(),
+        modified: buf.modified(),
+    })
+}
+
 #[tauri::command]
 fn edit_insert(
     line: usize,
     col: usize,
     text: String,
     state: tauri::State<AppState>,
-) -> Result<EditorContent, String> {
+) -> Result<EditResult, String> {
     if text.len() > MAX_INSERT_SIZE {
         return Err(format!(
             "Insertion too large ({} bytes, max {})",
@@ -200,13 +246,7 @@ fn edit_insert(
     let mut ws = state.workspace.lock().map_err(|e| e.to_string())?;
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.insert(line, col, &text).map_err(|e| e.to_string())?;
-    let path_str = buf.file_path_str();
-    let version = buf.version();
-    let full_text = buf.get_full_text();
-    let _ = buf;
-    notify_change(&path_str, version, &full_text, &state.ipc);
-    ws.reparse_active();
-    Ok(ws.active().unwrap().get_content(&state.ipc))
+    do_edit(&mut ws, &state.ipc)
 }
 
 #[tauri::command]
@@ -215,17 +255,11 @@ fn edit_delete(
     col: usize,
     len: usize,
     state: tauri::State<AppState>,
-) -> Result<EditorContent, String> {
+) -> Result<EditResult, String> {
     let mut ws = state.workspace.lock().map_err(|e| e.to_string())?;
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.delete(line, col, len).map_err(|e| e.to_string())?;
-    let path_str = buf.file_path_str();
-    let version = buf.version();
-    let full_text = buf.get_full_text();
-    let _ = buf;
-    notify_change(&path_str, version, &full_text, &state.ipc);
-    ws.reparse_active();
-    Ok(ws.active().unwrap().get_content(&state.ipc))
+    do_edit(&mut ws, &state.ipc)
 }
 
 #[tauri::command]
@@ -233,17 +267,11 @@ fn edit_newline(
     line: usize,
     col: usize,
     state: tauri::State<AppState>,
-) -> Result<EditorContent, String> {
+) -> Result<EditResult, String> {
     let mut ws = state.workspace.lock().map_err(|e| e.to_string())?;
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.insert(line, col, "\n").map_err(|e| e.to_string())?;
-    let path_str = buf.file_path_str();
-    let version = buf.version();
-    let full_text = buf.get_full_text();
-    let _ = buf;
-    notify_change(&path_str, version, &full_text, &state.ipc);
-    ws.reparse_active();
-    Ok(ws.active().unwrap().get_content(&state.ipc))
+    do_edit(&mut ws, &state.ipc)
 }
 
 #[tauri::command]
@@ -251,45 +279,27 @@ fn edit_backspace(
     line: usize,
     col: usize,
     state: tauri::State<AppState>,
-) -> Result<EditorContent, String> {
+) -> Result<EditResult, String> {
     let mut ws = state.workspace.lock().map_err(|e| e.to_string())?;
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.backspace(line, col).map_err(|e| e.to_string())?;
-    let path_str = buf.file_path_str();
-    let version = buf.version();
-    let full_text = buf.get_full_text();
-    let _ = buf;
-    notify_change(&path_str, version, &full_text, &state.ipc);
-    ws.reparse_active();
-    Ok(ws.active().unwrap().get_content(&state.ipc))
+    do_edit(&mut ws, &state.ipc)
 }
 
 #[tauri::command]
-fn edit_undo(state: tauri::State<AppState>) -> Result<EditorContent, String> {
+fn edit_undo(state: tauri::State<AppState>) -> Result<EditResult, String> {
     let mut ws = state.workspace.lock().map_err(|e| e.to_string())?;
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.undo();
-    let path_str = buf.file_path_str();
-    let version = buf.version();
-    let full_text = buf.get_full_text();
-    let _ = buf;
-    notify_change(&path_str, version, &full_text, &state.ipc);
-    ws.reparse_active();
-    Ok(ws.active().unwrap().get_content(&state.ipc))
+    do_edit(&mut ws, &state.ipc)
 }
 
 #[tauri::command]
-fn edit_redo(state: tauri::State<AppState>) -> Result<EditorContent, String> {
+fn edit_redo(state: tauri::State<AppState>) -> Result<EditResult, String> {
     let mut ws = state.workspace.lock().map_err(|e| e.to_string())?;
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.redo();
-    let path_str = buf.file_path_str();
-    let version = buf.version();
-    let full_text = buf.get_full_text();
-    let _ = buf;
-    notify_change(&path_str, version, &full_text, &state.ipc);
-    ws.reparse_active();
-    Ok(ws.active().unwrap().get_content(&state.ipc))
+    do_edit(&mut ws, &state.ipc)
 }
 
 #[tauri::command]
@@ -300,7 +310,7 @@ fn edit_replace_range(
     end_col: usize,
     text: String,
     state: tauri::State<AppState>,
-) -> Result<EditorContent, String> {
+) -> Result<EditResult, String> {
     if text.len() > MAX_INSERT_SIZE {
         return Err(format!(
             "Replacement too large ({} bytes, max {})",
@@ -312,13 +322,7 @@ fn edit_replace_range(
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.replace_range(start_line, start_col, end_line, end_col, &text)
         .map_err(|e| e.to_string())?;
-    let path_str = buf.file_path_str();
-    let version = buf.version();
-    let full_text = buf.get_full_text();
-    let _ = buf;
-    notify_change(&path_str, version, &full_text, &state.ipc);
-    ws.reparse_active();
-    Ok(ws.active().unwrap().get_content(&state.ipc))
+    do_edit(&mut ws, &state.ipc)
 }
 
 #[tauri::command]
@@ -384,9 +388,10 @@ fn replace_in_file(
     let _ = buf;
     notify_change(&path_str, version, &full_text, &state.ipc);
     ws.reparse_active();
+    let buf = ws.active().ok_or("No active buffer after replace")?;
     Ok(ReplaceResult {
         count,
-        content: ws.active().unwrap().get_content(&state.ipc),
+        content: buf.get_content(&state.ipc),
     })
 }
 
@@ -619,6 +624,25 @@ pub struct ReplaceResult {
     pub content: EditorContent,
 }
 
+/// Lightweight result returned by edit commands (no line data).
+#[derive(serde::Serialize)]
+pub struct EditResult {
+    pub total_lines: usize,
+    pub modified: bool,
+}
+
+/// Virtualized content: only the requested visible line range.
+#[derive(serde::Serialize, Clone)]
+pub struct VisibleContent {
+    pub lines: Vec<HighlightedLine>,
+    pub first_line: usize,
+    pub total_lines: usize,
+    pub file_path: Option<String>,
+    pub language: Option<String>,
+    pub modified: bool,
+    pub diagnostics: Vec<ipc_bridge::Diagnostic>,
+}
+
 // --- App entry ---
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -645,6 +669,7 @@ pub fn run() {
             read_directory,
             save_file,
             get_content,
+            get_visible_content,
             edit_insert,
             edit_delete,
             edit_newline,
@@ -675,7 +700,7 @@ pub fn run() {
             lsp_format,
         ])
         .setup(move |app| {
-            log::info!("CoreCode M6 starting...");
+            log::info!("CoreCode M7 starting...");
 
             let app_handle = app.handle().clone();
             std::thread::Builder::new()
@@ -688,6 +713,11 @@ pub fn run() {
                 .expect("Failed to spawn Extension Host manager thread");
 
             Ok(())
+        })
+        .on_window_event(|_window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                ext_host::kill_extension_host();
+            }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

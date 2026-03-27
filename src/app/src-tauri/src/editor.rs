@@ -114,11 +114,12 @@ impl DocumentBuffer {
     fn raw_insert_at_char(&mut self, char_idx: usize, text: &str) {
         let byte_idx = self.rope.char_to_byte(char_idx);
         let line = self.rope.char_to_line(char_idx);
-        let col = char_idx - self.rope.line_to_char(line);
+        let line_byte_start = self.rope.line_to_byte(line);
+        let col_bytes = byte_idx - line_byte_start;
 
         self.rope.insert(char_idx, text);
         self.modified = true;
-        self.version += 1;
+        self.version = self.version.wrapping_add(1);
 
         if let Some(tree) = &mut self.tree {
             let new_end_byte = byte_idx + text.len();
@@ -129,8 +130,8 @@ impl DocumentBuffer {
                 start_byte: byte_idx,
                 old_end_byte: byte_idx,
                 new_end_byte,
-                start_position: tree_sitter::Point { row: line, column: col },
-                old_end_position: tree_sitter::Point { row: line, column: col },
+                start_position: tree_sitter::Point { row: line, column: col_bytes },
+                old_end_position: tree_sitter::Point { row: line, column: col_bytes },
                 new_end_position: tree_sitter::Point {
                     row: new_end_line,
                     column: new_end_col,
@@ -151,29 +152,29 @@ impl DocumentBuffer {
         let start_byte = self.rope.char_to_byte(char_idx);
         let end_byte = self.rope.char_to_byte(end_idx);
         let start_line = self.rope.char_to_line(char_idx);
-        let start_col = char_idx - self.rope.line_to_char(start_line);
+        let start_col_bytes = start_byte - self.rope.line_to_byte(start_line);
+
+        // Compute old_end_position BEFORE removing (uses original rope state)
+        let old_end_line = self.rope.char_to_line(end_idx);
+        let old_end_col_bytes = end_byte - self.rope.line_to_byte(old_end_line);
 
         self.rope.remove(char_idx..end_idx);
         self.modified = true;
-        self.version += 1;
+        self.version = self.version.wrapping_add(1);
 
         if let Some(tree) = &mut self.tree {
-            let safe_byte = start_byte.min(self.rope.len_bytes().saturating_sub(1));
-            let new_line = if self.rope.len_bytes() == 0 { 0 } else { self.rope.byte_to_line(safe_byte) };
-            let new_col = start_byte.saturating_sub(self.rope.line_to_byte(new_line));
-
             tree.edit(&tree_sitter::InputEdit {
                 start_byte,
                 old_end_byte: end_byte,
                 new_end_byte: start_byte,
-                start_position: tree_sitter::Point { row: start_line, column: start_col },
+                start_position: tree_sitter::Point { row: start_line, column: start_col_bytes },
                 old_end_position: tree_sitter::Point {
-                    row: start_line,
-                    column: start_col + len,
+                    row: old_end_line,
+                    column: old_end_col_bytes,
                 },
                 new_end_position: tree_sitter::Point {
-                    row: new_line,
-                    column: new_col,
+                    row: start_line,
+                    column: start_col_bytes,
                 },
             });
         }
@@ -223,6 +224,9 @@ impl DocumentBuffer {
         }
 
         if col == 0 {
+            let total_lines = self.rope.len_lines();
+            let line = line.min(total_lines.saturating_sub(1));
+            if line == 0 { return Ok(()); }
             let prev_line = line - 1;
             let prev_line_len = self.rope.line(prev_line).len_chars();
             let nl_pos = self.rope.line_to_char(prev_line) + prev_line_len - 1;
@@ -428,15 +432,15 @@ impl DocumentBuffer {
         let text = self.rope.to_string();
 
         let (search_text, search_query) = if case_sensitive {
-            (text.clone(), query.to_string())
+            (std::borrow::Cow::Borrowed(text.as_str()), std::borrow::Cow::Borrowed(query))
         } else {
-            (text.to_lowercase(), query.to_lowercase())
+            (std::borrow::Cow::Owned(text.to_lowercase()), std::borrow::Cow::Owned(query.to_lowercase()))
         };
 
         let query_char_len = query.chars().count();
         let mut start = 0;
         let mut char_offset_at_start: usize = 0;
-        while let Some(pos) = search_text[start..].find(&search_query) {
+        while let Some(pos) = search_text[start..].find(&*search_query) {
             let byte_pos = start + pos;
             // Count chars only in the segment since last position (incremental, not O(n))
             char_offset_at_start += text[start..byte_pos].chars().count();
@@ -494,6 +498,42 @@ impl DocumentBuffer {
         self.modified = val;
     }
 
+    /// Generate only the visible line range for the frontend (virtualized).
+    pub fn get_visible_content(&self, first_line: usize, line_count: usize, ipc: &IpcHandle) -> crate::VisibleContent {
+        let total = self.rope.len_lines();
+        let start = first_line.min(total);
+        let end = (first_line + line_count).min(total);
+
+        let lines: Vec<HighlightedLine> = (start..end)
+            .map(|i| {
+                let line_text = self.rope.line(i).to_string();
+                let line_text_trimmed = line_text.trim_end_matches('\n').to_string();
+                let tokens = if let Some(tree) = &self.tree {
+                    highlighting::highlight_line(tree, &self.rope, i)
+                } else {
+                    vec![]
+                };
+                HighlightedLine { text: line_text_trimmed, tokens }
+            })
+            .collect();
+
+        let uri = crate::path_to_uri(&self.file_path.display().to_string());
+        let diagnostics = ipc.get_diagnostics_for_uri(&uri)
+            .into_iter()
+            .filter(|d| d.line >= start && d.line < end)
+            .collect();
+
+        crate::VisibleContent {
+            lines,
+            first_line: start,
+            total_lines: total,
+            file_path: Some(self.file_path.display().to_string()),
+            language: self.language.clone(),
+            modified: self.modified,
+            diagnostics,
+        }
+    }
+
     /// Generate EditorContent for the frontend.
     pub fn get_content(&self, ipc: &IpcHandle) -> EditorContent {
         let lines: Vec<HighlightedLine> = (0..self.rope.len_lines())
@@ -514,13 +554,7 @@ impl DocumentBuffer {
             })
             .collect();
 
-        let uri = {
-            let p = self.file_path.display().to_string();
-            #[cfg(target_os = "windows")]
-            { format!("file:///{}", p.replace('\\', "/")) }
-            #[cfg(not(target_os = "windows"))]
-            { format!("file://{}", p) }
-        };
+        let uri = crate::path_to_uri(&self.file_path.display().to_string());
         let diagnostics = ipc.get_diagnostics_for_uri(&uri);
 
         EditorContent {
