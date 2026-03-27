@@ -2188,7 +2188,9 @@ async function requestHover(line, col) {
       return;
     }
     hoverContent.textContent = '';
-    const text = typeof result.contents === 'string' ? result.contents : result.contents;
+    const text = typeof result.contents === 'string' ? result.contents
+      : Array.isArray(result.contents) ? result.contents.map(c => typeof c === 'string' ? c : c.value || '').join('\n')
+      : result.contents.value || String(result.contents);
     hoverContent.textContent = text;
     hoverOpen = true;
     hoverTooltip.classList.remove('lsp-hidden');
@@ -2279,7 +2281,8 @@ async function navigateToLocation(uri, line, col) {
   else if (path.startsWith('file://')) path = path.substring(7);
   // On Windows, handle /C:/... → C:\...
   if (path.match(/^\/[a-zA-Z]:\//)) path = path.substring(1);
-  path = path.replace(/\//g, '\\');
+  // Only convert to backslashes on Windows
+  if (navigator.platform.startsWith('Win')) path = path.replace(/\//g, '\\');
 
   try {
     saveBufferState();
@@ -2442,9 +2445,13 @@ async function executeCodeAction(action) {
     setTimeout(refreshDiagnostics, 500);
   }
   if (action.edit && action.edit.changes) {
-    // Apply workspace edits
+    // Apply workspace edits — sort end-to-start to preserve positions
     for (const [uri, edits] of Object.entries(action.edit.changes)) {
-      for (const edit of edits) {
+      const sorted = edits.slice().sort((a, b) => {
+        if (b.range.start.line !== a.range.start.line) return b.range.start.line - a.range.start.line;
+        return b.range.start.character - a.range.start.character;
+      });
+      for (const edit of sorted) {
         const r = edit.range;
         await invoke('edit_replace_range', {
           startLine: r.start.line, startCol: r.start.character,
@@ -2555,7 +2562,7 @@ async function openSymbolOutline() {
   }
 }
 
-function flattenSymbols(symbols, prefix) {
+function flattenSymbols(symbols, prefix = '') {
   const result = [];
   for (const sym of symbols) {
     const name = prefix ? `${prefix}.${sym.name}` : sym.name;

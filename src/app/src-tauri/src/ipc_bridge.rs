@@ -13,10 +13,9 @@ use std::sync::{Arc, Mutex};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 const IPC_HOST: &str = "127.0.0.1";
-const IPC_PORT: u16 = 17532;
 
 /// Maximum IPC frame size (10 MB). Frames larger than this are rejected.
 const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024;
@@ -172,7 +171,9 @@ pub struct DecorationRange {
 }
 
 /// M6: Pending request awaiting a response from Extension Host.
-type PendingRequests = Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>;
+/// Uses std::sync::mpsc so recv_timeout works reliably from any thread
+/// (unlike tokio::time::timeout which depends on the tokio runtime's timer driver).
+type PendingRequests = Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<serde_json::Value>>>>;
 
 /// M6: Default timeout for LSP requests (10 seconds).
 const LSP_REQUEST_TIMEOUT_MS: u64 = 10_000;
@@ -188,11 +189,10 @@ pub struct IpcHandle {
     ui_requests: Arc<Mutex<Vec<UiRequest>>>,
     status_bar_items: Arc<Mutex<Vec<StatusBarItem>>>,
     output_lines: Arc<Mutex<Vec<OutputLine>>>,
+    #[allow(dead_code)] // Planned for future milestone
     decorations: Arc<Mutex<Vec<TextDecoration>>>,
     pending_requests: PendingRequests,
     request_counter: Arc<Mutex<u64>>,
-    /// M6: Tokio runtime handle for spawning async tasks from sync context.
-    rt_handle: Arc<Mutex<Option<tokio::runtime::Handle>>>,
 }
 
 impl IpcHandle {
@@ -249,7 +249,8 @@ impl IpcHandle {
         std::mem::take(&mut *store)
     }
 
-    /// Get decorations for a specific URI.
+    /// Get decorations for a specific URI (planned for future milestone).
+    #[allow(dead_code)]
     pub fn get_decorations_for_uri(&self, uri: &str) -> Vec<TextDecoration> {
         lock_or_default(&self.decorations)
             .iter()
@@ -267,18 +268,15 @@ impl IpcHandle {
 
     /// M6: Send an LSP request and wait for a response (blocking, for Tauri commands).
     /// Returns the response JSON value or an error on timeout/failure.
+    /// Uses std::sync::mpsc with recv_timeout for reliable timeout behavior
+    /// regardless of which thread calls this method.
     pub fn request_sync(
         &self,
         method: &str,
         params: serde_json::Value,
     ) -> std::result::Result<serde_json::Value, String> {
-        let rt_handle = {
-            let guard = lock_or_default(&self.rt_handle);
-            guard.clone().ok_or_else(|| "IPC runtime not ready".to_string())?
-        };
-
         let request_id = self.next_request_id();
-        let (tx, rx) = oneshot::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
 
         // Register pending request
         lock_or_default(&self.pending_requests).insert(request_id.clone(), tx);
@@ -290,32 +288,33 @@ impl IpcHandle {
             params,
         });
 
-        // Block on the response with timeout
-        let pending = self.pending_requests.clone();
-        let req_id = request_id.clone();
-        rt_handle.block_on(async move {
-            match tokio::time::timeout(
-                tokio::time::Duration::from_millis(LSP_REQUEST_TIMEOUT_MS),
-                rx,
-            ).await {
-                Ok(Ok(value)) => Ok(value),
-                Ok(Err(_)) => {
-                    // Channel was dropped (e.g., disconnect)
-                    Err("LSP request cancelled".to_string())
-                }
-                Err(_) => {
-                    // Timeout — remove from pending
-                    lock_or_default(&pending).remove(&req_id);
-                    Err("LSP request timed out".to_string())
-                }
+        // Block on the response with timeout (works from any thread)
+        match rx.recv_timeout(std::time::Duration::from_millis(LSP_REQUEST_TIMEOUT_MS)) {
+            Ok(value) => Ok(value),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Timeout — remove from pending
+                lock_or_default(&self.pending_requests).remove(&request_id);
+                Err("LSP request timed out".to_string())
             }
-        })
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Channel was dropped (e.g., disconnect)
+                Err("LSP request cancelled".to_string())
+            }
+        }
     }
+}
+
+/// Find a free TCP port by binding to port 0 and reading the assigned port.
+/// The socket is closed immediately, so there is a small race window.
+pub fn find_free_port() -> u16 {
+    let listener = std::net::TcpListener::bind((IPC_HOST, 0u16))
+        .expect("Failed to bind to ephemeral port");
+    listener.local_addr().unwrap().port()
 }
 
 /// Start the IPC bridge. Returns a handle for sending messages.
 /// The bridge runs in a background thread with its own Tokio runtime.
-pub fn start_ipc_bridge() -> IpcHandle {
+pub fn start_ipc_bridge(port: u16) -> IpcHandle {
     let (tx, rx) = mpsc::channel::<OutgoingMessage>(256);
     let diagnostics = Arc::new(Mutex::new(Vec::new()));
     let connected = Arc::new(Mutex::new(false));
@@ -327,7 +326,6 @@ pub fn start_ipc_bridge() -> IpcHandle {
     let decorations = Arc::new(Mutex::new(Vec::new()));
     let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
     let request_counter = Arc::new(Mutex::new(0u64));
-    let rt_handle: Arc<Mutex<Option<tokio::runtime::Handle>>> = Arc::new(Mutex::new(None));
 
     let handle = IpcHandle {
         sender: tx,
@@ -341,7 +339,6 @@ pub fn start_ipc_bridge() -> IpcHandle {
         decorations: decorations.clone(),
         pending_requests: pending_requests.clone(),
         request_counter,
-        rt_handle: rt_handle.clone(),
     };
 
     std::thread::Builder::new()
@@ -352,11 +349,8 @@ pub fn start_ipc_bridge() -> IpcHandle {
                 .build()
                 .expect("Failed to create Tokio runtime");
 
-            // Store the runtime handle so request_sync can use it
-            *lock_or_default(&rt_handle) = Some(rt.handle().clone());
-
             rt.block_on(async move {
-                ipc_loop(rx, diagnostics, connected, commands, notifications, ui_requests, status_bar_items, output_lines, decorations, pending_requests).await;
+                ipc_loop(port, rx, diagnostics, connected, commands, notifications, ui_requests, status_bar_items, output_lines, decorations, pending_requests).await;
             });
         })
         .expect("Failed to spawn IPC bridge thread");
@@ -365,6 +359,7 @@ pub fn start_ipc_bridge() -> IpcHandle {
 }
 
 async fn ipc_loop(
+    port: u16,
     mut rx: mpsc::Receiver<OutgoingMessage>,
     diagnostics: Arc<Mutex<Vec<Diagnostic>>>,
     connected: Arc<Mutex<bool>>,
@@ -376,7 +371,7 @@ async fn ipc_loop(
     decorations: Arc<Mutex<Vec<TextDecoration>>>,
     pending_requests: PendingRequests,
 ) {
-    let addr = format!("{}:{}", IPC_HOST, IPC_PORT);
+    let addr = format!("{}:{}", IPC_HOST, port);
     let mut retry_count: u32 = 0;
     let mut delay_ms = INITIAL_RETRY_DELAY_MS;
 

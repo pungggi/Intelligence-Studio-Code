@@ -150,7 +150,17 @@ fn read_directory(path: String) -> Result<Vec<editor::DirEntry>, String> {
 #[tauri::command]
 fn save_file(state: tauri::State<AppState>) -> Result<(), String> {
     let mut ws = state.workspace.lock().map_err(|e| e.to_string())?;
-    ws.save_active().map_err(|e| e.to_string())
+    ws.save_active().map_err(|e| e.to_string())?;
+
+    // Notify Extension Host that the document was saved
+    if let Some(buf) = ws.active() {
+        let uri = path_to_uri(&buf.file_path_str());
+        state.ipc.send(OutgoingMessage::DidSave {
+            uri,
+            workspace_id: Some("default".to_string()),
+        });
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -353,20 +363,14 @@ fn replace_in_file(
 
     let count;
     if replace_all {
-        // Replace iteratively: each replacement may shift subsequent positions,
-        // so re-find after each replacement to ensure correct positions.
-        let mut replaced = 0;
-        loop {
-            let next = buf.find_all(&query, case_sensitive);
-            if next.is_empty() { break; }
-            let m = &next[0];
+        // Single-pass: collect all matches, then apply in reverse order
+        // so earlier positions are not shifted by later replacements.
+        let all_matches: Vec<_> = matches.iter().rev().cloned().collect();
+        for m in &all_matches {
             buf.replace_range(m.line, m.col, m.line, m.col + m.length, &replacement)
                 .map_err(|e| e.to_string())?;
-            replaced += 1;
-            // Safety: prevent infinite loop if replacement contains the query
-            if replaced > 100_000 { break; }
         }
-        count = replaced;
+        count = all_matches.len();
     } else {
         let m = &matches[0];
         buf.replace_range(m.line, m.col, m.line, m.col + m.length, &replacement)
@@ -621,7 +625,9 @@ pub struct ReplaceResult {
 pub fn run() {
     env_logger::init();
 
-    let ipc = ipc_bridge::start_ipc_bridge();
+    let ipc_port = ipc_bridge::find_free_port();
+    log::info!("CoreCode IPC port: {}", ipc_port);
+    let ipc = ipc_bridge::start_ipc_bridge(ipc_port);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -668,14 +674,14 @@ pub fn run() {
             lsp_document_symbols,
             lsp_format,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             log::info!("CoreCode M6 starting...");
 
             let app_handle = app.handle().clone();
             std::thread::Builder::new()
                 .name("ext-host-mgr".to_string())
                 .spawn(move || {
-                    if let Err(e) = ext_host::start_extension_host(&app_handle) {
+                    if let Err(e) = ext_host::start_extension_host(&app_handle, ipc_port) {
                         log::error!("Failed to start Extension Host: {}", e);
                     }
                 })

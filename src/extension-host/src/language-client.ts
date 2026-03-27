@@ -123,12 +123,13 @@ export class LanguageClient {
   private process: ChildProcess | null = null;
   private nextRequestId = 1;
   private pendingRequests = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
-  private buffer = "";
+  private buffer = Buffer.alloc(0);
   private contentLength = -1;
   private started = false;
   private serverCapabilities: Record<string, unknown> = {};
   private disposables: Array<{ dispose(): void }> = [];
   private vscodeApi: ReturnType<VscodeApiShim["createVscodeApi"]> | null = null;
+  private diagnosticCollection: { set(uri: string, diagnostics: unknown[]): void; clear(): void; dispose(): void } | null = null;
 
   constructor(id: string, name: string, serverOptions: ServerOptions, clientOptions: ClientOptions) {
     this.id = id;
@@ -192,6 +193,9 @@ export class LanguageClient {
       // Send initialized notification
       this.sendNotification("initialized", {});
 
+      // Create a single diagnostic collection for this client
+      this.diagnosticCollection = this.vscodeApi!.languages.createDiagnosticCollection(this.id + "-lsp");
+
       // Register VS Code providers based on server capabilities
       this.registerProviders();
     } catch (err) {
@@ -209,6 +213,10 @@ export class LanguageClient {
     }
     this.process.kill();
     this.started = false;
+    if (this.diagnosticCollection) {
+      this.diagnosticCollection.dispose();
+      this.diagnosticCollection = null;
+    }
     for (const d of this.disposables) d.dispose();
     this.disposables = [];
   }
@@ -248,28 +256,28 @@ export class LanguageClient {
   }
 
   private onStdoutData(data: Buffer): void {
-    this.buffer += data.toString("utf-8");
+    this.buffer = Buffer.concat([this.buffer, data]);
 
     while (true) {
       if (this.contentLength === -1) {
         const headerEnd = this.buffer.indexOf("\r\n\r\n");
         if (headerEnd === -1) break;
 
-        const header = this.buffer.substring(0, headerEnd);
+        const header = this.buffer.subarray(0, headerEnd).toString("utf-8");
         const match = header.match(/Content-Length:\s*(\d+)/i);
         if (!match) {
           console.error(`[LanguageClient:${this.id}] Invalid LSP header: ${header}`);
-          this.buffer = this.buffer.substring(headerEnd + 4);
+          this.buffer = this.buffer.subarray(headerEnd + 4);
           continue;
         }
         this.contentLength = parseInt(match[1], 10);
-        this.buffer = this.buffer.substring(headerEnd + 4);
+        this.buffer = this.buffer.subarray(headerEnd + 4);
       }
 
       if (this.buffer.length < this.contentLength) break;
 
-      const body = this.buffer.substring(0, this.contentLength);
-      this.buffer = this.buffer.substring(this.contentLength);
+      const body = this.buffer.subarray(0, this.contentLength).toString("utf-8");
+      this.buffer = this.buffer.subarray(this.contentLength);
       this.contentLength = -1;
 
       try {
@@ -303,8 +311,7 @@ export class LanguageClient {
         // Forward diagnostics to the Extension Host via vscode API
         // (LSP server sends diagnostics, we convert to VS Code format)
         const params = msg.params as { uri: string; diagnostics: Array<{ range: { start: { line: number; character: number }; end: { line: number; character: number } }; message: string; severity?: number; source?: string }> };
-        if (this.vscodeApi) {
-          const collection = this.vscodeApi.languages.createDiagnosticCollection(this.id + "-lsp");
+        if (this.diagnosticCollection) {
           const diags = (params.diagnostics ?? []).map(d => ({
             range: {
               start: { line: d.range.start.line, character: d.range.start.character },
@@ -314,7 +321,7 @@ export class LanguageClient {
             severity: this.mapSeverity(d.severity ?? 1),
             source: d.source ?? this.name,
           }));
-          collection.set(params.uri, diags);
+          this.diagnosticCollection.set(params.uri, diags);
         }
         break;
       }

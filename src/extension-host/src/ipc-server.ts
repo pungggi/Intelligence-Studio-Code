@@ -9,7 +9,7 @@
 import { createServer, Server, Socket } from "net";
 
 const IPC_HOST = "127.0.0.1";
-const IPC_PORT = 17532;
+const IPC_PORT = parseInt(process.env.CORECODE_IPC_PORT ?? "0", 10);
 
 /** Maximum IPC frame size (10 MB). Must match Rust side. */
 const MAX_FRAME_SIZE = 10 * 1024 * 1024;
