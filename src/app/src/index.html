@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>CoreCode</title>
   <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="lib/xterm/xterm.css" />
 </head>
 <body>
   <div id="app">
@@ -15,16 +16,16 @@
     </div>
 
     <!-- M5: Tab bar for multi-file editing -->
-    <div id="tab-bar">
+    <div id="tab-bar" role="tablist" aria-label="Open editors">
       <div id="tabs"></div>
     </div>
 
     <div id="main-area">
       <!-- M8: Activity bar for switching sidebar panels -->
-      <div id="activity-bar">
-        <button class="activity-btn active" data-panel="explorer" title="Explorer (Ctrl+B)">&#128193;</button>
-        <button class="activity-btn" data-panel="extensions" title="Extensions (Ctrl+Shift+X)">&#9881;</button>
-        <button class="activity-btn" data-panel="settings" title="Settings (Ctrl+,)">&#9776;</button>
+      <div id="activity-bar" role="toolbar" aria-label="Activity bar">
+        <button class="activity-btn active" data-panel="explorer" title="Explorer (Ctrl+B)" aria-label="Explorer" aria-pressed="true">&#128193;</button>
+        <button class="activity-btn" data-panel="extensions" title="Extensions (Ctrl+Shift+X)" aria-label="Extensions" aria-pressed="false">&#9881;</button>
+        <button class="activity-btn" data-panel="settings" title="Settings (Ctrl+,)" aria-label="Settings" aria-pressed="false">&#9776;</button>
       </div>
 
       <!-- M5: File explorer sidebar -->
@@ -64,10 +65,10 @@
         <div id="settings-list"></div>
       </div>
 
-      <div id="editor-area">
+      <div id="editor-area" role="main" aria-label="Code editor">
         <div id="editor-container">
-          <div id="gutter"><canvas id="gutter-canvas"></canvas></div>
-          <div id="editor" tabindex="0">
+          <div id="gutter" aria-hidden="true"><canvas id="gutter-canvas"></canvas></div>
+          <div id="editor" tabindex="0" role="textbox" aria-multiline="true" aria-label="Code editor" aria-live="off">
             <canvas id="editor-canvas"></canvas>
             <div id="scroll-sizer"></div>
           </div>
@@ -82,15 +83,15 @@
     </div>
 
     <!-- Find/Replace Bar -->
-    <div id="find-bar" class="find-hidden">
+    <div id="find-bar" class="find-hidden" role="search" aria-label="Find and replace">
       <div id="find-row">
-        <input id="find-input" type="text" placeholder="Find..." autocomplete="off" />
-        <span id="find-count"></span>
-        <button id="find-prev" title="Previous (Shift+Enter)">&uarr;</button>
-        <button id="find-next" title="Next (Enter)">&darr;</button>
-        <label id="find-case-label"><input id="find-case" type="checkbox" /> Aa</label>
-        <button id="find-toggle-replace" title="Toggle Replace">&#x25BC;</button>
-        <button id="find-close" title="Close (Escape)">&times;</button>
+        <input id="find-input" type="text" placeholder="Find..." autocomplete="off" aria-label="Find" />
+        <span id="find-count" aria-live="polite" aria-atomic="true"></span>
+        <button id="find-prev" title="Previous (Shift+Enter)" aria-label="Previous match">&uarr;</button>
+        <button id="find-next" title="Next (Enter)" aria-label="Next match">&darr;</button>
+        <label id="find-case-label"><input id="find-case" type="checkbox" aria-label="Match case" /> Aa</label>
+        <button id="find-toggle-replace" title="Toggle Replace" aria-label="Toggle replace">&#x25BC;</button>
+        <button id="find-close" title="Close (Escape)" aria-label="Close find bar">&times;</button>
       </div>
       <div id="replace-row" class="find-hidden">
         <input id="replace-input" type="text" placeholder="Replace..." autocomplete="off" />
@@ -99,15 +100,33 @@
       </div>
     </div>
 
-    <!-- Output Panel (toggle with Ctrl+`) -->
-    <div id="output-panel" class="output-hidden">
-      <div id="output-header">
-        <span id="output-title">Output</span>
-        <select id="output-channel-select"></select>
-        <button id="output-clear" title="Clear">Clear</button>
-        <button id="output-close" title="Close">&times;</button>
+    <!-- Bottom Panel: Output + Terminal (toggle with Ctrl+`) -->
+    <div id="bottom-panel" class="bottom-panel-hidden">
+      <div id="bottom-panel-header">
+        <div id="bottom-panel-tabs">
+          <button class="bottom-tab" data-panel="output">Output</button>
+          <button class="bottom-tab active" data-panel="terminal">Terminal</button>
+        </div>
+        <div id="bottom-panel-actions">
+          <button id="terminal-new" title="New Terminal">+</button>
+          <button id="bottom-panel-close" title="Close">&times;</button>
+        </div>
       </div>
-      <div id="output-content"></div>
+
+      <!-- Output sub-panel -->
+      <div id="output-panel" class="bottom-sub-panel" style="display:none;">
+        <div id="output-sub-header">
+          <select id="output-channel-select"></select>
+          <button id="output-clear" title="Clear">Clear</button>
+        </div>
+        <div id="output-content"></div>
+      </div>
+
+      <!-- Terminal sub-panel -->
+      <div id="terminal-panel" class="bottom-sub-panel">
+        <div id="terminal-tabs"></div>
+        <div id="terminal-container"></div>
+      </div>
     </div>
 
     <div id="statusbar">
@@ -160,14 +179,16 @@
   </div>
 
   <!-- Command Palette Overlay -->
-  <div id="command-palette" class="palette-hidden">
+  <div id="command-palette" class="palette-hidden" role="dialog" aria-label="Command palette" aria-modal="true">
     <div id="palette-backdrop"></div>
     <div id="palette-panel">
-      <input id="palette-input" type="text" placeholder="Type a command..." autocomplete="off" />
-      <div id="palette-list"></div>
+      <input id="palette-input" type="text" placeholder="Type a command..." autocomplete="off" aria-label="Command search" aria-autocomplete="list" aria-controls="palette-list" />
+      <div id="palette-list" role="listbox" aria-label="Commands"></div>
     </div>
   </div>
 
+  <script src="lib/xterm/xterm.js"></script>
+  <script src="lib/xterm/addon-fit.js"></script>
   <script src="editor.js"></script>
 </body>
 </html>

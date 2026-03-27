@@ -440,6 +440,33 @@ export interface FormattingOptions {
 export type DocumentSelector = string | { language?: string; scheme?: string; pattern?: string } |
   Array<string | { language?: string; scheme?: string; pattern?: string }>;
 
+// --- M8b: WebView ---
+
+export enum ViewColumn {
+  Active = -1,
+  Beside = -2,
+  One = 1,
+  Two = 2,
+  Three = 3,
+}
+
+export interface WebviewOptions {
+  enableScripts?: boolean;
+  retainContextWhenHidden?: boolean;
+  localResourceRoots?: unknown[];
+}
+
+export interface WebviewPanelOptions {
+  enableFindWidget?: boolean;
+  retainContextWhenHidden?: boolean;
+}
+
+interface WebviewPanelState {
+  messageEmitter: EventEmitter<unknown>;
+  disposeEmitter: EventEmitter<void>;
+  disposed: boolean;
+}
+
 /** M6: Cancellation token (simplified). */
 export interface CancellationToken {
   isCancellationRequested: boolean;
@@ -490,6 +517,9 @@ export class VscodeApiShim {
   private uiRequestId = 0;
   private statusBarItemId = 0;
   private decorationTypeId = 0;
+  // M8b: WebView panel state keyed by panel_id
+  private webviewPanelStates = new Map<string, WebviewPanelState>();
+  private webviewPanelId = 0;
 
   // M6: LSP provider registries
   private completionProviders: ProviderEntry<{ provideCompletionItems: (...args: unknown[]) => unknown }>[] = [];
@@ -609,6 +639,26 @@ export class VscodeApiShim {
       case "extension/uninstalled":
         // These are handled at the host level, not in the API shim
         break;
+      // M8b: Message from webview iframe to extension
+      case "webview/messageFromWebview": {
+        const wmp = msg.params as { panel_id: string; message: unknown };
+        const wvState = this.webviewPanelStates.get(wmp.panel_id);
+        if (wvState && !wvState.disposed) {
+          wvState.messageEmitter.fire(wmp.message);
+        }
+        break;
+      }
+      // M8b: User closed a webview panel tab
+      case "webview/closedByUser": {
+        const wcp = msg.params as { panel_id: string };
+        const wvState = this.webviewPanelStates.get(wcp.panel_id);
+        if (wvState && !wvState.disposed) {
+          wvState.disposed = true;
+          this.webviewPanelStates.delete(wcp.panel_id);
+          wvState.disposeEmitter.fire();
+        }
+        break;
+      }
       default:
         console.log(`[ApiShim] Unknown method: ${msg.method}`);
     }
@@ -1394,6 +1444,70 @@ export class VscodeApiShim {
           },
         };
       },
+
+      // M8b: WebView panels
+      createWebviewPanel(
+        viewType: string,
+        title: string,
+        showOptions: ViewColumn | { viewColumn: ViewColumn; preserveFocus?: boolean },
+        options?: WebviewOptions & WebviewPanelOptions
+      ) {
+        const panelId = `webview-${++self.webviewPanelId}`;
+        const column = typeof showOptions === "object" ? (showOptions as { viewColumn: ViewColumn }).viewColumn : showOptions as ViewColumn;
+        const enableScripts = options?.enableScripts ?? false;
+
+        const messageEmitter = new EventEmitter<unknown>();
+        const disposeEmitter = new EventEmitter<void>();
+        const panelState: WebviewPanelState = { messageEmitter, disposeEmitter, disposed: false };
+        self.webviewPanelStates.set(panelId, panelState);
+
+        self.sendOutgoing({
+          method: "webview/create",
+          params: { panel_id: panelId, view_type: viewType, title, column, enable_scripts: enableScripts },
+        });
+
+        let _html = "";
+
+        const webview = {
+          get html() { return _html; },
+          set html(value: string) {
+            _html = value;
+            self.sendOutgoing({ method: "webview/setHtml", params: { panel_id: panelId, html: value } });
+          },
+          postMessage(message: unknown): Thenable<boolean> {
+            self.sendOutgoing({ method: "webview/postMessage", params: { panel_id: panelId, message } });
+            return Promise.resolve(true);
+          },
+          onDidReceiveMessage: messageEmitter.event,
+          options: { enableScripts },
+          cspSource: "https:",
+        };
+
+        const panel = {
+          webview,
+          viewType,
+          title,
+          onDidDispose: disposeEmitter.event,
+          onDidChangeViewState: new EventEmitter<{ webviewPanel: unknown }>().event,
+          visible: true,
+          active: true,
+          viewColumn: column,
+          reveal(col?: ViewColumn, _preserveFocus?: boolean) {
+            self.sendOutgoing({ method: "webview/reveal", params: { panel_id: panelId, column: col } });
+          },
+          dispose() {
+            if (!panelState.disposed) {
+              panelState.disposed = true;
+              self.webviewPanelStates.delete(panelId);
+              self.sendOutgoing({ method: "webview/close", params: { panel_id: panelId } });
+              disposeEmitter.fire();
+            }
+          },
+        };
+
+        console.log(`[ApiShim] WebviewPanel created: ${panelId} (${viewType})`);
+        return panel;
+      },
     };
   }
 
@@ -1440,6 +1554,7 @@ export class VscodeApiShim {
         cancel() { /* noop for now */ }
         dispose() { /* noop */ }
       },
+      ViewColumn,
     };
   }
 }

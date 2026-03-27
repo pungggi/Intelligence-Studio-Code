@@ -16,6 +16,7 @@
  */
 
 const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
 
 // ─── Token Colors (Catppuccin Mocha) ─────────────────────────
 const TOKEN_COLORS = {
@@ -122,15 +123,27 @@ let findOpen = false;
 let findMatches = [];
 let findCurrentIdx = -1;
 
+// Bottom panel (output + terminal)
+let bottomPanelOpen = false;
+let bottomPanelActiveTab = 'terminal'; // 'output' or 'terminal'
+
 // Output panel
 let outputOpen = false;
 let outputAllLines = [];
 let outputSelectedChannel = '';
 
+// Terminal
+let terminals = new Map(); // terminal_id -> { xterm, fitAddon, container }
+let activeTerminalId = null;
+
 // File explorer
 let sidebarOpen = false;
 let explorerRoot = null;
 let expandedDirs = new Set();
+
+// M8b: WebView panels — panel_id → { container, iframe }
+const webviewPanelMap = new Map();
+let activeWebviewPanelId = null; // null = code editor is active
 
 // ─── DOM References ──────────────────────────────────────────
 
@@ -175,12 +188,26 @@ const replaceInputEl = document.getElementById('replace-input');
 const replaceOneBtn = document.getElementById('replace-one');
 const replaceAllBtn = document.getElementById('replace-all');
 
-// Output panel
+// Bottom panel
+const bottomPanelEl = document.getElementById('bottom-panel');
+const bottomPanelTabs = document.querySelectorAll('.bottom-tab');
+const bottomPanelCloseBtn = document.getElementById('bottom-panel-close');
+const terminalNewBtn = document.getElementById('terminal-new');
+
+// Output sub-panel
 const outputPanelEl = document.getElementById('output-panel');
 const outputChannelSelect = document.getElementById('output-channel-select');
 const outputClearBtn = document.getElementById('output-clear');
-const outputCloseBtn = document.getElementById('output-close');
 const outputContentEl = document.getElementById('output-content');
+
+// Terminal sub-panel
+const terminalPanelEl = document.getElementById('terminal-panel');
+const terminalTabsEl = document.getElementById('terminal-tabs');
+const terminalContainerEl = document.getElementById('terminal-container');
+
+// Editor area and container (used for webview show/hide)
+const editorAreaEl = document.getElementById('editor-area');
+const editorContainerEl = document.getElementById('editor-container');
 
 // Minimap
 const minimapEl = document.getElementById('minimap');
@@ -696,8 +723,33 @@ async function renderTabs() {
       });
       tab.appendChild(close);
 
-      tab.addEventListener('click', () => switchTab(buf.path));
+      tab.addEventListener('click', () => {
+        switchTab(buf.path);
+        showEditorCanvas();
+      });
       tabsEl.appendChild(tab);
+    }
+
+    // Append webview panel tabs
+    for (const [panelId, panel] of webviewPanelMap) {
+      const wvTab = document.createElement('div');
+      wvTab.className = 'tab webview-tab' + (panelId === activeWebviewPanelId ? ' active' : '');
+      wvTab.dataset.panelId = panelId;
+
+      const wvLabel = document.createElement('span');
+      wvLabel.className = 'tab-label';
+      wvLabel.textContent = panel.title || 'Preview';
+      wvTab.appendChild(wvLabel);
+
+      const wvClose = document.createElement('button');
+      wvClose.className = 'tab-close';
+      wvClose.textContent = '×';
+      wvClose.title = 'Close';
+      wvClose.addEventListener('click', (e) => { e.stopPropagation(); closeWebviewTabByUser(panelId); });
+      wvTab.appendChild(wvClose);
+
+      wvTab.addEventListener('click', () => revealWebviewTab(panelId));
+      tabsEl.appendChild(wvTab);
     }
   } catch (err) {
     console.error('renderTabs error:', err);
@@ -705,8 +757,9 @@ async function renderTabs() {
 }
 
 async function switchTab(path) {
-  if (path === activeBufferPath) return;
+  if (path === activeBufferPath && activeWebviewPanelId === null) return;
   try {
+    showEditorCanvas();
     saveBufferState();
     const content = await invoke('switch_buffer', { path });
     activeBufferPath = path;
@@ -1256,10 +1309,10 @@ document.addEventListener('keydown', (e) => {
   if (e.ctrlKey && e.key.toLowerCase() === 'w') { e.preventDefault(); if (activeBufferPath) closeTab(activeBufferPath); return; }
   if (e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'f') { e.preventDefault(); openFindBar(false); return; }
   if (e.ctrlKey && e.key.toLowerCase() === 'h') { e.preventDefault(); openFindBar(true); return; }
-  if (e.ctrlKey && e.key === '`') { e.preventDefault(); toggleOutputPanel(); return; }
+  if (e.ctrlKey && e.key === '`') { e.preventDefault(); toggleBottomPanel(); return; }
   if (e.key === 'Escape') {
     if (findOpen) { closeFindBar(); return; }
-    if (outputOpen) { closeOutputPanel(); return; }
+    if (bottomPanelOpen) { closeBottomPanel(); return; }
   }
 
   // Only handle editor keys when editor is focused
@@ -1843,6 +1896,142 @@ findToggleReplaceBtn.addEventListener('click', () => {
 replaceOneBtn.addEventListener('click', replaceOne);
 replaceAllBtn.addEventListener('click', replaceAll);
 
+// ─── M8b: WebView Panel Management ───────────────────────────
+
+function showEditorCanvas() {
+  activeWebviewPanelId = null;
+  editorContainerEl.style.display = '';
+  minimapEl.classList.remove('minimap-hidden-by-webview');
+  for (const [, panel] of webviewPanelMap) {
+    panel.container.style.display = 'none';
+  }
+}
+
+function createWebviewTab(panelId, title, _enableScripts) {
+  if (webviewPanelMap.has(panelId)) return;
+
+  const container = document.createElement('div');
+  container.className = 'webview-container';
+  container.dataset.panelId = panelId;
+  container.style.display = 'none';
+  editorAreaEl.appendChild(container);
+
+  const iframe = document.createElement('iframe');
+  iframe.className = 'webview-iframe';
+  // allow-same-origin is needed for acquireVsCodeApi state storage; scripts enabled per panel option
+  iframe.setAttribute('sandbox', 'allow-scripts allow-forms allow-same-origin');
+  container.appendChild(iframe);
+
+  webviewPanelMap.set(panelId, { container, iframe, title: title || 'Preview' });
+  renderTabs();
+  revealWebviewTab(panelId);
+}
+
+function setWebviewHtml(panelId, html) {
+  const panel = webviewPanelMap.get(panelId);
+  if (!panel) return;
+
+  const escapedPanelId = JSON.stringify(panelId);
+  const apiScript = `<script>
+(function(){
+  const _panelId=${escapedPanelId};
+  let _state=null;
+  window.acquireVsCodeApi=function(){
+    return {
+      postMessage:function(msg){window.parent.postMessage({type:'webview-msg',panelId:_panelId,message:msg},'*');},
+      setState:function(s){_state=s;},
+      getState:function(){return _state;}
+    };
+  };
+})();
+<\/script>`;
+
+  // Inject the shim just after the opening <head> or <html> tag, or prepend
+  let injected = html;
+  if (/<head[^>]*>/i.test(html)) {
+    injected = html.replace(/(<head[^>]*>)/i, '$1' + apiScript);
+  } else if (/<html[^>]*>/i.test(html)) {
+    injected = html.replace(/(<html[^>]*>)/i, '$1' + apiScript);
+  } else {
+    injected = apiScript + html;
+  }
+
+  panel.iframe.srcdoc = injected;
+}
+
+function sendWebviewMessage(panelId, message) {
+  const panel = webviewPanelMap.get(panelId);
+  if (panel?.iframe?.contentWindow) {
+    panel.iframe.contentWindow.postMessage(message, '*');
+  }
+}
+
+function revealWebviewTab(panelId) {
+  const panel = webviewPanelMap.get(panelId);
+  if (!panel) return;
+
+  activeWebviewPanelId = panelId;
+
+  // Hide code editor
+  editorContainerEl.style.display = 'none';
+  minimapEl.classList.add('minimap-hidden-by-webview');
+
+  // Show this webview, hide others
+  for (const [id, p] of webviewPanelMap) {
+    p.container.style.display = id === panelId ? '' : 'none';
+  }
+
+  renderTabs();
+}
+
+function closeWebviewTab(panelId) {
+  const panel = webviewPanelMap.get(panelId);
+  if (!panel) return;
+
+  panel.container.remove();
+  webviewPanelMap.delete(panelId);
+
+  if (activeWebviewPanelId === panelId) {
+    if (webviewPanelMap.size > 0) {
+      revealWebviewTab([...webviewPanelMap.keys()].pop());
+    } else {
+      showEditorCanvas();
+    }
+  }
+  renderTabs();
+}
+
+function closeWebviewTabByUser(panelId) {
+  invoke('webview_close_by_user', { panelId }).catch(() => {});
+  closeWebviewTab(panelId);
+}
+
+async function pollWebviewEvents() {
+  if (!isPageVisible()) return;
+  try {
+    const events = await invoke('get_webview_events');
+    for (const evt of events) {
+      switch (evt.kind) {
+        case 'create':   createWebviewTab(evt.panel_id, evt.title, evt.enable_scripts); break;
+        case 'setHtml':  setWebviewHtml(evt.panel_id, evt.html); break;
+        case 'postMessage': sendWebviewMessage(evt.panel_id, evt.message); break;
+        case 'reveal':   revealWebviewTab(evt.panel_id); break;
+        case 'close':    closeWebviewTab(evt.panel_id); break;
+      }
+    }
+  } catch (_) { /* ignore */ }
+}
+
+// Forward iframe messages to Extension Host
+window.addEventListener('message', (event) => {
+  if (event.data?.type === 'webview-msg') {
+    const { panelId, message } = event.data;
+    invoke('webview_post_message', { panelId, message }).catch(() => {});
+  }
+});
+
+const webviewInterval = setInterval(pollWebviewEvents, 100);
+
 // ─── Visibility-gated polling ────────────────────────────────
 // Skip IPC calls when window is hidden/minimized to save CPU
 function isPageVisible() { return document.visibilityState === 'visible'; }
@@ -1869,14 +2058,55 @@ async function pollStatusBarItems() {
 
 const statusBarInterval = setInterval(pollStatusBarItems, 2000);
 
-// ─── Output Panel ────────────────────────────────────────────
+// ─── Bottom Panel (Output + Terminal) ────────────────────────
 
-function toggleOutputPanel() { outputOpen ? closeOutputPanel() : openOutputPanel(); }
-function openOutputPanel() { outputOpen = true; outputPanelEl.classList.remove('output-hidden'); }
-function closeOutputPanel() { outputOpen = false; outputPanelEl.classList.add('output-hidden'); }
+function toggleBottomPanel() {
+  bottomPanelOpen ? closeBottomPanel() : openBottomPanel();
+}
+
+function openBottomPanel() {
+  bottomPanelOpen = true;
+  outputOpen = true;
+  bottomPanelEl.classList.remove('bottom-panel-hidden');
+  switchBottomTab(bottomPanelActiveTab);
+  // Auto-create a terminal if none exist and terminal tab is active
+  if (bottomPanelActiveTab === 'terminal' && terminals.size === 0) {
+    createTerminal();
+  }
+}
+
+function closeBottomPanel() {
+  bottomPanelOpen = false;
+  outputOpen = false;
+  bottomPanelEl.classList.add('bottom-panel-hidden');
+}
+
+function switchBottomTab(tab) {
+  bottomPanelActiveTab = tab;
+  bottomPanelTabs.forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.panel === tab);
+  });
+  outputPanelEl.style.display = tab === 'output' ? '' : 'none';
+  terminalPanelEl.style.display = tab === 'terminal' ? '' : 'none';
+  if (tab === 'terminal' && activeTerminalId) {
+    const term = terminals.get(activeTerminalId);
+    if (term) {
+      term.fitAddon.fit();
+      term.xterm.focus();
+    }
+  }
+}
+
+// Bottom panel tab switching
+bottomPanelTabs.forEach(btn => {
+  btn.addEventListener('click', () => switchBottomTab(btn.dataset.panel));
+});
+bottomPanelCloseBtn.addEventListener('click', closeBottomPanel);
+
+// --- Output sub-panel ---
 
 async function pollOutputLines() {
-  if (!isPageVisible() || !outputOpen) return;
+  if (!isPageVisible() || !bottomPanelOpen) return;
   try {
     const newLines = await invoke('get_output_lines');
     if (!newLines || newLines.length === 0) return;
@@ -1902,9 +2132,174 @@ function renderOutputContent() {
 
 outputChannelSelect.addEventListener('change', (e) => { outputSelectedChannel = e.target.value; renderOutputContent(); });
 outputClearBtn.addEventListener('click', () => { outputAllLines = outputAllLines.filter(l => l.channel !== outputSelectedChannel); renderOutputContent(); });
-outputCloseBtn.addEventListener('click', closeOutputPanel);
 
 const outputInterval = setInterval(pollOutputLines, 1000);
+
+// --- Terminal sub-panel ---
+
+async function createTerminal() {
+  try {
+    const terminalId = await invoke('terminal_create', { cols: 80, rows: 24 });
+    const container = document.createElement('div');
+    container.className = 'xterm-instance';
+    container.style.width = '100%';
+    container.style.height = '100%';
+    container.style.display = 'none';
+    terminalContainerEl.appendChild(container);
+
+    const xterm = new Terminal({
+      fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace",
+      fontSize: 13,
+      theme: {
+        background: '#1e1e2e',
+        foreground: '#cdd6f4',
+        cursor: '#f5e0dc',
+        cursorAccent: '#1e1e2e',
+        selectionBackground: '#31324480',
+        black: '#45475a',
+        red: '#f38ba8',
+        green: '#a6e3a1',
+        yellow: '#f9e2af',
+        blue: '#89b4fa',
+        magenta: '#cba6f7',
+        cyan: '#94e2d5',
+        white: '#bac2de',
+        brightBlack: '#585b70',
+        brightRed: '#f38ba8',
+        brightGreen: '#a6e3a1',
+        brightYellow: '#f9e2af',
+        brightBlue: '#89b4fa',
+        brightMagenta: '#cba6f7',
+        brightCyan: '#94e2d5',
+        brightWhite: '#a6adc8',
+      },
+      cursorBlink: true,
+      scrollback: 5000,
+    });
+
+    const fitAddon = new FitAddon.FitAddon();
+    xterm.loadAddon(fitAddon);
+    xterm.open(container);
+
+    // Send keystrokes to the PTY
+    xterm.onData((data) => {
+      invoke('terminal_write', { terminalId, data }).catch(() => {});
+    });
+
+    terminals.set(terminalId, { xterm, fitAddon, container });
+    switchTerminal(terminalId);
+    renderTerminalTabs();
+
+    // Fit after a frame to get correct dimensions
+    requestAnimationFrame(() => {
+      fitAddon.fit();
+      const dims = fitAddon.proposeDimensions();
+      if (dims) {
+        invoke('terminal_resize', { terminalId, cols: dims.cols, rows: dims.rows }).catch(() => {});
+      }
+    });
+  } catch (err) {
+    console.error('Failed to create terminal:', err);
+  }
+}
+
+function switchTerminal(terminalId) {
+  activeTerminalId = terminalId;
+  for (const [id, t] of terminals) {
+    t.container.style.display = id === terminalId ? '' : 'none';
+  }
+  const term = terminals.get(terminalId);
+  if (term) {
+    term.fitAddon.fit();
+    term.xterm.focus();
+  }
+  renderTerminalTabs();
+}
+
+async function closeTerminal(terminalId) {
+  const term = terminals.get(terminalId);
+  if (term) {
+    term.xterm.dispose();
+    term.container.remove();
+    terminals.delete(terminalId);
+  }
+  try {
+    await invoke('terminal_close', { terminalId });
+  } catch (err) { /* Ignore — may already be dead */ }
+
+  if (activeTerminalId === terminalId) {
+    const remaining = [...terminals.keys()];
+    activeTerminalId = remaining.length > 0 ? remaining[remaining.length - 1] : null;
+    if (activeTerminalId) switchTerminal(activeTerminalId);
+  }
+  renderTerminalTabs();
+
+  // Close bottom panel if no terminals and output is empty
+  if (terminals.size === 0 && bottomPanelActiveTab === 'terminal') {
+    closeBottomPanel();
+  }
+}
+
+function renderTerminalTabs() {
+  terminalTabsEl.innerHTML = '';
+  let idx = 1;
+  for (const [id] of terminals) {
+    const tab = document.createElement('button');
+    tab.className = 'terminal-tab' + (id === activeTerminalId ? ' active' : '');
+
+    const label = document.createElement('span');
+    label.textContent = `Terminal ${idx}`;
+    tab.appendChild(label);
+
+    const closeBtn = document.createElement('span');
+    closeBtn.className = 'term-tab-close';
+    closeBtn.textContent = '\u00d7';
+    closeBtn.addEventListener('click', (e) => { e.stopPropagation(); closeTerminal(id); });
+    tab.appendChild(closeBtn);
+
+    tab.addEventListener('click', () => switchTerminal(id));
+    terminalTabsEl.appendChild(tab);
+    idx++;
+  }
+}
+
+// New terminal button
+terminalNewBtn.addEventListener('click', () => {
+  if (!bottomPanelOpen) openBottomPanel();
+  switchBottomTab('terminal');
+  createTerminal();
+});
+
+// Listen for PTY output from Rust
+listen('terminal-data', (event) => {
+  const { terminal_id, data } = event.payload;
+  const term = terminals.get(terminal_id);
+  if (term) term.xterm.write(data);
+});
+
+// Listen for PTY exit from Rust
+listen('terminal-exit', (event) => {
+  const { terminal_id } = event.payload;
+  const term = terminals.get(terminal_id);
+  if (term) {
+    term.xterm.writeln('\r\n\x1b[90m[Process exited]\x1b[0m');
+  }
+});
+
+// Resize terminals when the bottom panel resizes
+const terminalResizeObserver = new ResizeObserver(() => {
+  if (!bottomPanelOpen || bottomPanelActiveTab !== 'terminal') return;
+  for (const [id, t] of terminals) {
+    if (t.container.style.display !== 'none') {
+      t.fitAddon.fit();
+      const dims = t.fitAddon.proposeDimensions();
+      if (dims) {
+        invoke('terminal_resize', { terminalId: id, cols: dims.cols, rows: dims.rows }).catch(() => {});
+      }
+    }
+  }
+});
+terminalResizeObserver.observe(terminalContainerEl);
 
 // ─── Diagnostics Polling ─────────────────────────────────────
 
@@ -3078,7 +3473,7 @@ document.addEventListener('keydown', (e) => {
 
 // ─── Cleanup ─────────────────────────────────────────────────
 
-const _ccIntervals = [statusBarInterval, outputInterval, diagnosticsInterval, extHostInterval, notifInterval, uiReqInterval];
+const _ccIntervals = [statusBarInterval, outputInterval, diagnosticsInterval, extHostInterval, notifInterval, uiReqInterval, webviewInterval];
 
 window.addEventListener('beforeunload', () => {
   _ccIntervals.forEach(id => clearInterval(id));
@@ -3101,7 +3496,7 @@ async function init() {
     await updateFromEditorContent(content);
     renderTabs();
     editorEl.focus();
-    statusEl.textContent = 'Ready — Ctrl+O open, Ctrl+B explorer, Ctrl+Space autocomplete, F12 go-to-def';
+    statusEl.textContent = 'Ready — Ctrl+O open, Ctrl+B explorer, Ctrl+` terminal, Ctrl+Space autocomplete';
     pollExtHostStatus();
     pollStatusBarItems();
   } catch (err) {

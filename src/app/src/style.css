@@ -865,33 +865,92 @@ body {
   cursor: pointer;
 }
 
-/* Output Panel */
-.output-hidden {
+/* ─── M8b: Bottom Panel (Output + Terminal) ──────────────── */
+
+.bottom-panel-hidden {
   display: none !important;
 }
 
-#output-panel {
+#bottom-panel {
   display: flex;
   flex-direction: column;
-  height: 200px;
+  height: 280px;
   border-top: 1px solid var(--border);
 }
 
-#output-header {
+#bottom-panel-header {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 4px 12px;
+  justify-content: space-between;
+  padding: 0 8px;
   background: var(--bg-titlebar);
   border-bottom: 1px solid var(--border);
-  font-size: 12px;
   -webkit-user-select: none;
   user-select: none;
+  min-height: 32px;
 }
 
-#output-title {
-  font-weight: 600;
+#bottom-panel-tabs {
+  display: flex;
+  gap: 0;
+}
+
+.bottom-tab {
+  padding: 6px 12px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-family: inherit;
   font-size: 12px;
+}
+
+.bottom-tab:hover {
+  color: var(--fg);
+}
+
+.bottom-tab.active {
+  color: var(--fg);
+  border-bottom-color: var(--accent);
+}
+
+#bottom-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+#bottom-panel-actions button {
+  padding: 2px 8px;
+  background: transparent;
+  border: none;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 14px;
+  border-radius: 3px;
+}
+
+#bottom-panel-actions button:hover {
+  color: var(--fg);
+  background: rgba(49, 50, 68, 0.5);
+}
+
+.bottom-sub-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Output sub-panel */
+#output-sub-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 12px;
+  background: var(--bg-gutter);
+  font-size: 11px;
 }
 
 #output-channel-select {
@@ -904,21 +963,17 @@ body {
   padding: 1px 4px;
 }
 
-#output-header button {
+#output-sub-header button {
   padding: 1px 6px;
   background: transparent;
   border: none;
   color: var(--fg-dim);
   cursor: pointer;
-  font-size: 14px;
+  font-size: 12px;
 }
 
-#output-header button:hover {
+#output-sub-header button:hover {
   color: var(--fg);
-}
-
-#output-close {
-  margin-left: auto;
 }
 
 #output-content {
@@ -930,6 +985,89 @@ body {
   white-space: pre-wrap;
   font-family: inherit;
   color: var(--fg-dim);
+}
+
+/* Terminal sub-panel */
+#terminal-tabs {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  background: var(--bg-gutter);
+  min-height: 0;
+}
+
+#terminal-tabs:empty {
+  display: none;
+}
+
+.terminal-tab {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  font-size: 11px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  border-right: 1px solid var(--border);
+  background: none;
+  border-top: none;
+  border-bottom: none;
+  border-left: none;
+  font-family: inherit;
+}
+
+.terminal-tab:hover {
+  color: var(--fg);
+  background: rgba(49, 50, 68, 0.5);
+}
+
+.terminal-tab.active {
+  color: var(--fg);
+  background: var(--bg);
+}
+
+.terminal-tab .term-tab-close {
+  opacity: 0;
+  padding: 0 2px;
+  background: none;
+  border: none;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.terminal-tab:hover .term-tab-close,
+.terminal-tab.active .term-tab-close {
+  opacity: 1;
+}
+
+.terminal-tab .term-tab-close:hover {
+  color: #f38ba8;
+}
+
+#terminal-container {
+  flex: 1;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+/* xterm.js theme overrides to match Catppuccin Mocha */
+#terminal-container .xterm {
+  padding: 4px;
+}
+
+#terminal-container .xterm-viewport::-webkit-scrollbar {
+  width: 10px;
+}
+
+#terminal-container .xterm-viewport::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+#terminal-container .xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 /* Command Palette */
@@ -1406,6 +1544,111 @@ body {
   color: var(--fg-dim);
   font-size: 11px;
   margin-left: auto;
+}
+
+/* ─── M8b: WebView Panel ──────────────────────────────────── */
+
+.webview-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #ffffff;
+}
+
+.webview-iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  flex: 1;
+}
+
+.minimap-hidden-by-webview {
+  display: none !important;
+}
+
+/* ─── M8c: High-Contrast Themes ──────────────────────────── */
+
+:root.hc-dark {
+  --bg: #000000;
+  --bg-gutter: #0a0a0a;
+  --bg-titlebar: #000000;
+  --bg-statusbar: #000000;
+  --fg: #ffffff;
+  --fg-dim: #c0c0c0;
+  --fg-gutter: #aaaaaa;
+  --accent: #6fc3df;
+  --cursor: #ffffff;
+  --selection: #264f78;
+  --border: #6fc3df;
+
+  --syn-keyword: #c586c0;
+  --syn-string: #ce9178;
+  --syn-number: #b5cea8;
+  --syn-comment: #6a9955;
+  --syn-function: #dcdcaa;
+  --syn-variable: #9cdcfe;
+  --syn-type: #4ec9b0;
+  --syn-property: #9cdcfe;
+  --syn-constant: #4fc1ff;
+  --syn-operator: #d4d4d4;
+  --syn-punctuation: #d4d4d4;
+}
+
+:root.hc-light {
+  --bg: #ffffff;
+  --bg-gutter: #f3f3f3;
+  --bg-titlebar: #dddddd;
+  --bg-statusbar: #007acc;
+  --fg: #000000;
+  --fg-dim: #595959;
+  --fg-gutter: #237893;
+  --accent: #0000ff;
+  --cursor: #000000;
+  --selection: #add6ff;
+  --border: #0000ff;
+
+  --syn-keyword: #0000ff;
+  --syn-string: #a31515;
+  --syn-number: #098658;
+  --syn-comment: #008000;
+  --syn-function: #795e26;
+  --syn-variable: #001080;
+  --syn-type: #267f99;
+  --syn-property: #001080;
+  --syn-constant: #0070c1;
+  --syn-operator: #000000;
+  --syn-punctuation: #000000;
+}
+
+/* High-contrast focus rings */
+:root.hc-dark *:focus,
+:root.hc-light *:focus {
+  outline: 2px solid var(--accent) !important;
+  outline-offset: 1px;
+}
+
+/* ─── ARIA / Accessibility ───────────────────────────────── */
+
+/* Ensure focusable elements show clear focus states */
+button:focus-visible,
+input:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Screen-reader only text */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* Ctrl+click underline on hover */

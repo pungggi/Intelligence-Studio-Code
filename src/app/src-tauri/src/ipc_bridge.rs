@@ -115,6 +115,15 @@ pub enum OutgoingMessage {
         key: String,
         value: serde_json::Value,
     },
+    /// M8b: Forward a message from a webview iframe to the Extension Host.
+    #[serde(rename = "webview/messageFromWebview")]
+    WebviewMessageFromWebview {
+        panel_id: String,
+        message: serde_json::Value,
+    },
+    /// M8b: Notify Extension Host that the user closed a webview panel.
+    #[serde(rename = "webview/closedByUser")]
+    WebviewClosedByUser { panel_id: String },
     /// IPC authentication handshake — must be the first message sent on connection.
     #[serde(rename = "ipc/auth")]
     IpcAuth { token: String },
@@ -170,6 +179,25 @@ pub struct OutputLine {
     pub text: String,
 }
 
+/// M8b: A webview panel event from the Extension Host (create, setHtml, postMessage, reveal, close).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebviewPanelEvent {
+    pub kind: String,
+    pub panel_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_scripts: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<serde_json::Value>,
+}
+
 /// A text decoration from an extension.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextDecoration {
@@ -210,6 +238,7 @@ pub struct IpcHandle {
     decorations: Arc<Mutex<Vec<TextDecoration>>>,
     pending_requests: PendingRequests,
     request_counter: Arc<Mutex<u64>>,
+    webview_events: Arc<Mutex<Vec<WebviewPanelEvent>>>,
 }
 
 impl IpcHandle {
@@ -274,6 +303,12 @@ impl IpcHandle {
             .filter(|d| d.uri == uri)
             .cloned()
             .collect()
+    }
+
+    /// M8b: Drain all pending webview panel events.
+    pub fn drain_webview_events(&self) -> Vec<WebviewPanelEvent> {
+        let mut store = lock_or_default(&self.webview_events);
+        std::mem::take(&mut *store)
     }
 
     /// M6: Generate a unique request ID.
@@ -343,6 +378,7 @@ pub fn start_ipc_bridge(port: u16, auth_token: &str) -> IpcHandle {
     let decorations = Arc::new(Mutex::new(Vec::new()));
     let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
     let request_counter = Arc::new(Mutex::new(0u64));
+    let webview_events: Arc<Mutex<Vec<WebviewPanelEvent>>> = Arc::new(Mutex::new(Vec::new()));
 
     let handle = IpcHandle {
         sender: tx,
@@ -356,6 +392,7 @@ pub fn start_ipc_bridge(port: u16, auth_token: &str) -> IpcHandle {
         decorations: decorations.clone(),
         pending_requests: pending_requests.clone(),
         request_counter,
+        webview_events: webview_events.clone(),
     };
 
     let token_for_thread = auth_token.to_string();
@@ -368,7 +405,7 @@ pub fn start_ipc_bridge(port: u16, auth_token: &str) -> IpcHandle {
                 .expect("Failed to create Tokio runtime");
 
             rt.block_on(async move {
-                ipc_loop(port, &token_for_thread, rx, diagnostics, connected, commands, notifications, ui_requests, status_bar_items, output_lines, decorations, pending_requests).await;
+                ipc_loop(port, &token_for_thread, rx, diagnostics, connected, commands, notifications, ui_requests, status_bar_items, output_lines, decorations, pending_requests, webview_events).await;
             });
         })
         .expect("Failed to spawn IPC bridge thread");
@@ -389,6 +426,7 @@ async fn ipc_loop(
     output_lines: Arc<Mutex<Vec<OutputLine>>>,
     decorations: Arc<Mutex<Vec<TextDecoration>>>,
     pending_requests: PendingRequests,
+    webview_events: Arc<Mutex<Vec<WebviewPanelEvent>>>,
 ) {
     let addr = format!("{}:{}", IPC_HOST, port);
     let mut retry_count: u32 = 0;
@@ -413,7 +451,7 @@ async fn ipc_loop(
                 retry_count = 0;
                 delay_ms = INITIAL_RETRY_DELAY_MS;
 
-                if let Err(e) = handle_connection(stream, auth_token, &mut rx, &diagnostics, &commands, &notifications, &ui_requests, &status_bar_items, &output_lines, &decorations, &pending_requests).await {
+                if let Err(e) = handle_connection(stream, auth_token, &mut rx, &diagnostics, &commands, &notifications, &ui_requests, &status_bar_items, &output_lines, &decorations, &pending_requests, &webview_events).await {
                     log::warn!("[IPC] Connection lost: {}", e);
                 }
 
@@ -450,6 +488,7 @@ async fn handle_connection(
     output_lines: &Arc<Mutex<Vec<OutputLine>>>,
     decorations: &Arc<Mutex<Vec<TextDecoration>>>,
     pending_requests: &PendingRequests,
+    webview_events: &Arc<Mutex<Vec<WebviewPanelEvent>>>,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
 
@@ -473,6 +512,7 @@ async fn handle_connection(
     let out_clone = output_lines.clone();
     let dec_clone = decorations.clone();
     let pending_clone = pending_requests.clone();
+    let wv_clone = webview_events.clone();
     let mut read_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         let mut accumulated = Vec::new();
@@ -514,7 +554,7 @@ async fn handle_connection(
 
                         let payload = &accumulated[4..4 + frame_len];
                         match serde_json::from_slice::<IncomingMessage>(payload) {
-                            Ok(msg) => handle_incoming(&msg, &diag_clone, &cmd_clone, &notif_clone, &ui_clone, &sb_clone, &out_clone, &dec_clone, &pending_clone),
+                            Ok(msg) => handle_incoming(&msg, &diag_clone, &cmd_clone, &notif_clone, &ui_clone, &sb_clone, &out_clone, &dec_clone, &pending_clone, &wv_clone),
                             Err(e) => log::warn!("[IPC] Malformed message: {}", e),
                         }
 
@@ -563,6 +603,7 @@ fn handle_incoming(
     output_lines: &Arc<Mutex<Vec<OutputLine>>>,
     decorations: &Arc<Mutex<Vec<TextDecoration>>>,
     pending_requests: &PendingRequests,
+    webview_events: &Arc<Mutex<Vec<WebviewPanelEvent>>>,
 ) {
     match msg.method.as_str() {
         // M6: LSP response correlation
@@ -669,6 +710,45 @@ fn handle_incoming(
                     store.retain(|d| !(d.uri == dec.uri && d.decoration_type == dec.decoration_type));
                     store.push(dec);
                 }
+            }
+        }
+        // M8b: WebView panel events from Extension Host
+        "webview/create" => {
+            if let Some(params) = &msg.params {
+                let panel_id = params.get("panel_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let view_type = params.get("view_type").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let title = params.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let column = params.get("column").and_then(|v| v.as_u64()).map(|n| n as u32);
+                let enable_scripts = params.get("enable_scripts").and_then(|v| v.as_bool());
+                let mut store = lock_or_default(webview_events);
+                store.push(WebviewPanelEvent { kind: "create".to_string(), panel_id, title, view_type, column, enable_scripts, html: None, message: None });
+            }
+        }
+        "webview/setHtml" => {
+            if let Some(params) = &msg.params {
+                let panel_id = params.get("panel_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let html = params.get("html").and_then(|v| v.as_str()).map(|s| s.to_string());
+                lock_or_default(webview_events).push(WebviewPanelEvent { kind: "setHtml".to_string(), panel_id, title: None, view_type: None, column: None, enable_scripts: None, html, message: None });
+            }
+        }
+        "webview/postMessage" => {
+            if let Some(params) = &msg.params {
+                let panel_id = params.get("panel_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let message = params.get("message").cloned();
+                lock_or_default(webview_events).push(WebviewPanelEvent { kind: "postMessage".to_string(), panel_id, title: None, view_type: None, column: None, enable_scripts: None, html: None, message });
+            }
+        }
+        "webview/reveal" => {
+            if let Some(params) = &msg.params {
+                let panel_id = params.get("panel_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let column = params.get("column").and_then(|v| v.as_u64()).map(|n| n as u32);
+                lock_or_default(webview_events).push(WebviewPanelEvent { kind: "reveal".to_string(), panel_id, title: None, view_type: None, column, enable_scripts: None, html: None, message: None });
+            }
+        }
+        "webview/close" => {
+            if let Some(params) = &msg.params {
+                let panel_id = params.get("panel_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                lock_or_default(webview_events).push(WebviewPanelEvent { kind: "close".to_string(), panel_id, title: None, view_type: None, column: None, enable_scripts: None, html: None, message: None });
             }
         }
         _ => {

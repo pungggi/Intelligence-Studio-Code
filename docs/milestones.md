@@ -378,11 +378,11 @@ VisibleContent { lines: Vec<HighlightedLine>, first_line, total_lines, file_path
 | **Open VSX integration** | Extension marketplace via Open VSX Registry, search, browse | P1 | Done |
 | **Extension install/update** | `.vsix` install from marketplace, auto-update checking | P1 | Done |
 | **Settings editor UI** | Visual settings editor reading/writing JSON config | P2 | Done |
-| **WebView support** | `vscode.window.createWebviewPanel` — embedded HTML views for extensions | P1 | Planned |
-| **Integrated terminal** | PTY-based terminal emulator panel (xterm.js or custom) | P1 | Planned |
+| **WebView support** | `vscode.window.createWebviewPanel` — embedded HTML views for extensions | P1 | Done |
+| **Integrated terminal** | PTY-based terminal emulator panel (xterm.js or custom) | P1 | Done |
 | **Accessibility** | Screen reader support: AT-SPI (Linux), NSAccessibility (macOS), UIA (Windows) | P1 | Planned |
-| **Keyboard navigation** | Full keyboard-only navigation, focus management, ARIA | P1 | Planned |
-| **High-contrast themes** | Built-in high-contrast light and dark themes | P2 | Planned |
+| **Keyboard navigation** | Full keyboard-only navigation, focus management, ARIA | P1 | Done |
+| **High-contrast themes** | Built-in high-contrast light and dark themes | P2 | Done |
 | **Top 20 extension testing** | Full compatibility matrix validation for target extensions | P0 | Planned |
 | **Multi-workspace** | Shared Extension Host serving multiple project windows (workspace-scoped routing) | P1 | Planned |
 
@@ -430,6 +430,64 @@ settings/changed       (Rust → Extension Host)  { key: string, value: any }
 |:---------|:-------|
 | Ctrl+Shift+X | Open Extensions panel |
 | Ctrl+, | Open Settings panel |
+
+### M8b: WebView, Terminal, Themes, ARIA (Complete)
+
+| Feature | Description | Files |
+|:--------|:------------|:------|
+| **Integrated terminal** | PTY-based terminal panel via `portable-pty` (ConPTY/Unix), xterm.js frontend, multi-session tabs | `terminal.rs`, `editor.js`, `index.html` |
+| **WebView support** | `vscode.window.createWebviewPanel` — iframe panels with `acquireVsCodeApi`, bidirectional postMessage | `ipc_bridge.rs`, `lib.rs`, `vscode-api-shim.ts`, `editor.js` |
+| **High-contrast themes** | `hc-dark` and `hc-light` CSS classes with full token color overrides | `style.css` |
+| **Keyboard navigation / ARIA** | `role=tablist/tab/main/textbox/dialog/search/toolbar`, `aria-label`, focus rings, `.sr-only` | `index.html`, `style.css` |
+
+### New Tauri Commands (M8b)
+
+```
+terminal_create(cwd, shell, cols, rows)     → String  (terminal ID)
+terminal_write(terminal_id, data)           → ()
+terminal_resize(terminal_id, cols, rows)    → ()
+terminal_close(terminal_id)                 → ()
+terminal_list()                             → Vec<TerminalInfo>
+get_webview_events()                        → Vec<WebviewPanelEvent>
+webview_post_message(panel_id, message)     → ()
+webview_close_by_user(panel_id)             → ()
+```
+
+### New IPC Messages (M8b)
+
+```
+webview/create          (Extension Host → Rust)  { panel_id, view_type, title, column, enable_scripts }
+webview/setHtml         (Extension Host → Rust)  { panel_id, html }
+webview/postMessage     (Extension Host → Rust)  { panel_id, message }
+webview/reveal          (Extension Host → Rust)  { panel_id, column? }
+webview/close           (Extension Host → Rust)  { panel_id }
+webview/messageFromWebview (Rust → Extension Host) { panel_id, message }
+webview/closedByUser    (Rust → Extension Host)  { panel_id }
+```
+
+### New Tauri Events (M8b)
+
+```
+terminal-data   → { terminal_id, data }    (PTY output → xterm.js write)
+terminal-exit   → { terminal_id, exit_code? }
+```
+
+### VS Code API Coverage (M8b additions)
+
+```
+vscode.window
+  ├── createWebviewPanel(viewType, title, showOptions, options)
+  │     → WebviewPanel.webview.html (setter)
+  │     → WebviewPanel.webview.postMessage(message)
+  │     → WebviewPanel.webview.onDidReceiveMessage
+  │     → WebviewPanel.reveal(column?)
+  │     → WebviewPanel.dispose()
+  │     → WebviewPanel.onDidDispose
+  ├── (terminal omitted — exposed via integrated terminal UI, not vscode.window.createTerminal yet)
+  └── ...
+
+vscode.ViewColumn  (Active, Beside, One, Two, Three)
+```
 
 ### Multi-workspace Architecture (from M5 IPC groundwork)
 

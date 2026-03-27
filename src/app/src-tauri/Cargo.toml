@@ -53,3 +53,6 @@ dirs = "5"
 
 # Cryptographic random for IPC auth token
 getrandom = "0.2"
+
+# Terminal PTY support (ConPTY on Windows, Unix PTY on macOS/Linux)
+portable-pty = "0.8"

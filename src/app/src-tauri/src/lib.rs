@@ -5,11 +5,13 @@ mod highlighting;
 mod ipc_bridge;
 mod marketplace;
 mod settings;
+mod terminal;
 
 use editor::WorkspaceState;
 use ipc_bridge::{IpcHandle, OutgoingMessage};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use tauri::AppHandle;
 
 /// Maximum text insertion size (1 MB).
 const MAX_INSERT_SIZE: usize = 1024 * 1024;
@@ -21,6 +23,7 @@ struct AppState {
     marketplace: marketplace::MarketplaceClient,
     extension_mgr: Mutex<extension_mgr::ExtensionManager>,
     settings: Mutex<settings::SettingsStore>,
+    terminal_mgr: Mutex<terminal::TerminalManager>,
 }
 
 // --- Path validation ---
@@ -771,6 +774,92 @@ fn get_setting_definitions(
     state.ipc.request_sync("settings/getDefinitions", serde_json::json!({}))
 }
 
+// --- M8b: Terminal Commands ---
+
+#[tauri::command]
+fn terminal_create(
+    app: AppHandle,
+    cwd: Option<String>,
+    shell: Option<String>,
+    cols: u32,
+    rows: u32,
+    state: tauri::State<AppState>,
+) -> Result<String, String> {
+    let mut mgr = state.terminal_mgr.lock().map_err(|e| e.to_string())?;
+    mgr.create(
+        &app,
+        cwd.as_deref(),
+        shell.as_deref(),
+        cols as u16,
+        rows as u16,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn terminal_write(
+    terminal_id: String,
+    data: String,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    let mut mgr = state.terminal_mgr.lock().map_err(|e| e.to_string())?;
+    mgr.write(&terminal_id, data.as_bytes())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn terminal_resize(
+    terminal_id: String,
+    cols: u32,
+    rows: u32,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    let mut mgr = state.terminal_mgr.lock().map_err(|e| e.to_string())?;
+    mgr.resize(&terminal_id, cols as u16, rows as u16)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn terminal_close(
+    terminal_id: String,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    let mut mgr = state.terminal_mgr.lock().map_err(|e| e.to_string())?;
+    mgr.close(&terminal_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn terminal_list(state: tauri::State<AppState>) -> Result<Vec<terminal::TerminalInfo>, String> {
+    let mgr = state.terminal_mgr.lock().map_err(|e| e.to_string())?;
+    Ok(mgr.list())
+}
+
+// --- M8b: WebView Commands ---
+
+/// Drain all pending webview panel events (create, setHtml, postMessage, reveal, close).
+#[tauri::command]
+fn get_webview_events(state: tauri::State<AppState>) -> Result<Vec<ipc_bridge::WebviewPanelEvent>, String> {
+    Ok(state.ipc.drain_webview_events())
+}
+
+/// Forward a message from a webview iframe to the Extension Host.
+#[tauri::command]
+fn webview_post_message(
+    panel_id: String,
+    message: serde_json::Value,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    state.ipc.send(OutgoingMessage::WebviewMessageFromWebview { panel_id, message });
+    Ok(())
+}
+
+/// Notify Extension Host that the user closed a webview panel.
+#[tauri::command]
+fn webview_close_by_user(panel_id: String, state: tauri::State<AppState>) -> Result<(), String> {
+    state.ipc.send(OutgoingMessage::WebviewClosedByUser { panel_id });
+    Ok(())
+}
+
 // --- Response types ---
 
 #[derive(serde::Serialize, Clone)]
@@ -858,6 +947,7 @@ pub fn run() {
             marketplace: marketplace_client,
             extension_mgr: Mutex::new(ext_mgr),
             settings: Mutex::new(settings_store),
+            terminal_mgr: Mutex::new(terminal::TerminalManager::new()),
         })
         .invoke_handler(tauri::generate_handler![
             open_file,
@@ -909,6 +999,16 @@ pub fn run() {
             update_setting,
             reset_setting,
             get_setting_definitions,
+            // M8b: Terminal commands
+            terminal_create,
+            terminal_write,
+            terminal_resize,
+            terminal_close,
+            terminal_list,
+            // M8b: WebView commands
+            get_webview_events,
+            webview_post_message,
+            webview_close_by_user,
         ])
         .setup(move |app| {
             log::info!("CoreCode M8 starting...");
