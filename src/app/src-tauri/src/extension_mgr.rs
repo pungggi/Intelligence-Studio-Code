@@ -135,19 +135,30 @@ impl ExtensionManager {
 
             let target = install_dir.join(&relative_path);
 
-            // Security: ensure path doesn't escape install dir
-            let canonical_base = install_dir
-                .canonicalize()
-                .unwrap_or_else(|_| install_dir.clone());
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).ok();
-            }
-            // Check the target resolves within install_dir (prevent zip-slip)
-            if let Ok(canonical_target) = target.canonicalize() {
-                if !canonical_target.starts_with(&canonical_base) {
-                    log::warn!("Skipping zip entry with path traversal: {raw_name}");
+            // Security: lexical path traversal check (prevent zip-slip)
+            // We must check BEFORE creating directories or writing files.
+            // Use lexical normalization: resolve the target relative to install_dir
+            // and verify it stays within bounds. This works for paths that don't exist yet.
+            {
+                use std::path::Component;
+                let mut depth: i32 = 0;
+                for component in target.strip_prefix(&install_dir).unwrap_or(&target).components() {
+                    match component {
+                        Component::ParentDir => depth -= 1,
+                        Component::Normal(_) => depth += 1,
+                        _ => {}
+                    }
+                    if depth < 0 {
+                        log::warn!("Skipping zip entry with path traversal: {raw_name}");
+                        break;
+                    }
+                }
+                if depth < 0 {
                     continue;
                 }
+            }
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).ok();
             }
 
             if file.is_dir() {
@@ -188,6 +199,27 @@ impl ExtensionManager {
                 }
 
                 let target = install_dir.join(&raw_name);
+
+                // Security: lexical path traversal check (prevent zip-slip)
+                {
+                    use std::path::Component;
+                    let mut depth: i32 = 0;
+                    for component in target.strip_prefix(&install_dir).unwrap_or(&target).components() {
+                        match component {
+                            Component::ParentDir => depth -= 1,
+                            Component::Normal(_) => depth += 1,
+                            _ => {}
+                        }
+                        if depth < 0 {
+                            break;
+                        }
+                    }
+                    if depth < 0 {
+                        log::warn!("Skipping zip entry with path traversal: {raw_name}");
+                        continue;
+                    }
+                }
+
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent).ok();
                 }

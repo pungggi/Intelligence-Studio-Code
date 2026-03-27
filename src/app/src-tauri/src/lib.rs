@@ -626,14 +626,24 @@ fn marketplace_list_installed(
 async fn install_extension(
     namespace: String,
     name: String,
-    download_url: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<extension_mgr::InstalledExtension, String> {
-    // Get extension details for display name and description
-    let info = state.marketplace.get_extension(&namespace, &name).await.ok();
+    // Get extension details from Open VSX (derive download URL server-side to prevent SSRF)
+    let info = state.marketplace.get_extension(&namespace, &name).await
+        .map_err(|e| format!("Failed to get extension info: {e}"))?;
+
+    // Derive download URL from the trusted API response
+    let download_url = info.files.get("download")
+        .ok_or_else(|| format!("No download URL found for {namespace}.{name}"))?;
+
+    // Validate the download URL points to Open VSX
+    if !download_url.starts_with("https://open-vsx.org/") {
+        return Err(format!("Untrusted download URL: {download_url}"));
+    }
 
     // Download the VSIX
-    let vsix_bytes = state.marketplace.download_vsix(&download_url).await?;
+    let vsix_bytes = state.marketplace.download_vsix(download_url).await?;
+    let info = Some(info);
 
     let version = info.as_ref().map(|i| i.version.as_str()).unwrap_or("0.0.0");
     let display_name = info.as_ref().and_then(|i| i.display_name.as_deref());

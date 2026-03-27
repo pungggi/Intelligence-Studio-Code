@@ -86,7 +86,10 @@ const BUFFER_LINES = 30;  // extra lines to cache above/below viewport
 // Serial edit queue — prevents async keystroke interleaving
 let editQueueTail = Promise.resolve();
 function queueEdit(fn) {
-  editQueueTail = editQueueTail.then(fn, fn);
+  editQueueTail = editQueueTail.then(fn).catch(err => {
+    console.error('[queueEdit] Edit failed:', err);
+    return fn();
+  });
   return editQueueTail;
 }
 
@@ -302,7 +305,7 @@ function paintEditorCanvas() {
   }
 
   // Draw text lines
-  const fontSize = parseFloat(style.fontSize);
+  const fontSize = cachedFontSize;
   const visibleCount = Math.ceil((h / dpr) / lineHeight) + 2;
   for (let vi = 0; vi < visibleCount; vi++) {
     const lineIdx = first + vi;
@@ -1110,12 +1113,12 @@ async function executePaletteCommand(command) {
     try {
       const updates = await invoke('check_extension_updates');
       if (updates.length === 0) {
-        showToast('All extensions are up to date', 'info');
+        showToast('info', 'All extensions are up to date');
       } else {
-        showToast(`${updates.length} extension update(s) available`, 'info');
+        showToast('info', `${updates.length} extension update(s) available`);
       }
     } catch (err) {
-      showToast(`Failed to check updates: ${err}`, 'error');
+      showToast('error', `Failed to check updates: ${err}`);
     }
   } else {
     await invoke('execute_command', { command });
@@ -2853,19 +2856,10 @@ function renderExtensionList(extensions, mode) {
           installBtn.disabled = true;
           installBtn.textContent = 'Installing...';
           try {
-            // Get full extension info to find download URL
-            const fullInfo = await invoke('marketplace_get_extension', {
-              namespace: ext.namespace,
-              name: ext.name,
-            });
-            const downloadUrl = fullInfo.files?.download;
-            if (!downloadUrl) {
-              throw new Error('No download URL available');
-            }
+            // Download URL is now derived server-side from the Open VSX API
             await invoke('install_extension', {
               namespace: ext.namespace,
               name: ext.name,
-              downloadUrl,
             });
             installBtn.textContent = 'Installed';
             installedExtensions = await invoke('marketplace_list_installed');

@@ -154,10 +154,19 @@ export class LanguageClient {
 
     if (!command) {
       console.error(`[LanguageClient:${this.id}] No server command specified`);
+      this.started = false;
       return;
     }
 
-    console.log(`[LanguageClient:${this.id}] Spawning: ${command} ${args.join(" ")}`);
+    // Security: log full spawn details for audit trail
+    console.warn(`[LanguageClient:${this.id}] SPAWN AUDIT: command=${JSON.stringify(command)}, args=${JSON.stringify(args)}, cwd=${JSON.stringify(spawnOpts?.cwd)}, env_overrides=${JSON.stringify(Object.keys(spawnOpts?.env ?? {}))}`);
+
+    // Validate command doesn't contain shell metacharacters
+    if (/[;&|`$]/.test(command)) {
+      console.error(`[LanguageClient:${this.id}] Refusing to spawn command with shell metacharacters: ${command}`);
+      this.started = false;
+      return;
+    }
 
     this.process = spawn(command, args, {
       cwd: spawnOpts?.cwd,

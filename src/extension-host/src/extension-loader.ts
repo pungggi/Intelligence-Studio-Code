@@ -42,8 +42,17 @@ interface LoadedExtension {
 export class ExtensionLoader {
   private extensions = new Map<string, LoadedExtension>();
   private activationErrors = new Map<string, string>();
+  /** Stable vscode API singleton — shared across all extensions to avoid require.cache pollution */
+  private cachedVscodeApi: ReturnType<VscodeApiShim["createVscodeApi"]> | null = null;
 
   constructor(private apiShim: VscodeApiShim) {}
+
+  private getVscodeApi(): ReturnType<VscodeApiShim["createVscodeApi"]> {
+    if (!this.cachedVscodeApi) {
+      this.cachedVscodeApi = this.apiShim.createVscodeApi();
+    }
+    return this.cachedVscodeApi;
+  }
 
   /**
    * Scan a directory for VS Code extensions and activate them.
@@ -167,8 +176,8 @@ export class ExtensionLoader {
     }
 
     try {
-      // Inject vscode API into the module's require cache before loading
-      const vscodeApi = this.apiShim.createVscodeApi();
+      // Use stable cached vscode API singleton to avoid require.cache pollution
+      const vscodeApi = this.getVscodeApi();
 
       // M6: Build vscode-languageclient shim with LanguageClient that has vscodeApi attached
       const languageClientShim = {
@@ -213,8 +222,11 @@ export class ExtensionLoader {
       try {
         mod = require(mainPath);
       } finally {
-        // Always restore the original resolver to avoid global pollution
+        // Always restore the original resolver and clean up cache entries
+        // to avoid global pollution across extensions
         Module._resolveFilename = originalResolve;
+        delete require.cache["vscode"];
+        delete require.cache["vscode-languageclient"];
       }
       ext.module = mod;
 

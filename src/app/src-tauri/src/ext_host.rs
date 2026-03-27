@@ -24,7 +24,12 @@ pub fn kill_extension_host() {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+            let pid_i32 = pid as i32;
+            if pid_i32 > 0 {
+                unsafe { libc::kill(pid_i32, libc::SIGTERM); }
+            } else {
+                log::error!("Refusing to send SIGTERM to PID {} (cast to {})", pid, pid_i32);
+            }
         }
     }
 }
