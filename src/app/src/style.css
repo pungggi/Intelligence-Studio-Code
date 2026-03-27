@@ -9,6 +9,7 @@
   --accent: #89b4fa;
   --cursor: #f5e0dc;
   --selection: #313244;
+  --border: #313244;
 
   /* Syntax colors (Catppuccin Mocha inspired) */
   --syn-keyword: #cba6f7;
@@ -54,7 +55,7 @@ body {
   align-items: center;
   gap: 12px;
   font-size: 13px;
-  border-bottom: 1px solid #313244;
+  border-bottom: 1px solid var(--border);
   -webkit-user-select: none;
   user-select: none;
 }
@@ -64,7 +65,7 @@ body {
 }
 
 #language-badge {
-  background: #313244;
+  background: var(--border);
   padding: 1px 8px;
   border-radius: 4px;
   font-size: 11px;
@@ -75,6 +76,209 @@ body {
   margin-left: auto;
   font-size: 11px;
   color: var(--fg-dim);
+}
+
+/* ─── M5: Tab Bar ─────────────────────────────────────────── */
+
+#tab-bar {
+  background: var(--bg-titlebar);
+  display: flex;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  min-height: 35px;
+  overflow-x: auto;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+#tab-bar::-webkit-scrollbar {
+  height: 2px;
+}
+#tab-bar::-webkit-scrollbar-thumb {
+  background: var(--border);
+}
+
+#tabs {
+  display: flex;
+  align-items: stretch;
+  min-height: 35px;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  font-size: 12px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  border-right: 1px solid var(--border);
+  white-space: nowrap;
+  position: relative;
+  min-width: 0;
+}
+
+.tab:hover {
+  color: var(--fg);
+  background: rgba(49, 50, 68, 0.5);
+}
+
+.tab.active {
+  color: var(--fg);
+  background: var(--bg);
+  border-bottom: 2px solid var(--accent);
+}
+
+.tab .tab-modified {
+  color: var(--accent);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.tab .tab-close {
+  opacity: 0;
+  padding: 0 2px;
+  border: none;
+  background: none;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  border-radius: 3px;
+}
+
+.tab:hover .tab-close,
+.tab.active .tab-close {
+  opacity: 1;
+}
+
+.tab .tab-close:hover {
+  background: rgba(243, 139, 168, 0.3);
+  color: #f38ba8;
+}
+
+.tab-empty-hint {
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+
+/* ─── M5: Main area (sidebar + editor) ────────────────────── */
+
+#main-area {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+/* ─── M5: File Explorer Sidebar ───────────────────────────── */
+
+.sidebar-hidden {
+  display: none !important;
+}
+
+#sidebar {
+  width: 250px;
+  min-width: 200px;
+  max-width: 400px;
+  background: var(--bg-gutter);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border);
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+#sidebar-close {
+  background: none;
+  border: none;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 16px;
+  padding: 0 4px;
+  line-height: 1;
+}
+#sidebar-close:hover {
+  color: var(--fg);
+}
+
+#file-tree {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 4px 0;
+  font-size: 13px;
+}
+
+.tree-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.tree-item:hover {
+  background: rgba(49, 50, 68, 0.5);
+}
+
+.tree-item.active {
+  background: rgba(137, 180, 250, 0.15);
+  color: var(--accent);
+}
+
+.tree-icon {
+  flex-shrink: 0;
+  width: 16px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+
+.tree-icon.folder {
+  color: var(--accent);
+}
+
+.tree-icon.file {
+  color: var(--fg-dim);
+}
+
+.tree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tree-indent {
+  flex-shrink: 0;
+}
+
+/* ─── Editor area ─────────────────────────────────────────── */
+
+#editor-area {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
 }
 
 #editor-container {
@@ -93,7 +297,7 @@ body {
   overflow: hidden;
   font-size: 14px;
   line-height: 1.6;
-  border-right: 1px solid #313244;
+  border-right: 1px solid var(--border);
   -webkit-user-select: none;
   user-select: none;
 }
@@ -159,6 +363,36 @@ body {
 .tok-punctuation { color: var(--syn-punctuation); }
 .tok-plain      { color: var(--fg); }
 
+/* ─── M5: Minimap ─────────────────────────────────────────── */
+
+.minimap-hidden {
+  display: none !important;
+}
+
+#minimap {
+  width: 80px;
+  position: relative;
+  background: var(--bg-gutter);
+  border-left: 1px solid var(--border);
+  overflow: hidden;
+}
+
+#minimap-canvas {
+  width: 100%;
+  display: block;
+}
+
+#minimap-viewport {
+  position: absolute;
+  left: 0;
+  right: 0;
+  background: rgba(137, 180, 250, 0.1);
+  border: 1px solid rgba(137, 180, 250, 0.3);
+  pointer-events: none;
+}
+
+/* ─── Status bar ──────────────────────────────────────────── */
+
 #statusbar {
   background: var(--bg-statusbar);
   padding: 4px 16px;
@@ -167,7 +401,7 @@ body {
   gap: 20px;
   font-size: 12px;
   color: var(--fg-dim);
-  border-top: 1px solid #313244;
+  border-top: 1px solid var(--border);
   -webkit-user-select: none;
   user-select: none;
 }
@@ -196,7 +430,7 @@ body {
 }
 
 .ext-sb-item:hover {
-  background: #313244;
+  background: var(--border);
 }
 
 /* Diagnostic underlines */
@@ -237,7 +471,7 @@ body {
 #find-bar {
   background: var(--bg-titlebar);
   padding: 6px 12px;
-  border-bottom: 1px solid #313244;
+  border-bottom: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -274,7 +508,7 @@ body {
 
 #find-bar button {
   padding: 2px 8px;
-  background: #313244;
+  background: var(--border);
   border: 1px solid #45475a;
   border-radius: 4px;
   color: var(--fg);
@@ -305,7 +539,7 @@ body {
   display: flex;
   flex-direction: column;
   height: 200px;
-  border-top: 1px solid #313244;
+  border-top: 1px solid var(--border);
 }
 
 #output-header {
@@ -314,7 +548,7 @@ body {
   gap: 12px;
   padding: 4px 12px;
   background: var(--bg-titlebar);
-  border-bottom: 1px solid #313244;
+  border-bottom: 1px solid var(--border);
   font-size: 12px;
   -webkit-user-select: none;
   user-select: none;
@@ -406,7 +640,7 @@ body {
   padding: 10px 16px;
   background: var(--bg);
   border: none;
-  border-bottom: 1px solid #313244;
+  border-bottom: 1px solid var(--border);
   color: var(--fg);
   font-family: inherit;
   font-size: 14px;
@@ -431,7 +665,7 @@ body {
 
 .palette-item:hover,
 .palette-item.selected {
-  background: #313244;
+  background: var(--border);
 }
 
 .palette-item .palette-label {
@@ -454,9 +688,9 @@ body {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
 }
 
-.toast-info    { background: #313244; border-left: 3px solid #89b4fa; }
-.toast-warning { background: #313244; border-left: 3px solid #fab387; }
-.toast-error   { background: #313244; border-left: 3px solid #f38ba8; }
+.toast-info    { background: var(--border); border-left: 3px solid #89b4fa; }
+.toast-warning { background: var(--border); border-left: 3px solid #fab387; }
+.toast-error   { background: var(--border); border-left: 3px solid #f38ba8; }
 
 .toast-fade {
   opacity: 0;
@@ -470,20 +704,24 @@ body {
 
 /* Scrollbar */
 #editor::-webkit-scrollbar,
-#output-content::-webkit-scrollbar {
+#output-content::-webkit-scrollbar,
+#file-tree::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 #editor::-webkit-scrollbar-track,
-#output-content::-webkit-scrollbar-track {
+#output-content::-webkit-scrollbar-track,
+#file-tree::-webkit-scrollbar-track {
   background: var(--bg);
 }
 #editor::-webkit-scrollbar-thumb,
-#output-content::-webkit-scrollbar-thumb {
-  background: #313244;
+#output-content::-webkit-scrollbar-thumb,
+#file-tree::-webkit-scrollbar-thumb {
+  background: var(--border);
   border-radius: 5px;
 }
 #editor::-webkit-scrollbar-thumb:hover,
-#output-content::-webkit-scrollbar-thumb:hover {
+#output-content::-webkit-scrollbar-thumb:hover,
+#file-tree::-webkit-scrollbar-thumb:hover {
   background: #45475a;
 }

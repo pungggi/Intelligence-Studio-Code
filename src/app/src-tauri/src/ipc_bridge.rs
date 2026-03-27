@@ -47,6 +47,8 @@ pub enum DiagnosticSeverity {
 }
 
 /// Messages sent from the editor to the Extension Host.
+/// M5: All document-related messages include an optional `workspace_id` field
+/// for future multi-workspace routing. Defaults to "default" for single workspace.
 #[derive(Debug, Serialize)]
 #[serde(tag = "method", content = "params")]
 #[allow(dead_code)]
@@ -57,15 +59,23 @@ pub enum OutgoingMessage {
         language_id: String,
         version: u32,
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
     },
     #[serde(rename = "textDocument/didChange")]
     DidChange {
         uri: String,
         version: u32,
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
     },
     #[serde(rename = "textDocument/didClose")]
-    DidClose { uri: String },
+    DidClose {
+        uri: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+    },
     #[serde(rename = "executeCommand")]
     ExecuteCommand { command: String, args: Vec<serde_json::Value> },
     #[serde(rename = "listCommands")]
@@ -159,7 +169,9 @@ pub struct IpcHandle {
 
 impl IpcHandle {
     pub fn send(&self, msg: OutgoingMessage) {
-        let _ = self.sender.try_send(msg);
+        if let Err(e) = self.sender.try_send(msg) {
+            log::warn!("[IPC] Outgoing message dropped (channel full or closed): {}", e);
+        }
     }
 
     pub fn get_diagnostics(&self) -> Vec<Diagnostic> {
@@ -351,6 +363,15 @@ async fn handle_connection(
                 Ok(n) => {
                     accumulated.extend_from_slice(&buf[..n]);
 
+                    // Guard against unbounded accumulation BEFORE processing
+                    if accumulated.len() > MAX_FRAME_SIZE + 4 {
+                        log::error!(
+                            "[IPC] Accumulated buffer too large ({} bytes), dropping connection",
+                            accumulated.len()
+                        );
+                        return;
+                    }
+
                     // Process complete frames
                     while accumulated.len() >= 4 {
                         let frame_len = u32::from_le_bytes(
@@ -377,13 +398,7 @@ async fn handle_connection(
                             Err(e) => log::warn!("[IPC] Malformed message: {}", e),
                         }
 
-                        accumulated = accumulated[4 + frame_len..].to_vec();
-                    }
-
-                    // Guard against unbounded accumulation from incomplete frames
-                    if accumulated.len() > MAX_FRAME_SIZE + 4 {
-                        log::error!("[IPC] Accumulated buffer too large, dropping connection");
-                        return;
+                        accumulated.drain(..4 + frame_len);
                     }
                 }
                 Err(e) => {

@@ -83,17 +83,25 @@ fn map_kind(kind: &str) -> &'static str {
         "string" | "string_fragment" | "template_string" | "template_literal"
         | "escape_sequence" | "string_literal" | "char_literal"
         | "string_content" | "string_start" | "string_end"
-        | "interpolation" => "string",
+        | "interpolation"
+        // CSS strings
+        | "string_value" => "string",
 
         // Numbers
-        "number" | "integer" | "float" | "integer_literal" | "float_literal" => "number",
+        "number" | "integer" | "float" | "integer_literal" | "float_literal"
+        // CSS numbers
+        | "integer_value" | "float_value" => "number",
 
         // Comments
         "comment" | "line_comment" | "block_comment" => "comment",
 
         // Properties
         "property_identifier" | "shorthand_property_identifier" | "field_identifier"
-        | "attribute" => "property",
+        | "attribute"
+        // HTML attributes
+        | "attribute_name"
+        // CSS properties
+        | "property_name" | "feature_name" => "property",
 
         // Types (Rust, TS, Python)
         "type_identifier" | "predefined_type" | "primitive_type"
@@ -101,7 +109,9 @@ fn map_kind(kind: &str) -> &'static str {
 
         // Constants
         "true" | "false" | "null" | "undefined" | "none" | "boolean"
-        | "None" | "True" | "False" => "constant",
+        | "None" | "True" | "False"
+        // CSS constants / colors
+        | "color_value" | "plain_value" => "constant",
 
         // Operators
         "=" | "==" | "===" | "!=" | "!==" | "+" | "-" | "*" | "/" | "%" | "&&" | "||" | "!"
@@ -112,6 +122,25 @@ fn map_kind(kind: &str) -> &'static str {
 
         // Punctuation
         "(" | ")" | "{" | "}" | "[" | "]" | ";" | "," | "." | ":" => "punctuation",
+
+        // HTML tags
+        "tag_name" | "doctype" => "keyword",
+        "attribute_value" | "quoted_attribute_value" => "string",
+        "self_closing_tag" | "start_tag" | "end_tag" => "plain",
+
+        // CSS selectors & at-rules
+        "class_name" | "id_name" | "pseudo_class_selector" | "pseudo_element_selector" => "type",
+        "at_keyword" | "important" => "keyword",
+        "unit" => "constant",
+
+        // Markdown
+        "atx_heading" | "setext_heading" => "keyword",
+        "heading_content" => "keyword",
+        "link_text" | "link_destination" | "link_label" => "string",
+        "emphasis" | "strong_emphasis" => "keyword",
+        "code_span" | "fenced_code_block" | "indented_code_block" => "string",
+        "code_fence_content" => "string",
+        "block_quote" => "comment",
 
         // Identifiers
         "identifier" => "variable",

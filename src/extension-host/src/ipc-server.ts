@@ -121,7 +121,10 @@ export class IpcServer {
 
     const header = Buffer.alloc(4);
     header.writeUInt32LE(json.length, 0);
-    this.client.write(Buffer.concat([header, json]));
+    const ok = this.client.write(Buffer.concat([header, json]));
+    if (!ok) {
+      console.warn("[IPC] Write backpressure detected, kernel buffer full");
+    }
   }
 
   isConnected(): boolean {

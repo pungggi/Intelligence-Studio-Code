@@ -13,9 +13,34 @@
       <span id="language-badge"></span>
       <span id="status"></span>
     </div>
-    <div id="editor-container">
-      <div id="gutter"></div>
-      <div id="editor" tabindex="0"></div>
+
+    <!-- M5: Tab bar for multi-file editing -->
+    <div id="tab-bar">
+      <div id="tabs"></div>
+    </div>
+
+    <div id="main-area">
+      <!-- M5: File explorer sidebar -->
+      <div id="sidebar" class="sidebar-hidden">
+        <div id="sidebar-header">
+          <span id="sidebar-title">Explorer</span>
+          <button id="sidebar-close" title="Close sidebar">&times;</button>
+        </div>
+        <div id="file-tree"></div>
+      </div>
+
+      <div id="editor-area">
+        <div id="editor-container">
+          <div id="gutter"></div>
+          <div id="editor" tabindex="0"></div>
+        </div>
+
+        <!-- M5: Minimap -->
+        <div id="minimap" class="minimap-hidden">
+          <canvas id="minimap-canvas"></canvas>
+          <div id="minimap-viewport"></div>
+        </div>
+      </div>
     </div>
 
     <!-- Find/Replace Bar -->

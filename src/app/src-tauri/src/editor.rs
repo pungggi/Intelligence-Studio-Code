@@ -1,21 +1,22 @@
-//! Editor State — Rope text buffer + Tree-sitter syntax highlighting + Undo/Redo.
+//! Editor State — Multi-document workspace with Rope text buffers + Tree-sitter + Undo/Redo.
 //!
-//! This is the core editor engine. It owns the text buffer and provides
-//! edit operations that keep the syntax tree in sync incrementally.
-//! M4 adds: undo/redo, selection operations, find/replace, more grammars.
+//! M5: Refactored from single-file EditorState to WorkspaceState holding
+//! multiple DocumentBuffers in a HashMap. Each buffer has its own rope,
+//! syntax tree, undo stack, and modification state.
 
 use crate::highlighting;
 use crate::ipc_bridge::IpcHandle;
 use crate::{EditorContent, HighlightedLine};
 use anyhow::{Context, Result};
 use ropey::Rope;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Maximum file size that can be opened (50 MB).
 const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
 
-/// Maximum undo history depth.
+/// Maximum undo history depth per buffer.
 const MAX_UNDO_HISTORY: usize = 10_000;
 
 // --- Undo/Redo ---
@@ -29,28 +30,29 @@ enum EditOp {
 }
 
 struct UndoManager {
-    undo_stack: Vec<EditOp>,
+    undo_stack: VecDeque<EditOp>,
     redo_stack: Vec<EditOp>,
 }
 
+#[allow(dead_code)]
 impl UndoManager {
     fn new() -> Self {
         Self {
-            undo_stack: Vec::new(),
+            undo_stack: VecDeque::new(),
             redo_stack: Vec::new(),
         }
     }
 
     fn push(&mut self, op: EditOp) {
-        self.undo_stack.push(op);
+        self.undo_stack.push_back(op);
         self.redo_stack.clear();
         if self.undo_stack.len() > MAX_UNDO_HISTORY {
-            self.undo_stack.remove(0);
+            self.undo_stack.pop_front(); // O(1) instead of Vec::remove(0) which is O(n)
         }
     }
 
     fn pop_undo(&mut self) -> Option<EditOp> {
-        self.undo_stack.pop()
+        self.undo_stack.pop_back()
     }
 
     fn push_redo(&mut self, op: EditOp) {
@@ -62,7 +64,7 @@ impl UndoManager {
     }
 
     fn push_undo_no_clear(&mut self, op: EditOp) {
-        self.undo_stack.push(op);
+        self.undo_stack.push_back(op);
     }
 
     fn clear(&mut self) {
@@ -80,90 +82,31 @@ pub struct FindMatch {
     pub length: usize,
 }
 
-// --- Editor State ---
+// --- Per-document buffer ---
 
-pub struct EditorState {
+/// A single open document with its own rope, syntax tree, and undo history.
+pub struct DocumentBuffer {
     rope: Rope,
-    file_path: Option<PathBuf>,
+    file_path: PathBuf,
     language: Option<String>,
     modified: bool,
-    parser: tree_sitter::Parser,
     tree: Option<tree_sitter::Tree>,
     version: u32,
     undo_mgr: UndoManager,
 }
 
-impl EditorState {
-    pub fn new() -> Self {
-        let mut parser = tree_sitter::Parser::new();
-        let _ = parser.set_language(&tree_sitter_javascript::LANGUAGE.into());
-
-        let rope = Rope::from_str("// Welcome to CoreCode\n// Open a file to begin editing\n");
-        let tree = parser.parse(&rope.to_string(), None);
-
+#[allow(dead_code)]
+impl DocumentBuffer {
+    fn new(path: PathBuf, content: &str, language: Option<String>, tree: Option<tree_sitter::Tree>) -> Self {
         Self {
-            rope,
-            file_path: None,
-            language: Some("javascript".to_string()),
+            rope: Rope::from_str(content),
+            file_path: path,
+            language,
             modified: false,
-            parser,
             tree,
-            version: 0,
+            version: 1,
             undo_mgr: UndoManager::new(),
         }
-    }
-
-    pub fn open_file(&mut self, path: &str) -> Result<()> {
-        let metadata = fs::metadata(path).context("Failed to stat file")?;
-        if metadata.len() > MAX_FILE_SIZE {
-            anyhow::bail!(
-                "File too large ({:.1} MB, max {:.0} MB)",
-                metadata.len() as f64 / (1024.0 * 1024.0),
-                MAX_FILE_SIZE as f64 / (1024.0 * 1024.0)
-            );
-        }
-
-        let content = fs::read_to_string(path).context("Failed to read file")?;
-        self.rope = Rope::from_str(&content);
-        self.file_path = Some(PathBuf::from(path));
-        self.modified = false;
-        self.undo_mgr.clear();
-
-        let ext = PathBuf::from(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_string();
-
-        self.language = Some(ext.clone());
-        self.set_language_from_ext(&ext);
-
-        let source = self.rope.to_string();
-        self.tree = self.parser.parse(&source, None);
-
-        if self.tree.is_none() {
-            log::warn!("Tree-sitter parse returned None for {}", path);
-        }
-
-        log::info!(
-            "Opened {} ({} lines, language: {})",
-            path,
-            self.rope.len_lines(),
-            ext
-        );
-
-        Ok(())
-    }
-
-    pub fn save_file(&mut self) -> Result<()> {
-        let path = self
-            .file_path
-            .as_ref()
-            .context("No file path set")?;
-        fs::write(path, self.rope.to_string()).context("Failed to write file")?;
-        self.modified = false;
-        log::info!("Saved {}", path.display());
-        Ok(())
     }
 
     // --- Raw edit operations (no undo recording) ---
@@ -193,8 +136,6 @@ impl EditorState {
                     column: new_end_col,
                 },
             });
-
-            self.reparse();
         }
     }
 
@@ -205,7 +146,6 @@ impl EditorState {
             return String::new();
         }
 
-        // Capture deleted text before removing
         let deleted: String = self.rope.slice(char_idx..end_idx).to_string();
 
         let start_byte = self.rope.char_to_byte(char_idx);
@@ -236,8 +176,6 @@ impl EditorState {
                     column: new_col,
                 },
             });
-
-            self.reparse();
         }
 
         deleted
@@ -312,7 +250,6 @@ impl EditorState {
     }
 
     /// Replace a range of text (for selection replacement, find/replace).
-    /// Returns the deleted text.
     pub fn replace_range(
         &mut self,
         start_line: usize,
@@ -332,7 +269,6 @@ impl EditorState {
 
         let mut ops = Vec::new();
 
-        // Delete the range
         let deleted = if end > start {
             let d = self.raw_delete_at_char(start, end - start);
             ops.push(EditOp::Delete {
@@ -344,7 +280,6 @@ impl EditorState {
             String::new()
         };
 
-        // Insert new text
         if !new_text.is_empty() {
             self.raw_insert_at_char(start, new_text);
             ops.push(EditOp::Insert {
@@ -405,6 +340,7 @@ impl EditorState {
 
         let reverse = self.apply_reverse(&op);
         self.undo_mgr.push_redo(reverse);
+        self.modified = true; // Buffer content changed; save-point tracking is future work
         true
     }
 
@@ -416,6 +352,7 @@ impl EditorState {
 
         let reverse = self.apply_forward(&op);
         self.undo_mgr.push_undo_no_clear(reverse);
+        self.modified = true; // Buffer content changed; save-point tracking is future work
         true
     }
 
@@ -436,6 +373,10 @@ impl EditorState {
                 }
             }
             EditOp::Group(ops) => {
+                debug_assert!(
+                    ops.iter().all(|op| !matches!(op, EditOp::Group(_))),
+                    "Nested Group EditOps are not supported"
+                );
                 let mut reverse_ops = Vec::new();
                 for op in ops.iter().rev() {
                     reverse_ops.push(self.apply_reverse(op));
@@ -463,6 +404,10 @@ impl EditorState {
                 }
             }
             EditOp::Group(ops) => {
+                debug_assert!(
+                    ops.iter().all(|op| !matches!(op, EditOp::Group(_))),
+                    "Nested Group EditOps are not supported"
+                );
                 let mut forward_ops = Vec::new();
                 for op in ops {
                     forward_ops.push(self.apply_forward(op));
@@ -488,10 +433,14 @@ impl EditorState {
             (text.to_lowercase(), query.to_lowercase())
         };
 
+        let query_char_len = query.chars().count();
         let mut start = 0;
+        let mut char_offset_at_start: usize = 0;
         while let Some(pos) = search_text[start..].find(&search_query) {
             let byte_pos = start + pos;
-            let char_pos = text[..byte_pos].chars().count();
+            // Count chars only in the segment since last position (incremental, not O(n))
+            char_offset_at_start += text[start..byte_pos].chars().count();
+            let char_pos = char_offset_at_start;
             let line = self.rope.char_to_line(char_pos);
             let line_start = self.rope.line_to_char(line);
             let col = char_pos - line_start;
@@ -499,19 +448,234 @@ impl EditorState {
             matches.push(FindMatch {
                 line,
                 col,
-                length: query.chars().count(),
+                length: query_char_len,
             });
 
-            start = byte_pos + search_query.len();
+            let next_start = byte_pos + search_query.len();
+            char_offset_at_start += text[byte_pos..next_start].chars().count();
+            start = next_start;
         }
 
         matches
     }
 
-    // --- Internal ---
+    // --- Accessors ---
 
-    fn reparse(&mut self) {
-        let rope = &self.rope;
+    #[allow(dead_code)]
+    pub fn get_full_text(&self) -> String {
+        self.rope.to_string()
+    }
+
+    pub fn file_path(&self) -> &Path {
+        &self.file_path
+    }
+
+    pub fn file_path_str(&self) -> String {
+        self.file_path.display().to_string()
+    }
+
+    pub fn language(&self) -> Option<String> {
+        self.language.clone()
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn modified(&self) -> bool {
+        self.modified
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.rope.len_lines()
+    }
+
+    pub fn set_modified(&mut self, val: bool) {
+        self.modified = val;
+    }
+
+    /// Generate EditorContent for the frontend.
+    pub fn get_content(&self, ipc: &IpcHandle) -> EditorContent {
+        let lines: Vec<HighlightedLine> = (0..self.rope.len_lines())
+            .map(|i| {
+                let line_text = self.rope.line(i).to_string();
+                let line_text_trimmed = line_text.trim_end_matches('\n').to_string();
+
+                let tokens = if let Some(tree) = &self.tree {
+                    highlighting::highlight_line(tree, &self.rope, i)
+                } else {
+                    vec![]
+                };
+
+                HighlightedLine {
+                    text: line_text_trimmed,
+                    tokens,
+                }
+            })
+            .collect();
+
+        let uri = {
+            let p = self.file_path.display().to_string();
+            #[cfg(target_os = "windows")]
+            { format!("file:///{}", p.replace('\\', "/")) }
+            #[cfg(not(target_os = "windows"))]
+            { format!("file://{}", p) }
+        };
+        let diagnostics = ipc.get_diagnostics_for_uri(&uri);
+
+        EditorContent {
+            line_count: lines.len(),
+            lines,
+            file_path: Some(self.file_path.display().to_string()),
+            language: self.language.clone(),
+            modified: self.modified,
+            diagnostics,
+        }
+    }
+}
+
+// --- Workspace State ---
+
+/// Holds all open document buffers and a shared parser.
+pub struct WorkspaceState {
+    buffers: HashMap<PathBuf, DocumentBuffer>,
+    active_path: Option<PathBuf>,
+    parser: tree_sitter::Parser,
+}
+
+#[allow(dead_code)]
+impl WorkspaceState {
+    pub fn new() -> Self {
+        let mut parser = tree_sitter::Parser::new();
+        let _ = parser.set_language(&tree_sitter_javascript::LANGUAGE.into());
+
+        Self {
+            buffers: HashMap::new(),
+            active_path: None,
+            parser,
+        }
+    }
+
+    /// Open a file into a new buffer (or switch to it if already open).
+    /// Returns true if the buffer was newly created.
+    pub fn open_file(&mut self, path: &str) -> Result<bool> {
+        let canonical = PathBuf::from(path);
+
+        if self.buffers.contains_key(&canonical) {
+            // Already open — just switch to it
+            self.active_path = Some(canonical);
+            return Ok(false);
+        }
+
+        let metadata = fs::metadata(path).context("Failed to stat file")?;
+        if metadata.len() > MAX_FILE_SIZE {
+            anyhow::bail!(
+                "File too large ({:.1} MB, max {:.0} MB)",
+                metadata.len() as f64 / (1024.0 * 1024.0),
+                MAX_FILE_SIZE as f64 / (1024.0 * 1024.0)
+            );
+        }
+
+        let content = fs::read_to_string(path).context("Failed to read file")?;
+
+        let ext = canonical
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        self.set_language_from_ext(&ext);
+        let tree = self.parser.parse(&content, None);
+        if tree.is_none() {
+            log::warn!("Tree-sitter parse returned None for {}", path);
+        }
+
+        let language = Some(ext.clone());
+        let buffer = DocumentBuffer::new(canonical.clone(), &content, language, tree);
+
+        log::info!(
+            "Opened {} ({} lines, language: {})",
+            path,
+            buffer.line_count(),
+            ext
+        );
+
+        self.buffers.insert(canonical.clone(), buffer);
+        self.active_path = Some(canonical);
+        Ok(true)
+    }
+
+    /// Close a buffer. Returns the path of the new active buffer (if any).
+    pub fn close_buffer(&mut self, path: &Path) -> Option<PathBuf> {
+        self.buffers.remove(path);
+
+        if self.active_path.as_deref() == Some(path) {
+            // Switch to another open buffer (pick the first one)
+            self.active_path = self.buffers.keys().next().cloned();
+        }
+
+        self.active_path.clone()
+    }
+
+    /// Switch active buffer. Returns false if path not found in open buffers.
+    pub fn switch_buffer(&mut self, path: &Path) -> bool {
+        if self.buffers.contains_key(path) {
+            self.active_path = Some(path.to_path_buf());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Save the active buffer to disk.
+    pub fn save_active(&mut self) -> Result<()> {
+        let path = self
+            .active_path
+            .as_ref()
+            .context("No active buffer")?
+            .clone();
+        let buf = self
+            .buffers
+            .get_mut(&path)
+            .context("Active buffer not found")?;
+        fs::write(&buf.file_path, buf.rope.to_string()).context("Failed to write file")?;
+        buf.modified = false;
+        log::info!("Saved {}", buf.file_path.display());
+        Ok(())
+    }
+
+    /// Get a reference to the active buffer.
+    pub fn active(&self) -> Option<&DocumentBuffer> {
+        self.active_path.as_ref().and_then(|p| self.buffers.get(p))
+    }
+
+    /// Get a mutable reference to the active buffer.
+    pub fn active_mut(&mut self) -> Option<&mut DocumentBuffer> {
+        // Work around borrow checker
+        let path = self.active_path.clone();
+        path.and_then(move |p| self.buffers.get_mut(&p))
+    }
+
+    /// Reparse the active buffer using the shared parser.
+    pub fn reparse_active(&mut self) {
+        let path = match &self.active_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        // Set the correct language first (needs &mut self for parser)
+        let lang = self.buffers.get(&path).and_then(|b| b.language.clone());
+        if let Some(lang) = &lang {
+            self.set_language_from_ext(lang);
+        }
+
+        // Now borrow the buffer mutably for reparsing
+        let buf = match self.buffers.get_mut(&path) {
+            Some(b) => b,
+            None => return,
+        };
+
+        let rope = &buf.rope;
         let new_tree = self.parser.parse_with(
             &mut |byte_offset, _position| {
                 if byte_offset >= rope.len_bytes() {
@@ -520,12 +684,35 @@ impl EditorState {
                 let (chunk, chunk_start, _, _) = rope.chunk_at_byte(byte_offset);
                 &chunk[byte_offset - chunk_start..]
             },
-            self.tree.as_ref(),
+            buf.tree.as_ref(),
         );
         if new_tree.is_none() {
             log::warn!("Tree-sitter incremental parse returned None");
         }
-        self.tree = new_tree;
+        buf.tree = new_tree;
+    }
+
+    /// List all open buffers.
+    pub fn list_open_buffers(&self) -> Vec<BufferInfo> {
+        self.buffers
+            .values()
+            .map(|buf| BufferInfo {
+                path: buf.file_path.display().to_string(),
+                modified: buf.modified,
+                language: buf.language.clone(),
+                active: self.active_path.as_ref() == Some(&buf.file_path),
+            })
+            .collect()
+    }
+
+    /// Check if active path is set.
+    pub fn has_active(&self) -> bool {
+        self.active_path.is_some() && self.active().is_some()
+    }
+
+    /// Get active path as string.
+    pub fn active_path_str(&self) -> Option<String> {
+        self.active_path.as_ref().map(|p| p.display().to_string())
     }
 
     fn set_language_from_ext(&mut self, ext: &str) {
@@ -548,71 +735,70 @@ impl EditorState {
             "json" | "jsonc" => {
                 let _ = self.parser.set_language(&tree_sitter_json::LANGUAGE.into());
             }
+            "html" | "htm" => {
+                let _ = self.parser.set_language(&tree_sitter_html::LANGUAGE.into());
+            }
+            "css" | "scss" => {
+                let _ = self.parser.set_language(&tree_sitter_css::LANGUAGE.into());
+            }
+            "md" | "markdown" => {
+                let _ = self.parser.set_language(&tree_sitter_md::LANGUAGE.into());
+            }
             _ => {
-                self.tree = None;
+                // Unknown language — no tree-sitter support
             }
         }
     }
+}
 
-    pub fn get_content(&self, ipc: &IpcHandle) -> EditorContent {
-        let lines: Vec<HighlightedLine> = (0..self.rope.len_lines())
-            .map(|i| {
-                let line_text = self.rope.line(i).to_string();
-                let line_text_trimmed = line_text.trim_end_matches('\n').to_string();
+// --- Buffer info for frontend ---
 
-                let tokens = if let Some(tree) = &self.tree {
-                    highlighting::highlight_line(tree, &self.rope, i)
-                } else {
-                    vec![]
-                };
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BufferInfo {
+    pub path: String,
+    pub modified: bool,
+    pub language: Option<String>,
+    pub active: bool,
+}
 
-                HighlightedLine {
-                    text: line_text_trimmed,
-                    tokens,
-                }
-            })
-            .collect();
+// --- Directory reading for file explorer ---
 
-        let diagnostics = if let Some(path) = &self.file_path {
-            let uri = {
-                let p = path.display().to_string();
-                #[cfg(target_os = "windows")]
-                { format!("file:///{}", p.replace('\\', "/")) }
-                #[cfg(not(target_os = "windows"))]
-                { format!("file://{}", p) }
-            };
-            ipc.get_diagnostics_for_uri(&uri)
-        } else {
-            vec![]
-        };
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DirEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+}
 
-        EditorContent {
-            line_count: lines.len(),
-            lines,
-            file_path: self.file_path.as_ref().map(|p| p.display().to_string()),
-            language: self.language.clone(),
-            modified: self.modified,
-            diagnostics,
+pub fn read_directory(path: &str) -> Result<Vec<DirEntry>> {
+    let mut entries = Vec::new();
+    let dir = fs::read_dir(path).context("Failed to read directory")?;
+
+    for entry in dir {
+        let entry = entry.context("Failed to read directory entry")?;
+        let metadata = entry.metadata().context("Failed to stat entry")?;
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        // Skip hidden files/dirs (starting with .)
+        if name.starts_with('.') {
+            continue;
         }
+        // Skip common non-essential directories
+        if metadata.is_dir() && matches!(name.as_str(), "node_modules" | "target" | ".git" | "__pycache__" | "dist" | ".next") {
+            continue;
+        }
+
+        entries.push(DirEntry {
+            name,
+            path: entry.path().display().to_string(),
+            is_dir: metadata.is_dir(),
+        });
     }
 
-    pub fn get_full_text(&self) -> String {
-        self.rope.to_string()
-    }
+    // Sort: directories first, then alphabetically
+    entries.sort_by(|a, b| {
+        b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
 
-    pub fn file_path_str(&self) -> Option<String> {
-        self.file_path.as_ref().map(|p| p.display().to_string())
-    }
-
-    pub fn language(&self) -> Option<String> {
-        self.language.clone()
-    }
-
-    pub fn version(&self) -> u32 {
-        self.version
-    }
-
-    pub fn line_count(&self) -> usize {
-        self.rope.len_lines()
-    }
+    Ok(entries)
 }

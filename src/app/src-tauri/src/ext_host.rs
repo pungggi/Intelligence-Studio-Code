@@ -51,6 +51,9 @@ pub fn start_extension_host(_app: &AppHandle) -> Result<()> {
                     }
                     Err(e) => {
                         log::error!("Extension Host wait error: {}", e);
+                        // Force kill in case process is still running
+                        let _ = process.kill();
+                        let _ = process.wait();
                     }
                 }
             }

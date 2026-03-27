@@ -35,21 +35,26 @@ function activate(context) {
     }
   });
 
-  // Lint on text change with debounce
-  let lintTimer = null;
+  // Lint on text change with debounce (per-document timers)
+  const lintTimers = new Map();
   vscode.workspace.onDidChangeTextDocument((event) => {
     if (isLintable(event.document)) {
-      if (lintTimer) clearTimeout(lintTimer);
+      const uri = event.document.uri;
+      if (lintTimers.has(uri)) clearTimeout(lintTimers.get(uri));
       const doc = event.document;
-      lintTimer = setTimeout(() => {
-        lintTimer = null;
+      lintTimers.set(uri, setTimeout(() => {
+        lintTimers.delete(uri);
         lintDocument(doc);
-      }, 300);
+      }, 300));
     }
   });
 
-  // Lint on close — clear diagnostics
+  // Lint on close — clear diagnostics and pending timers
   vscode.workspace.onDidCloseTextDocument((doc) => {
+    if (lintTimers.has(doc.uri)) {
+      clearTimeout(lintTimers.get(doc.uri));
+      lintTimers.delete(doc.uri);
+    }
     diagnosticCollection.delete(doc.uri);
   });
 

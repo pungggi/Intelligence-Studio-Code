@@ -1,23 +1,33 @@
 /**
- * CoreCode M4 — Editor Frontend (Complete)
+ * CoreCode M5 — Multi-file Editor Frontend
  *
- * Features:
+ * Features carried from M4:
  * - Text editing with syntax highlighting
  * - Diagnostics display (underlines + gutter markers)
  * - Command palette (Ctrl+Shift+P)
- * - Extension Host status
- * - Undo/Redo (Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y)
- * - Selection (Shift+Arrow, Ctrl+A, click-drag, Shift+click)
- * - Clipboard (Ctrl+C / Ctrl+X / Ctrl+V)
- * - Find/Replace (Ctrl+F / Ctrl+H)
- * - Extension status bar items
- * - Output panel (Ctrl+`)
+ * - Undo/Redo, Selection, Clipboard, Find/Replace
+ * - Extension status bar items, Output panel
+ *
+ * New in M5:
+ * - Tab bar with open/close/switch, modified indicator, Ctrl+Tab cycling
+ * - File explorer sidebar (Ctrl+B toggle)
+ * - Multi-document state (per-buffer cursor, selection)
+ * - Minimap (scrollbar-side overview)
  */
 
 const { invoke } = window.__TAURI__.core;
 
-// ─── State ───────────────────────────────────────────────────
+// ─── Multi-buffer State ─────────────────────────────────────
 
+/**
+ * Per-buffer state stored in the frontend.
+ * Keys are canonical file paths (strings).
+ * @type {Map<string, {cursorLine: number, cursorCol: number, selAnchorLine: number|null, selAnchorCol: number|null, scrollTop: number}>}
+ */
+const bufferStates = new Map();
+let activeBufferPath = null;
+
+// Current active buffer's state (synced with bufferStates on switch)
 let cursorLine = 0;
 let cursorCol = 0;
 let lines = [];
@@ -46,6 +56,11 @@ let outputOpen = false;
 let outputAllLines = [];
 let outputSelectedChannel = '';
 
+// File explorer
+let sidebarOpen = false;
+let explorerRoot = null;
+let expandedDirs = new Set();
+
 // ─── DOM References ──────────────────────────────────────────
 
 const editorEl = document.getElementById('editor');
@@ -62,6 +77,15 @@ const paletteInputEl = document.getElementById('palette-input');
 const paletteListEl = document.getElementById('palette-list');
 const paletteBackdropEl = document.getElementById('palette-backdrop');
 const extStatusBarEl = document.getElementById('ext-status-bar-items');
+
+// Tab bar
+const tabBarEl = document.getElementById('tab-bar');
+const tabsEl = document.getElementById('tabs');
+
+// Sidebar
+const sidebarEl = document.getElementById('sidebar');
+const sidebarCloseBtn = document.getElementById('sidebar-close');
+const fileTreeEl = document.getElementById('file-tree');
 
 // Find bar
 const findBarEl = document.getElementById('find-bar');
@@ -83,6 +107,132 @@ const outputChannelSelect = document.getElementById('output-channel-select');
 const outputClearBtn = document.getElementById('output-clear');
 const outputCloseBtn = document.getElementById('output-close');
 const outputContentEl = document.getElementById('output-content');
+
+// Minimap
+const minimapEl = document.getElementById('minimap');
+const minimapCanvas = document.getElementById('minimap-canvas');
+const minimapViewport = document.getElementById('minimap-viewport');
+
+// ─── Buffer State Management ─────────────────────────────────
+
+function saveBufferState() {
+  if (!activeBufferPath) return;
+  bufferStates.set(activeBufferPath, {
+    cursorLine,
+    cursorCol,
+    selAnchorLine,
+    selAnchorCol,
+    scrollTop: editorEl.scrollTop,
+  });
+}
+
+function restoreBufferState(path) {
+  const state = bufferStates.get(path);
+  if (state) {
+    cursorLine = state.cursorLine;
+    cursorCol = state.cursorCol;
+    selAnchorLine = state.selAnchorLine;
+    selAnchorCol = state.selAnchorCol;
+    // scrollTop restored after render
+  } else {
+    cursorLine = 0;
+    cursorCol = 0;
+    selAnchorLine = null;
+    selAnchorCol = null;
+  }
+}
+
+// ─── Tab Bar ──────────────────────────────────────────────────
+
+async function renderTabs() {
+  try {
+    const buffers = await invoke('list_open_buffers');
+    tabsEl.innerHTML = '';
+
+    if (buffers.length === 0) {
+      const hint = document.createElement('div');
+      hint.className = 'tab-empty-hint';
+      hint.textContent = 'No files open — Ctrl+O to open';
+      tabsEl.appendChild(hint);
+      return;
+    }
+
+    for (const buf of buffers) {
+      const tab = document.createElement('div');
+      tab.className = 'tab' + (buf.active ? ' active' : '');
+      tab.dataset.path = buf.path;
+
+      const name = buf.path.split(/[/\\]/).pop();
+
+      if (buf.modified) {
+        const dot = document.createElement('span');
+        dot.className = 'tab-modified';
+        dot.textContent = '●';
+        tab.appendChild(dot);
+      }
+
+      const label = document.createElement('span');
+      label.className = 'tab-label';
+      label.textContent = name;
+      label.title = buf.path;
+      tab.appendChild(label);
+
+      const close = document.createElement('button');
+      close.className = 'tab-close';
+      close.textContent = '×';
+      close.title = 'Close';
+      close.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeTab(buf.path);
+      });
+      tab.appendChild(close);
+
+      tab.addEventListener('click', () => switchTab(buf.path));
+      tabsEl.appendChild(tab);
+    }
+  } catch (err) {
+    console.error('renderTabs error:', err);
+  }
+}
+
+async function switchTab(path) {
+  if (path === activeBufferPath) return;
+  try {
+    saveBufferState();
+    const content = await invoke('switch_buffer', { path });
+    activeBufferPath = path;
+    restoreBufferState(path);
+    renderContent(content);
+    renderTabs();
+    const scrollState = bufferStates.get(path);
+    if (scrollState) editorEl.scrollTop = scrollState.scrollTop;
+  } catch (err) {
+    console.error('switchTab error:', err);
+    statusEl.textContent = `Error: ${err}`;
+  }
+}
+
+async function closeTab(path) {
+  try {
+    bufferStates.delete(path);
+    const result = await invoke('close_buffer', { path });
+    if (result) {
+      activeBufferPath = result.file_path;
+      restoreBufferState(activeBufferPath);
+      renderContent(result);
+    } else {
+      activeBufferPath = null;
+      cursorLine = 0;
+      cursorCol = 0;
+      clearSelection();
+      const content = await invoke('get_content');
+      renderContent(content);
+    }
+    renderTabs();
+  } catch (err) {
+    console.error('closeTab error:', err);
+  }
+}
 
 // ─── Selection Helpers ───────────────────────────────────────
 
@@ -147,6 +297,7 @@ function renderContent(content) {
   diagnostics = content.diagnostics || [];
 
   if (filePath) {
+    activeBufferPath = filePath;
     const name = filePath.split(/[/\\]/).pop();
     fileNameEl.textContent = (modified ? '● ' : '') + name;
   } else {
@@ -184,8 +335,9 @@ function renderContent(content) {
     diagsByLine.get(d.line).push(d);
   }
 
-  editorEl.innerHTML = '';
-  gutterEl.innerHTML = '';
+  // Build DOM in fragments for a single reflow instead of N reflows
+  const editorFrag = document.createDocumentFragment();
+  const gutterFrag = document.createDocumentFragment();
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -199,7 +351,7 @@ function renderContent(content) {
       gutterLine.classList.add('gutter-warning');
     }
     gutterLine.textContent = String(i + 1);
-    gutterEl.appendChild(gutterLine);
+    gutterFrag.appendChild(gutterLine);
 
     const editorLine = document.createElement('div');
     editorLine.className = 'line';
@@ -213,13 +365,19 @@ function renderContent(content) {
       editorLine.textContent = line.text || '';
     }
 
-    editorEl.appendChild(editorLine);
+    editorFrag.appendChild(editorLine);
   }
+
+  editorEl.innerHTML = '';
+  gutterEl.innerHTML = '';
+  editorEl.appendChild(editorFrag);
+  gutterEl.appendChild(gutterFrag);
 
   renderCursor();
   renderSelection();
   renderFindHighlights();
   updateStatusBar();
+  renderMinimap();
 }
 
 function applyTokensAndDiags(text, tokens, diags) {
@@ -310,7 +468,6 @@ function renderSelection() {
     const colStart = (i === sel.startLine) ? sel.startCol : 0;
     let colEnd = (i === sel.endLine) ? sel.endCol : lineLen;
 
-    // For intermediate lines, extend past EOL to visualize the newline
     if (i !== sel.endLine) colEnd = Math.max(colEnd, lineLen) + 1;
 
     if (colStart >= colEnd) continue;
@@ -386,6 +543,203 @@ function updateStatusBar() {
   cursorPosEl.textContent = pos;
 }
 
+// ─── Minimap ──────────────────────────────────────────────────
+
+function renderMinimap() {
+  if (lines.length < 50) {
+    minimapEl.classList.add('minimap-hidden');
+    return;
+  }
+  minimapEl.classList.remove('minimap-hidden');
+
+  const scale = 2;
+  const lineH = scale;
+  const width = 80;
+  const height = Math.min(lines.length * lineH, editorEl.clientHeight);
+
+  minimapCanvas.width = width;
+  minimapCanvas.height = height;
+  const ctx = minimapCanvas.getContext('2d');
+  ctx.clearRect(0, 0, width, height);
+
+  const ratio = height / (lines.length * lineH);
+
+  for (let i = 0; i < lines.length; i++) {
+    const text = lines[i]?.text || '';
+    const y = Math.floor(i * lineH * ratio);
+    if (y >= height) break;
+
+    // Draw a thin representation of text
+    const indent = text.length - text.trimStart().length;
+    const textLen = Math.min(text.trim().length, 60);
+    if (textLen > 0) {
+      ctx.fillStyle = 'rgba(205, 214, 244, 0.3)';
+      ctx.fillRect(indent * 0.8, y, textLen * 0.8, Math.max(lineH * ratio, 1));
+    }
+  }
+
+  // Viewport indicator
+  const computedLH = parseFloat(getComputedStyle(editorEl).lineHeight);
+  const lineHeightPx = Number.isNaN(computedLH)
+    ? parseFloat(getComputedStyle(editorEl).fontSize) * 1.5
+    : computedLH;
+  const totalH = lines.length * lineHeightPx;
+  const vpFraction = editorEl.clientHeight / totalH;
+  const vpTop = (editorEl.scrollTop / totalH) * height;
+  const vpH = Math.max(vpFraction * height, 10);
+
+  minimapViewport.style.top = `${vpTop}px`;
+  minimapViewport.style.height = `${vpH}px`;
+}
+
+editorEl.addEventListener('scroll', () => {
+  renderMinimap();
+});
+
+// ─── File Explorer ────────────────────────────────────────────
+
+function toggleSidebar() {
+  sidebarOpen = !sidebarOpen;
+  if (sidebarOpen) {
+    sidebarEl.classList.remove('sidebar-hidden');
+    if (!explorerRoot) {
+      // Ask user to open a folder
+      openFolderDialog();
+    }
+  } else {
+    sidebarEl.classList.add('sidebar-hidden');
+  }
+}
+
+function closeSidebar() {
+  sidebarOpen = false;
+  sidebarEl.classList.add('sidebar-hidden');
+}
+
+sidebarCloseBtn.addEventListener('click', closeSidebar);
+
+async function openFolderDialog() {
+  try {
+    const result = await window.__TAURI__.dialog.open({
+      directory: true,
+      multiple: false,
+      title: 'Open Folder',
+    });
+    if (result) {
+      explorerRoot = result;
+      document.getElementById('sidebar-title').textContent = result.split(/[/\\]/).pop() || 'Explorer';
+      expandedDirs.clear();
+      expandedDirs.add(result);
+      await renderFileTree();
+    }
+  } catch (err) {
+    console.error('Open folder error:', err);
+  }
+}
+
+async function renderFileTree() {
+  if (!explorerRoot) return;
+  fileTreeEl.innerHTML = '';
+  await renderDirContents(explorerRoot, 0, fileTreeEl);
+}
+
+async function renderDirContents(dirPath, depth, parentEl) {
+  try {
+    const entries = await invoke('read_directory', { path: dirPath });
+    for (const entry of entries) {
+      const item = document.createElement('div');
+      item.className = 'tree-item';
+      if (entry.path === activeBufferPath) item.classList.add('active');
+
+      // Indent
+      if (depth > 0) {
+        const indent = document.createElement('span');
+        indent.className = 'tree-indent';
+        indent.style.width = `${depth * 16}px`;
+        item.appendChild(indent);
+      }
+
+      const icon = document.createElement('span');
+      icon.className = 'tree-icon';
+
+      const name = document.createElement('span');
+      name.className = 'tree-name';
+      name.textContent = entry.name;
+
+      if (entry.is_dir) {
+        const isExpanded = expandedDirs.has(entry.path);
+        icon.classList.add('folder');
+        icon.textContent = isExpanded ? '▾' : '▸';
+
+        item.appendChild(icon);
+        item.appendChild(name);
+        item.addEventListener('click', async () => {
+          if (expandedDirs.has(entry.path)) {
+            expandedDirs.delete(entry.path);
+          } else {
+            expandedDirs.add(entry.path);
+          }
+          await renderFileTree();
+        });
+        parentEl.appendChild(item);
+
+        if (isExpanded) {
+          await renderDirContents(entry.path, depth + 1, parentEl);
+        }
+      } else {
+        icon.classList.add('file');
+        icon.textContent = getFileIcon(entry.name);
+        item.appendChild(icon);
+        item.appendChild(name);
+        item.addEventListener('click', () => openFileFromExplorer(entry.path));
+        parentEl.appendChild(item);
+      }
+    }
+  } catch (err) {
+    console.error('renderDirContents error:', err);
+  }
+}
+
+function getFileIcon(name) {
+  const ext = name.split('.').pop()?.toLowerCase();
+  switch (ext) {
+    case 'js': case 'jsx': case 'mjs': return '◆';
+    case 'ts': case 'tsx': return '◇';
+    case 'rs': return '⚙';
+    case 'py': return '⬡';
+    case 'json': return '{ }';
+    case 'html': case 'htm': return '◈';
+    case 'css': case 'scss': return '◉';
+    case 'md': return '¶';
+    default: return '○';
+  }
+}
+
+async function openFileFromExplorer(path) {
+  try {
+    saveBufferState();
+    statusEl.textContent = 'Opening...';
+    const content = await invoke('open_file', { path });
+    activeBufferPath = content.file_path;
+    restoreBufferState(activeBufferPath);
+    if (!bufferStates.has(activeBufferPath)) {
+      cursorLine = 0;
+      cursorCol = 0;
+      clearSelection();
+    }
+    findMatches = [];
+    findCurrentIdx = -1;
+    renderContent(content);
+    renderTabs();
+    renderFileTree();
+    statusEl.textContent = '';
+    editorEl.focus();
+  } catch (err) {
+    console.error('Open file error:', err);
+    statusEl.textContent = `Error: ${err}`;
+  }
+}
+
 // ─── Command Palette ─────────────────────────────────────────
 
 function openPalette() {
@@ -395,6 +749,11 @@ function openPalette() {
   paletteSelectedIndex = 0;
   invoke('list_commands').then(cmds => {
     paletteCommands = cmds || [];
+    filterPalette('');
+    paletteInputEl.focus();
+  }).catch(err => {
+    console.error('Failed to list commands:', err);
+    paletteCommands = [];
     filterPalette('');
     paletteInputEl.focus();
   });
@@ -413,7 +772,10 @@ function filterPalette(query) {
     : paletteCommands.slice();
   const builtins = [
     { label: 'Open File', command: '__builtin:open' },
+    { label: 'Open Folder', command: '__builtin:openFolder' },
     { label: 'Save File', command: '__builtin:save' },
+    { label: 'Toggle Sidebar', command: '__builtin:toggleSidebar' },
+    { label: 'Close Tab', command: '__builtin:closeTab' },
   ].filter(b => !q || b.label.toLowerCase().includes(q));
   renderPaletteList(builtins);
 }
@@ -423,7 +785,11 @@ function renderPaletteList(builtins) {
   for (let i = 0; i < builtins.length; i++) {
     const item = document.createElement('div');
     item.className = 'palette-item' + (i === paletteSelectedIndex ? ' selected' : '');
-    item.innerHTML = `<span class="palette-label">Built-in</span>${escapeHtml(builtins[i].label)}`;
+    const badge = document.createElement('span');
+    badge.className = 'palette-label';
+    badge.textContent = 'Built-in';
+    item.appendChild(badge);
+    item.appendChild(document.createTextNode(builtins[i].label));
     const cmd = builtins[i].command;
     item.addEventListener('click', () => executePaletteCommand(cmd));
     paletteListEl.appendChild(item);
@@ -432,7 +798,11 @@ function renderPaletteList(builtins) {
     const idx = builtins.length + i;
     const item = document.createElement('div');
     item.className = 'palette-item' + (idx === paletteSelectedIndex ? ' selected' : '');
-    item.innerHTML = `<span class="palette-label">Extension</span>${escapeHtml(paletteFiltered[i])}`;
+    const badge = document.createElement('span');
+    badge.className = 'palette-label';
+    badge.textContent = 'Extension';
+    item.appendChild(badge);
+    item.appendChild(document.createTextNode(paletteFiltered[i]));
     const cmd = paletteFiltered[i];
     item.addEventListener('click', () => executePaletteCommand(cmd));
     paletteListEl.appendChild(item);
@@ -449,8 +819,15 @@ async function executePaletteCommand(command) {
   closePalette();
   if (command === '__builtin:open') {
     await openFileDialog();
+  } else if (command === '__builtin:openFolder') {
+    if (!sidebarOpen) toggleSidebar();
+    else await openFolderDialog();
   } else if (command === '__builtin:save') {
     await saveFile();
+  } else if (command === '__builtin:toggleSidebar') {
+    toggleSidebar();
+  } else if (command === '__builtin:closeTab') {
+    if (activeBufferPath) await closeTab(activeBufferPath);
   } else {
     await invoke('execute_command', { command });
     setTimeout(refreshDiagnostics, 500);
@@ -520,10 +897,31 @@ document.addEventListener('keydown', async (e) => {
       replaceOne();
       return;
     }
-    return; // let find inputs handle their own typing
+    return;
   }
 
-  // ── Global shortcuts (work regardless of editor focus) ──
+  // ── Global shortcuts ──
+
+  // Ctrl+B: Toggle sidebar
+  if (e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'b') {
+    e.preventDefault();
+    toggleSidebar();
+    return;
+  }
+
+  // Ctrl+Tab / Ctrl+Shift+Tab: Cycle tabs
+  if (e.ctrlKey && e.key === 'Tab') {
+    e.preventDefault();
+    await cycleTab(e.shiftKey ? -1 : 1);
+    return;
+  }
+
+  // Ctrl+W: Close current tab
+  if (e.ctrlKey && e.key.toLowerCase() === 'w') {
+    e.preventDefault();
+    if (activeBufferPath) await closeTab(activeBufferPath);
+    return;
+  }
 
   if (e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'f') {
     e.preventDefault();
@@ -625,6 +1023,11 @@ document.addEventListener('keydown', async (e) => {
     try {
       const clipText = await navigator.clipboard.readText();
       if (!clipText) return;
+      const MAX_PASTE_SIZE = 1024 * 1024; // 1 MB, matches backend MAX_INSERT_SIZE
+      if (clipText.length > MAX_PASTE_SIZE) {
+        statusEl.textContent = `Paste too large (${(clipText.length / 1024 / 1024).toFixed(1)} MB, max 1 MB)`;
+        return;
+      }
 
       let startLine, startCol;
       if (hasSelection()) {
@@ -876,6 +1279,21 @@ function setCursorAfterInsert(startLine, startCol, text) {
   }
 }
 
+// ─── Tab Cycling ──────────────────────────────────────────────
+
+async function cycleTab(direction) {
+  try {
+    const buffers = await invoke('list_open_buffers');
+    if (buffers.length < 2) return;
+
+    const currentIdx = buffers.findIndex(b => b.active);
+    let nextIdx = (currentIdx + direction + buffers.length) % buffers.length;
+    await switchTab(buffers[nextIdx].path);
+  } catch (err) {
+    console.error('cycleTab error:', err);
+  }
+}
+
 // ─── Mouse (click + drag selection) ─────────────────────────
 
 editorEl.addEventListener('mousedown', (e) => {
@@ -926,19 +1344,26 @@ async function openFileDialog() {
     const result = await window.__TAURI__.dialog.open({
       multiple: false,
       filters: [
-        { name: 'Code', extensions: ['js', 'ts', 'rs', 'py', 'jsx', 'tsx', 'json', 'html', 'css', 'md', 'txt'] },
+        { name: 'Code', extensions: ['js', 'ts', 'rs', 'py', 'jsx', 'tsx', 'json', 'html', 'css', 'md', 'txt', 'scss'] },
         { name: 'All', extensions: ['*'] }
       ]
     });
     if (result) {
+      saveBufferState();
       statusEl.textContent = 'Opening...';
       const content = await invoke('open_file', { path: result });
-      cursorLine = 0;
-      cursorCol = 0;
-      clearSelection();
+      activeBufferPath = content.file_path;
+      if (!bufferStates.has(activeBufferPath)) {
+        cursorLine = 0;
+        cursorCol = 0;
+        clearSelection();
+      } else {
+        restoreBufferState(activeBufferPath);
+      }
       findMatches = [];
       findCurrentIdx = -1;
       renderContent(content);
+      renderTabs();
       statusEl.textContent = '';
     }
   } catch (err) {
@@ -953,6 +1378,7 @@ async function saveFile() {
     await invoke('save_file');
     const content = await invoke('get_content');
     renderContent(content);
+    renderTabs();
     statusEl.textContent = 'Saved';
     setTimeout(() => { statusEl.textContent = ''; }, 2000);
   } catch (err) {
@@ -968,7 +1394,6 @@ function openFindBar(withReplace) {
   findBarEl.classList.remove('find-hidden');
   if (withReplace) replaceRowEl.classList.remove('find-hidden');
 
-  // Pre-fill from selection if single-line
   if (hasSelection()) {
     const sel = getSelectionRange();
     if (sel.startLine === sel.endLine) {
@@ -1004,7 +1429,6 @@ async function runFind() {
   const caseSensitive = findCaseEl.checked;
   findMatches = await invoke('find_in_file', { query, caseSensitive });
   if (findMatches.length > 0) {
-    // Find match closest to (or after) cursor
     findCurrentIdx = 0;
     for (let i = 0; i < findMatches.length; i++) {
       const m = findMatches[i];
@@ -1036,7 +1460,6 @@ function findPrev() {
 function scrollToMatch() {
   if (findCurrentIdx < 0 || findCurrentIdx >= findMatches.length) return;
   const m = findMatches[findCurrentIdx];
-  // Select the match
   selAnchorLine = m.line;
   selAnchorCol = m.col;
   cursorLine = m.line;
@@ -1075,7 +1498,6 @@ async function replaceAll() {
   renderFindHighlights();
 }
 
-// Find bar event listeners
 findInputEl.addEventListener('input', () => runFind());
 findCaseEl.addEventListener('change', () => runFind());
 findPrevBtn.addEventListener('click', findPrev);
@@ -1286,11 +1708,15 @@ function handleQuickPick(req) {
     for (let i = 0; i < filtered.length; i++) {
       const item = document.createElement('div');
       item.className = 'palette-item' + (i === paletteSelectedIndex ? ' selected' : '');
-      let html = escapeHtml(filtered[i].label || '');
+      const labelSpan = document.createElement('span');
+      labelSpan.textContent = filtered[i].label || '';
+      item.appendChild(labelSpan);
       if (filtered[i].description) {
-        html += ` <span style="color: var(--fg-dim)">${escapeHtml(filtered[i].description)}</span>`;
+        const descSpan = document.createElement('span');
+        descSpan.style.color = 'var(--fg-dim)';
+        descSpan.textContent = ' ' + filtered[i].description;
+        item.appendChild(descSpan);
       }
-      item.innerHTML = html;
       const idx = i;
       item.addEventListener('click', () => {
         closePaletteAndRespond(req.request_id, filtered[idx].label);
@@ -1329,20 +1755,20 @@ function handleQuickPick(req) {
     closePaletteAndRespond(req.request_id, null);
   }
 
+  // Use AbortController to cleanly remove all temporary listeners at once
+  const qpAbort = new AbortController();
   paletteInputEl.removeEventListener('input', paletteInputHandler);
   paletteInputEl.removeEventListener('keydown', paletteKeydownHandler);
   paletteBackdropEl.removeEventListener('click', closePalette);
-  paletteInputEl.addEventListener('input', onQuickPickInput);
-  paletteInputEl.addEventListener('keydown', onQuickPickKeydown);
-  paletteBackdropEl.addEventListener('click', onQuickPickBackdropClick);
+  paletteInputEl.addEventListener('input', onQuickPickInput, { signal: qpAbort.signal });
+  paletteInputEl.addEventListener('keydown', onQuickPickKeydown, { signal: qpAbort.signal });
+  paletteBackdropEl.addEventListener('click', onQuickPickBackdropClick, { signal: qpAbort.signal });
 
   function closePaletteAndRespond(requestId, value) {
     paletteOpen = false;
     paletteEl.classList.add('palette-hidden');
     paletteInputEl.placeholder = 'Type a command...';
-    paletteInputEl.removeEventListener('input', onQuickPickInput);
-    paletteInputEl.removeEventListener('keydown', onQuickPickKeydown);
-    paletteBackdropEl.removeEventListener('click', onQuickPickBackdropClick);
+    qpAbort.abort(); // Remove all temporary listeners at once
     paletteInputEl.addEventListener('input', paletteInputHandler);
     paletteInputEl.addEventListener('keydown', paletteKeydownHandler);
     paletteBackdropEl.addEventListener('click', closePalette);
@@ -1383,18 +1809,19 @@ function handleInputBox(req) {
     closeInputAndRespond(req.request_id, null);
   }
 
+  // Use AbortController to cleanly remove all temporary listeners at once
+  const ibAbort = new AbortController();
   paletteInputEl.removeEventListener('input', paletteInputHandler);
   paletteInputEl.removeEventListener('keydown', paletteKeydownHandler);
   paletteBackdropEl.removeEventListener('click', closePalette);
-  paletteInputEl.addEventListener('keydown', onInputBoxKeydown);
-  paletteBackdropEl.addEventListener('click', onInputBoxBackdropClick);
+  paletteInputEl.addEventListener('keydown', onInputBoxKeydown, { signal: ibAbort.signal });
+  paletteBackdropEl.addEventListener('click', onInputBoxBackdropClick, { signal: ibAbort.signal });
 
   function closeInputAndRespond(requestId, value) {
     paletteOpen = false;
     paletteEl.classList.add('palette-hidden');
     paletteInputEl.placeholder = 'Type a command...';
-    paletteInputEl.removeEventListener('keydown', onInputBoxKeydown);
-    paletteBackdropEl.removeEventListener('click', onInputBoxBackdropClick);
+    ibAbort.abort(); // Remove all temporary listeners at once
     paletteInputEl.addEventListener('input', paletteInputHandler);
     paletteInputEl.addEventListener('keydown', paletteKeydownHandler);
     paletteBackdropEl.addEventListener('click', closePalette);
@@ -1409,23 +1836,28 @@ const uiReqInterval = setInterval(pollUiRequests, 500);
 
 // ─── Cleanup ─────────────────────────────────────────────────
 
+// Track all polling intervals so they can be cleaned up on reload
+const _ccIntervals = [statusBarInterval, outputInterval, diagnosticsInterval, extHostInterval, notifInterval, uiReqInterval];
+
 window.addEventListener('beforeunload', () => {
-  clearInterval(diagnosticsInterval);
-  clearInterval(extHostInterval);
-  clearInterval(notifInterval);
-  clearInterval(uiReqInterval);
-  clearInterval(statusBarInterval);
-  clearInterval(outputInterval);
+  _ccIntervals.forEach(id => clearInterval(id));
 });
 
 // ─── Init ────────────────────────────────────────────────────
 
 async function init() {
+  // Clear stale intervals from previous hot-reload (beforeunload may not fire in Tauri)
+  if (window._ccPrevIntervals) {
+    window._ccPrevIntervals.forEach(id => clearInterval(id));
+  }
+  window._ccPrevIntervals = _ccIntervals;
+
   try {
     const content = await invoke('get_content');
     renderContent(content);
+    renderTabs();
     editorEl.focus();
-    statusEl.textContent = 'Ready — Ctrl+O to open, Ctrl+Shift+P for commands';
+    statusEl.textContent = 'Ready — Ctrl+O to open file, Ctrl+B for explorer, Ctrl+Shift+P for commands';
     pollExtHostStatus();
     pollStatusBarItems();
   } catch (err) {

@@ -117,6 +117,12 @@ export class ExtensionLoader {
           err instanceof Error ? err.message : String(err);
         this.activationErrors.set(id, msg);
         console.error(`[ExtLoader] Failed to activate ${id}:`, err);
+        // Notify frontend of activation failure via showMessage
+        try {
+          this.apiShim.createVscodeApi().window.showErrorMessage(
+            `Extension ${id} failed to activate: ${msg}`
+          );
+        } catch { /* ignore send failure */ }
       }
     }
   }
@@ -180,8 +186,14 @@ export class ExtensionLoader {
         exports: vscodeApi,
       } as NodeJS.Module;
 
-      // Load the extension module
-      const mod = require(mainPath);
+      // Load the extension module, then restore the global monkeypatch
+      let mod: { activate?: (ctx: unknown) => unknown; deactivate?: () => void };
+      try {
+        mod = require(mainPath);
+      } finally {
+        // Always restore the original resolver to avoid global pollution
+        Module._resolveFilename = originalResolve;
+      }
       ext.module = mod;
 
       // Create extension context

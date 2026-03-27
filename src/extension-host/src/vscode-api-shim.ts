@@ -122,7 +122,8 @@ export class Uri {
     try {
       const url = new URL(value);
       return new Uri(url.protocol.replace(":", ""), url.hostname, url.pathname, url.search, url.hash);
-    } catch {
+    } catch (e) {
+      console.warn(`[Uri] Failed to parse '${value}', treating as file path:`, e);
       return new Uri("file", "", value, "", "");
     }
   }
@@ -274,6 +275,38 @@ export interface TextEditorDecorationType {
   dispose(): void;
 }
 
+// --- TreeView API (M5) ---
+
+export interface TreeItem {
+  label: string;
+  description?: string;
+  tooltip?: string;
+  collapsibleState?: TreeItemCollapsibleState;
+  command?: { command: string; title: string; arguments?: unknown[] };
+  iconPath?: string | Uri;
+  contextValue?: string;
+}
+
+export enum TreeItemCollapsibleState {
+  None = 0,
+  Collapsed = 1,
+  Expanded = 2,
+}
+
+export interface TreeDataProvider<T> {
+  getTreeItem(element: T): TreeItem | Promise<TreeItem>;
+  getChildren(element?: T): T[] | Promise<T[]>;
+  onDidChangeTreeData?: EventEmitter<T | undefined | null | void>['event'];
+}
+
+export interface TreeView<T> {
+  readonly onDidExpandElement: EventEmitter<{ element: T }>['event'];
+  readonly onDidCollapseElement: EventEmitter<{ element: T }>['event'];
+  readonly onDidChangeSelection: EventEmitter<{ selection: T[] }>['event'];
+  reveal(element: T): Promise<void>;
+  dispose(): void;
+}
+
 // --- Configuration ---
 
 interface ConfigurationSection {
@@ -297,6 +330,7 @@ export class VscodeApiShim {
 
   private configDefaults = new Map<string, unknown>();
   private configOverrides = new Map<string, unknown>();
+  private treeDataProviders = new Map<string, TreeDataProvider<unknown>>();
 
   private pendingUiRequests = new Map<
     string,
@@ -775,6 +809,40 @@ export class VscodeApiShim {
           },
         };
       },
+
+      // M5: TreeView API
+      createTreeView<T>(viewId: string, options: { treeDataProvider: TreeDataProvider<T> }): TreeView<T> {
+        const expandEmitter = new EventEmitter<{ element: T }>();
+        const collapseEmitter = new EventEmitter<{ element: T }>();
+        const selectionEmitter = new EventEmitter<{ selection: T[] }>();
+
+        // Register the provider for later use
+        self.treeDataProviders.set(viewId, options.treeDataProvider as TreeDataProvider<unknown>);
+
+        console.log(`[ApiShim] TreeView registered: ${viewId}`);
+
+        return {
+          onDidExpandElement: expandEmitter.event,
+          onDidCollapseElement: collapseEmitter.event,
+          onDidChangeSelection: selectionEmitter.event,
+          async reveal(_element: T) {
+            // Stub — frontend will handle tree reveal
+          },
+          dispose() {
+            self.treeDataProviders.delete(viewId);
+          },
+        };
+      },
+
+      registerTreeDataProvider<T>(viewId: string, provider: TreeDataProvider<T>): { dispose(): void } {
+        self.treeDataProviders.set(viewId, provider as TreeDataProvider<unknown>);
+        console.log(`[ApiShim] TreeDataProvider registered: ${viewId}`);
+        return {
+          dispose() {
+            self.treeDataProviders.delete(viewId);
+          },
+        };
+      },
     };
   }
 
@@ -799,6 +867,7 @@ export class VscodeApiShim {
       window: this.window,
       DiagnosticSeverity: this.DiagnosticSeverity,
       StatusBarAlignment: this.StatusBarAlignment,
+      TreeItemCollapsibleState,
       Uri,
       Position,
       Range,
