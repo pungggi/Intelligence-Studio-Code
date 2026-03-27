@@ -7,6 +7,17 @@
  * - vscode.window.createTextEditorDecorationType
  * - vscode.Uri
  * - vscode.Range / vscode.Position
+ *
+ * M6 adds:
+ * - vscode.languages.registerCompletionItemProvider
+ * - vscode.languages.registerHoverProvider
+ * - vscode.languages.registerDefinitionProvider
+ * - vscode.languages.registerReferenceProvider
+ * - vscode.languages.registerCodeActionProvider
+ * - vscode.languages.registerSignatureHelpProvider
+ * - vscode.languages.registerDocumentSymbolProvider
+ * - vscode.languages.registerDocumentFormattingEditProvider
+ * - LSP request/response handling via lsp/request and lsp/response IPC messages
  */
 
 import type { IpcMessage } from "./ipc-server";
@@ -307,6 +318,142 @@ export interface TreeView<T> {
   dispose(): void;
 }
 
+// --- M6: LSP Provider Types ---
+
+export enum CompletionItemKind {
+  Text = 0, Method = 1, Function = 2, Constructor = 3, Field = 4,
+  Variable = 5, Class = 6, Interface = 7, Module = 8, Property = 9,
+  Unit = 10, Value = 11, Enum = 12, Keyword = 13, Snippet = 14,
+  Color = 15, File = 16, Reference = 17, Folder = 18, EnumMember = 19,
+  Constant = 20, Struct = 21, Event = 22, Operator = 23, TypeParameter = 24,
+}
+
+export enum CompletionTriggerKind {
+  Invoke = 0,
+  TriggerCharacter = 1,
+  TriggerForIncompleteCompletions = 2,
+}
+
+export interface CompletionItem {
+  label: string | { label: string; detail?: string; description?: string };
+  kind?: CompletionItemKind;
+  detail?: string;
+  documentation?: string | { kind: string; value: string };
+  sortText?: string;
+  filterText?: string;
+  insertText?: string | { value: string };
+  range?: Range;
+  additionalTextEdits?: TextEdit[];
+  command?: { command: string; title: string; arguments?: unknown[] };
+}
+
+export interface CompletionList {
+  isIncomplete: boolean;
+  items: CompletionItem[];
+}
+
+export interface CompletionContext {
+  triggerKind: CompletionTriggerKind;
+  triggerCharacter?: string;
+}
+
+export interface TextEdit {
+  range: Range;
+  newText: string;
+}
+
+export interface Hover {
+  contents: string | { kind: string; value: string } | Array<string | { kind: string; value: string }>;
+  range?: Range;
+}
+
+export interface Location {
+  uri: Uri;
+  range: Range;
+}
+
+export enum SymbolKind {
+  File = 0, Module = 1, Namespace = 2, Package = 3, Class = 4,
+  Method = 5, Property = 6, Field = 7, Constructor = 8, Enum = 9,
+  Interface = 10, Function = 11, Variable = 12, Constant = 13,
+  String = 14, Number = 15, Boolean = 16, Array = 17, Object = 18,
+  Key = 19, Null = 20, EnumMember = 21, Struct = 22, Event = 23,
+  Operator = 24, TypeParameter = 25,
+}
+
+export interface DocumentSymbol {
+  name: string;
+  detail?: string;
+  kind: SymbolKind;
+  range: Range;
+  selectionRange: Range;
+  children?: DocumentSymbol[];
+}
+
+export interface SymbolInformation {
+  name: string;
+  kind: SymbolKind;
+  location: Location;
+  containerName?: string;
+}
+
+export interface CodeAction {
+  title: string;
+  kind?: string;
+  diagnostics?: Diagnostic[];
+  edit?: WorkspaceEdit;
+  command?: { command: string; title: string; arguments?: unknown[] };
+  isPreferred?: boolean;
+}
+
+export interface WorkspaceEdit {
+  entries(): [Uri, TextEdit[]][];
+}
+
+export interface SignatureHelp {
+  signatures: SignatureInformation[];
+  activeSignature: number;
+  activeParameter: number;
+}
+
+export interface SignatureInformation {
+  label: string;
+  documentation?: string | { kind: string; value: string };
+  parameters?: ParameterInformation[];
+}
+
+export interface ParameterInformation {
+  label: string | [number, number];
+  documentation?: string | { kind: string; value: string };
+}
+
+export interface FormattingOptions {
+  tabSize: number;
+  insertSpaces: boolean;
+}
+
+/** Document selector: language ID or object with language, scheme, pattern. */
+export type DocumentSelector = string | { language?: string; scheme?: string; pattern?: string } |
+  Array<string | { language?: string; scheme?: string; pattern?: string }>;
+
+/** M6: Cancellation token (simplified). */
+export interface CancellationToken {
+  isCancellationRequested: boolean;
+  onCancellationRequested: (listener: () => void) => { dispose(): void };
+}
+
+const nullCancellationToken: CancellationToken = {
+  isCancellationRequested: false,
+  onCancellationRequested: () => ({ dispose: () => {} }),
+};
+
+/** M6: Provider registration entry. */
+interface ProviderEntry<T> {
+  selector: DocumentSelector;
+  provider: T;
+  triggerCharacters?: string[];
+}
+
 // --- Configuration ---
 
 interface ConfigurationSection {
@@ -339,6 +486,16 @@ export class VscodeApiShim {
   private uiRequestId = 0;
   private statusBarItemId = 0;
   private decorationTypeId = 0;
+
+  // M6: LSP provider registries
+  private completionProviders: ProviderEntry<{ provideCompletionItems: (...args: unknown[]) => unknown }>[] = [];
+  private hoverProviders: ProviderEntry<{ provideHover: (...args: unknown[]) => unknown }>[] = [];
+  private definitionProviders: ProviderEntry<{ provideDefinition: (...args: unknown[]) => unknown }>[] = [];
+  private referenceProviders: ProviderEntry<{ provideReferences: (...args: unknown[]) => unknown }>[] = [];
+  private codeActionProviders: ProviderEntry<{ provideCodeActions: (...args: unknown[]) => unknown }>[] = [];
+  private signatureHelpProviders: ProviderEntry<{ provideSignatureHelp: (...args: unknown[]) => unknown }>[] = [];
+  private documentSymbolProviders: ProviderEntry<{ provideDocumentSymbols: (...args: unknown[]) => unknown }>[] = [];
+  private formattingProviders: ProviderEntry<{ provideDocumentFormattingEdits: (...args: unknown[]) => unknown }>[] = [];
 
   // Events
   private _onDidOpenTextDocument = new EventEmitter<TextDocument>();
@@ -392,9 +549,263 @@ export class VscodeApiShim {
         }
         break;
       }
+      // M6: LSP request handling
+      case "lsp/request": {
+        const p = msg.params as { request_id: string; method: string; params: Record<string, unknown> };
+        this.handleLspRequest(p.request_id, p.method, p.params);
+        break;
+      }
       default:
         console.log(`[ApiShim] Unknown method: ${msg.method}`);
     }
+  }
+
+  // M6: Handle LSP requests from frontend, dispatch to providers, send response back
+  private async handleLspRequest(requestId: string, method: string, params: Record<string, unknown>): Promise<void> {
+    try {
+      const result = await this.dispatchLspRequest(method, params);
+      this.sendOutgoing({
+        method: "lsp/response",
+        params: { request_id: requestId, result: result ?? null },
+      });
+    } catch (err) {
+      console.error(`[ApiShim] LSP request ${method} failed:`, err);
+      this.sendOutgoing({
+        method: "lsp/response",
+        params: { request_id: requestId, result: null, error: String(err) },
+      });
+    }
+  }
+
+  private async dispatchLspRequest(method: string, params: Record<string, unknown>): Promise<unknown> {
+    const uri = params.uri as string;
+    const doc = this.documents.get(uri);
+    if (!doc && method !== "textDocument/formatting") {
+      return null;
+    }
+
+    switch (method) {
+      case "textDocument/completion": {
+        const position = new Position(params.line as number, params.character as number);
+        const context: CompletionContext = {
+          triggerKind: (params.triggerKind as number) ?? CompletionTriggerKind.Invoke,
+          triggerCharacter: params.triggerCharacter as string | undefined,
+        };
+        for (const entry of this.completionProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideCompletionItems(doc, position, nullCancellationToken, context);
+            if (result) return this.serializeCompletions(result);
+          }
+        }
+        return null;
+      }
+      case "textDocument/hover": {
+        const position = new Position(params.line as number, params.character as number);
+        for (const entry of this.hoverProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideHover(doc, position, nullCancellationToken);
+            if (result) return this.serializeHover(result as Hover);
+          }
+        }
+        return null;
+      }
+      case "textDocument/definition": {
+        const position = new Position(params.line as number, params.character as number);
+        for (const entry of this.definitionProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideDefinition(doc, position, nullCancellationToken);
+            if (result) return this.serializeLocations(result);
+          }
+        }
+        return null;
+      }
+      case "textDocument/references": {
+        const position = new Position(params.line as number, params.character as number);
+        const refContext = { includeDeclaration: true };
+        for (const entry of this.referenceProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideReferences(doc, position, refContext, nullCancellationToken);
+            if (result) return this.serializeLocations(result);
+          }
+        }
+        return null;
+      }
+      case "textDocument/codeAction": {
+        const range = new Range(
+          params.startLine as number, params.startCharacter as number,
+          params.endLine as number, params.endCharacter as number
+        );
+        const codeActionContext = {
+          diagnostics: (params.diagnostics ?? []) as Diagnostic[],
+          only: params.only as string[] | undefined,
+        };
+        for (const entry of this.codeActionProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideCodeActions(doc, range, codeActionContext, nullCancellationToken);
+            if (result) return this.serializeCodeActions(result as CodeAction[]);
+          }
+        }
+        return null;
+      }
+      case "textDocument/signatureHelp": {
+        const position = new Position(params.line as number, params.character as number);
+        const sigContext = {
+          triggerKind: 1,
+          triggerCharacter: params.triggerCharacter as string | undefined,
+          isRetrigger: false,
+        };
+        for (const entry of this.signatureHelpProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideSignatureHelp(doc, position, nullCancellationToken, sigContext);
+            if (result) return result;
+          }
+        }
+        return null;
+      }
+      case "textDocument/documentSymbol": {
+        for (const entry of this.documentSymbolProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideDocumentSymbols(doc, nullCancellationToken);
+            if (result) return this.serializeSymbols(result);
+          }
+        }
+        return null;
+      }
+      case "textDocument/formatting": {
+        const options: FormattingOptions = {
+          tabSize: (params.tabSize as number) ?? 2,
+          insertSpaces: (params.insertSpaces as boolean) ?? true,
+        };
+        for (const entry of this.formattingProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideDocumentFormattingEdits(doc, options, nullCancellationToken);
+            if (result) return this.serializeTextEdits(result as TextEdit[]);
+          }
+        }
+        return null;
+      }
+      default:
+        console.log(`[ApiShim] Unknown LSP method: ${method}`);
+        return null;
+    }
+  }
+
+  // M6: Document selector matching
+  private matchesSelector(selector: DocumentSelector, doc: TextDocument): boolean {
+    const selectors = Array.isArray(selector) ? selector : [selector];
+    for (const sel of selectors) {
+      if (typeof sel === "string") {
+        if (sel === doc.languageId || sel === "*") return true;
+      } else {
+        if (sel.language && sel.language !== doc.languageId && sel.language !== "*") continue;
+        if (sel.scheme && sel.scheme !== "file") continue;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // M6: Serialization helpers for LSP results
+  private serializeCompletions(result: unknown): unknown {
+    if (Array.isArray(result)) {
+      return { isIncomplete: false, items: result.map(i => this.serializeCompletionItem(i)) };
+    }
+    const list = result as CompletionList;
+    if (list.items) {
+      return { isIncomplete: list.isIncomplete ?? false, items: list.items.map(i => this.serializeCompletionItem(i)) };
+    }
+    return { isIncomplete: false, items: [] };
+  }
+
+  private serializeCompletionItem(item: unknown): unknown {
+    const ci = item as CompletionItem;
+    const label = typeof ci.label === "string" ? ci.label : ci.label?.label ?? "";
+    const detail = typeof ci.label === "object" ? ci.label?.detail : ci.detail;
+    const insertText = typeof ci.insertText === "string" ? ci.insertText :
+      (ci.insertText as { value: string })?.value ?? label;
+    const doc = typeof ci.documentation === "string" ? ci.documentation :
+      (ci.documentation as { value: string })?.value;
+    return { label, detail, documentation: doc, insertText, kind: ci.kind ?? CompletionItemKind.Text, sortText: ci.sortText, filterText: ci.filterText };
+  }
+
+  private serializeHover(hover: Hover): unknown {
+    let contents: string;
+    if (typeof hover.contents === "string") {
+      contents = hover.contents;
+    } else if (Array.isArray(hover.contents)) {
+      contents = hover.contents.map(c => typeof c === "string" ? c : c.value).join("\n\n");
+    } else {
+      contents = (hover.contents as { value: string }).value ?? String(hover.contents);
+    }
+    return { contents, range: hover.range ? this.serializeRange(hover.range) : undefined };
+  }
+
+  private serializeLocations(result: unknown): unknown {
+    if (!result) return [];
+    const items = Array.isArray(result) ? result : [result];
+    return items.map((loc: Location) => ({
+      uri: typeof loc.uri === "string" ? loc.uri : loc.uri?.toString?.() ?? String(loc.uri),
+      range: loc.range ? this.serializeRange(loc.range) : { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+    }));
+  }
+
+  private serializeCodeActions(actions: CodeAction[]): unknown {
+    return actions.map(a => ({
+      title: a.title,
+      kind: a.kind,
+      isPreferred: a.isPreferred,
+      command: a.command,
+      edit: a.edit ? this.serializeWorkspaceEdit(a.edit) : undefined,
+    }));
+  }
+
+  private serializeWorkspaceEdit(edit: WorkspaceEdit): unknown {
+    const changes: Record<string, unknown[]> = {};
+    if (typeof edit.entries === "function") {
+      for (const [uri, edits] of edit.entries()) {
+        const uriStr = typeof uri === "string" ? uri : uri.toString();
+        changes[uriStr] = this.serializeTextEdits(edits);
+      }
+    }
+    return { changes };
+  }
+
+  private serializeTextEdits(edits: TextEdit[]): unknown[] {
+    return edits.map(e => ({
+      range: this.serializeRange(e.range),
+      newText: e.newText,
+    }));
+  }
+
+  private serializeSymbols(result: unknown): unknown {
+    if (!result) return [];
+    const items = result as unknown[];
+    return items.map((sym: unknown) => {
+      const ds = sym as DocumentSymbol;
+      if (ds.selectionRange) {
+        return {
+          name: ds.name, detail: ds.detail, kind: ds.kind,
+          range: this.serializeRange(ds.range),
+          selectionRange: this.serializeRange(ds.selectionRange),
+          children: ds.children ? this.serializeSymbols(ds.children) : [],
+        };
+      }
+      const si = sym as SymbolInformation;
+      return {
+        name: si.name, kind: si.kind, containerName: si.containerName,
+        location: si.location ? {
+          uri: si.location.uri?.toString?.() ?? String(si.location.uri),
+          range: this.serializeRange(si.location.range),
+        } : undefined,
+      };
+    });
+  }
+
+  private serializeRange(range: Range): unknown {
+    return {
+      start: { line: range.start.line, character: range.start.character },
+      end: { line: range.end.line, character: range.end.character },
+    };
   }
 
   private handleDidOpen(params: Record<string, string>): void {
@@ -559,6 +970,91 @@ export class VscodeApiShim {
 
         self.diagnosticCollections.push(collection);
         return collection;
+      },
+
+      // M6: Provider registration APIs
+      registerCompletionItemProvider(
+        selector: DocumentSelector,
+        provider: { provideCompletionItems: (...args: unknown[]) => unknown; resolveCompletionItem?: (...args: unknown[]) => unknown },
+        ...triggerCharacters: string[]
+      ): { dispose(): void } {
+        const entry = { selector, provider, triggerCharacters };
+        self.completionProviders.push(entry);
+        console.log(`[ApiShim] CompletionItemProvider registered (triggers: ${triggerCharacters.join(", ") || "none"})`);
+        return { dispose: () => { self.completionProviders = self.completionProviders.filter(e => e !== entry); } };
+      },
+
+      registerHoverProvider(
+        selector: DocumentSelector,
+        provider: { provideHover: (...args: unknown[]) => unknown }
+      ): { dispose(): void } {
+        const entry = { selector, provider };
+        self.hoverProviders.push(entry);
+        console.log("[ApiShim] HoverProvider registered");
+        return { dispose: () => { self.hoverProviders = self.hoverProviders.filter(e => e !== entry); } };
+      },
+
+      registerDefinitionProvider(
+        selector: DocumentSelector,
+        provider: { provideDefinition: (...args: unknown[]) => unknown }
+      ): { dispose(): void } {
+        const entry = { selector, provider };
+        self.definitionProviders.push(entry);
+        console.log("[ApiShim] DefinitionProvider registered");
+        return { dispose: () => { self.definitionProviders = self.definitionProviders.filter(e => e !== entry); } };
+      },
+
+      registerReferenceProvider(
+        selector: DocumentSelector,
+        provider: { provideReferences: (...args: unknown[]) => unknown }
+      ): { dispose(): void } {
+        const entry = { selector, provider };
+        self.referenceProviders.push(entry);
+        console.log("[ApiShim] ReferenceProvider registered");
+        return { dispose: () => { self.referenceProviders = self.referenceProviders.filter(e => e !== entry); } };
+      },
+
+      registerCodeActionProvider(
+        selector: DocumentSelector,
+        provider: { provideCodeActions: (...args: unknown[]) => unknown },
+        _metadata?: unknown
+      ): { dispose(): void } {
+        const entry = { selector, provider };
+        self.codeActionProviders.push(entry);
+        console.log("[ApiShim] CodeActionProvider registered");
+        return { dispose: () => { self.codeActionProviders = self.codeActionProviders.filter(e => e !== entry); } };
+      },
+
+      registerSignatureHelpProvider(
+        selector: DocumentSelector,
+        provider: { provideSignatureHelp: (...args: unknown[]) => unknown },
+        ...triggerCharactersOrMetadata: unknown[]
+      ): { dispose(): void } {
+        const triggerChars = triggerCharactersOrMetadata.filter(c => typeof c === "string") as string[];
+        const entry = { selector, provider, triggerCharacters: triggerChars };
+        self.signatureHelpProviders.push(entry);
+        console.log(`[ApiShim] SignatureHelpProvider registered (triggers: ${triggerChars.join(", ") || "none"})`);
+        return { dispose: () => { self.signatureHelpProviders = self.signatureHelpProviders.filter(e => e !== entry); } };
+      },
+
+      registerDocumentSymbolProvider(
+        selector: DocumentSelector,
+        provider: { provideDocumentSymbols: (...args: unknown[]) => unknown }
+      ): { dispose(): void } {
+        const entry = { selector, provider };
+        self.documentSymbolProviders.push(entry);
+        console.log("[ApiShim] DocumentSymbolProvider registered");
+        return { dispose: () => { self.documentSymbolProviders = self.documentSymbolProviders.filter(e => e !== entry); } };
+      },
+
+      registerDocumentFormattingEditProvider(
+        selector: DocumentSelector,
+        provider: { provideDocumentFormattingEdits: (...args: unknown[]) => unknown }
+      ): { dispose(): void } {
+        const entry = { selector, provider };
+        self.formattingProviders.push(entry);
+        console.log("[ApiShim] DocumentFormattingEditProvider registered");
+        return { dispose: () => { self.formattingProviders = self.formattingProviders.filter(e => e !== entry); } };
       },
     };
   }
@@ -871,6 +1367,24 @@ export class VscodeApiShim {
       Uri,
       Position,
       Range,
+      // M6 exports
+      CompletionItemKind,
+      CompletionTriggerKind,
+      CompletionItem: {} as unknown, // Type-only, extensions use interface
+      SymbolKind,
+      SignatureHelp: {} as unknown,
+      CodeAction: {} as unknown,
+      Location,
+      TextEdit: {} as unknown,
+      WorkspaceEdit: {} as unknown,
+      Hover: {} as unknown,
+      DocumentSymbol: {} as unknown,
+      SymbolInformation: {} as unknown,
+      CancellationTokenSource: class CancellationTokenSource {
+        token: CancellationToken = nullCancellationToken;
+        cancel() { /* noop for now */ }
+        dispose() { /* noop */ }
+      },
     };
   }
 }

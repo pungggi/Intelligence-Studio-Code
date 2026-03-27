@@ -880,6 +880,117 @@ document.addEventListener('keydown', async (e) => {
   // Don't handle editor keys when palette is open
   if (paletteOpen) return;
 
+  // M6: Don't handle editor keys when symbols palette is open
+  if (symbolsOpen) return;
+
+  // M6: Autocomplete navigation when popup is open
+  if (acOpen) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      acSelectedIdx = Math.min(acSelectedIdx + 1, autocompleteList.children.length - 1);
+      updateAcSelection();
+      const items = autocompleteList.querySelectorAll('.ac-item');
+      if (items[acSelectedIdx]) showAcDetail(acItems[acSelectedIdx]);
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      acSelectedIdx = Math.max(acSelectedIdx - 1, 0);
+      updateAcSelection();
+      const items = autocompleteList.querySelectorAll('.ac-item');
+      if (items[acSelectedIdx]) showAcDetail(acItems[acSelectedIdx]);
+      return;
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      e.preventDefault();
+      if (acItems[acSelectedIdx]) acceptCompletion(acItems[acSelectedIdx]);
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeAutocomplete();
+      return;
+    }
+    // Let other keys fall through to typing (will update filter)
+  }
+
+  // M6: Code actions navigation
+  if (codeActionsOpen) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      caSelectedIdx = Math.min(caSelectedIdx + 1, caItems.length - 1);
+      const items = codeActionsList.querySelectorAll('.ca-item');
+      items.forEach((el, i) => el.classList.toggle('selected', i === caSelectedIdx));
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      caSelectedIdx = Math.max(caSelectedIdx - 1, 0);
+      const items = codeActionsList.querySelectorAll('.ca-item');
+      items.forEach((el, i) => el.classList.toggle('selected', i === caSelectedIdx));
+      return;
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (caItems[caSelectedIdx]) executeCodeAction(caItems[caSelectedIdx]);
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeCodeActions();
+      return;
+    }
+  }
+
+  // M6: Escape closes LSP popups
+  if (e.key === 'Escape' && (hoverOpen || sigHelpOpen || refsOpen)) {
+    e.preventDefault();
+    closeLspPopups();
+    return;
+  }
+
+  // M6: Ctrl+Shift+O — Document symbols
+  if (e.ctrlKey && e.shiftKey && e.key === 'O') {
+    e.preventDefault();
+    openSymbolOutline();
+    return;
+  }
+
+  // M6: Ctrl+Shift+F — Format document
+  if (e.ctrlKey && e.shiftKey && e.key === 'F') {
+    e.preventDefault();
+    formatDocument();
+    return;
+  }
+
+  // M6: Ctrl+Space — Trigger autocomplete
+  if (e.ctrlKey && e.key === ' ') {
+    e.preventDefault();
+    triggerAutocomplete(null);
+    return;
+  }
+
+  // M6: F12 — Go to definition
+  if (e.key === 'F12' && !e.shiftKey && !e.ctrlKey) {
+    e.preventDefault();
+    goToDefinition();
+    return;
+  }
+
+  // M6: Shift+F12 — Find references
+  if (e.key === 'F12' && e.shiftKey && !e.ctrlKey) {
+    e.preventDefault();
+    findReferences();
+    return;
+  }
+
+  // M6: Ctrl+. — Code actions
+  if (e.ctrlKey && e.key === '.') {
+    e.preventDefault();
+    requestCodeActions();
+    return;
+  }
+
   // ── Find bar keys (when find inputs are focused) ──
   if (findOpen && (document.activeElement === findInputEl || document.activeElement === replaceInputEl)) {
     if (e.key === 'Escape') {
@@ -1203,6 +1314,15 @@ document.addEventListener('keydown', async (e) => {
       }
       renderContent(content);
     }
+    // M6: Update autocomplete filter on backspace
+    if (acOpen) {
+      if (acFilterText.length > 0) {
+        acFilterText = acFilterText.slice(0, -1);
+        renderAutocomplete();
+      } else {
+        closeAutocomplete();
+      }
+    }
     return;
   }
 
@@ -1263,6 +1383,24 @@ document.addEventListener('keydown', async (e) => {
       cursorCol++;
       renderContent(content);
     }
+
+    // M6: Trigger signature help on ( and ,
+    if (e.key === '(' || e.key === ',') {
+      requestSignatureHelp(e.key);
+    } else if (e.key === ')') {
+      closeSignatureHelp();
+    }
+
+    // M6: Trigger/update autocomplete on . and word characters
+    if (e.key === '.') {
+      triggerAutocomplete('.');
+    } else if (acOpen && /[a-zA-Z0-9_$]/.test(e.key)) {
+      acFilterText += e.key;
+      renderAutocomplete();
+    } else if (acOpen && e.key === ' ') {
+      closeAutocomplete();
+    }
+
     return;
   }
 });
@@ -1834,6 +1972,742 @@ function handleInputBox(req) {
 
 const uiReqInterval = setInterval(pollUiRequests, 500);
 
+// ─── M6: LSP Features ────────────────────────────────────────
+
+// --- M6: DOM References ---
+const autocompletePopup = document.getElementById('autocomplete-popup');
+const autocompleteList = document.getElementById('autocomplete-list');
+const autocompleteDetail = document.getElementById('autocomplete-detail');
+const hoverTooltip = document.getElementById('hover-tooltip');
+const hoverContent = document.getElementById('hover-content');
+const signatureHelp = document.getElementById('signature-help');
+const signatureLabel = document.getElementById('signature-label');
+const signatureDocs = document.getElementById('signature-docs');
+const codeActionsMenu = document.getElementById('code-actions-menu');
+const codeActionsList = document.getElementById('code-actions-list');
+const referencesPanel = document.getElementById('references-panel');
+const referencesList = document.getElementById('references-list');
+const referencesClose = document.getElementById('references-close');
+const referencesTitle = document.getElementById('references-title');
+const symbolsPalette = document.getElementById('symbols-palette');
+const symbolsBackdrop = document.getElementById('symbols-backdrop');
+const symbolsPanel = document.getElementById('symbols-panel');
+const symbolsInput = document.getElementById('symbols-input');
+const symbolsList = document.getElementById('symbols-list');
+
+// --- M6: State ---
+let acOpen = false;
+let acItems = [];
+let acSelectedIdx = 0;
+let acFilterText = '';
+let hoverOpen = false;
+let hoverTimer = null;
+let sigHelpOpen = false;
+let codeActionsOpen = false;
+let caItems = [];
+let caSelectedIdx = 0;
+let refsOpen = false;
+let symbolsOpen = false;
+let symbolItems = [];
+let symbolSelectedIdx = 0;
+
+function getActiveUri() {
+  if (!activeBufferPath) return null;
+  // Windows path → file URI
+  if (activeBufferPath.match(/^[a-zA-Z]:\\/)) {
+    return 'file:///' + activeBufferPath.replace(/\\/g, '/');
+  }
+  return 'file://' + activeBufferPath;
+}
+
+// --- M6: Autocomplete ---
+
+async function triggerAutocomplete(triggerChar) {
+  const uri = getActiveUri();
+  if (!uri) return;
+  try {
+    const result = await invoke('lsp_completion', {
+      uri,
+      line: cursorLine,
+      character: cursorCol,
+      triggerKind: triggerChar ? 2 : 1,
+      triggerCharacter: triggerChar || null,
+    });
+    if (!result || !result.items || result.items.length === 0) {
+      closeAutocomplete();
+      return;
+    }
+    acItems = result.items;
+    acSelectedIdx = 0;
+    acFilterText = '';
+    acOpen = true;
+    renderAutocomplete();
+    positionAutocomplete();
+  } catch (err) {
+    // No provider or timeout — silently close
+    closeAutocomplete();
+  }
+}
+
+function renderAutocomplete() {
+  autocompleteList.innerHTML = '';
+  const filtered = acFilterText
+    ? acItems.filter(i => (i.filterText || i.label || '').toLowerCase().includes(acFilterText.toLowerCase()))
+    : acItems;
+  const max = Math.min(filtered.length, 30);
+  for (let i = 0; i < max; i++) {
+    const item = filtered[i];
+    const div = document.createElement('div');
+    div.className = 'ac-item' + (i === acSelectedIdx ? ' selected' : '');
+
+    const icon = document.createElement('span');
+    icon.className = 'ac-icon ' + acKindClass(item.kind);
+    icon.textContent = acKindLetter(item.kind);
+    div.appendChild(icon);
+
+    const label = document.createElement('span');
+    label.className = 'ac-label';
+    label.textContent = item.label || '';
+    div.appendChild(label);
+
+    if (item.detail) {
+      const detail = document.createElement('span');
+      detail.className = 'ac-detail';
+      detail.textContent = item.detail;
+      div.appendChild(detail);
+    }
+
+    div.addEventListener('click', () => acceptCompletion(item));
+    div.addEventListener('mouseenter', () => {
+      acSelectedIdx = i;
+      updateAcSelection();
+      showAcDetail(item);
+    });
+    autocompleteList.appendChild(div);
+  }
+  if (max > 0) showAcDetail(filtered[acSelectedIdx]);
+  autocompletePopup.classList.remove('lsp-hidden');
+}
+
+function updateAcSelection() {
+  const items = autocompleteList.querySelectorAll('.ac-item');
+  items.forEach((el, i) => el.classList.toggle('selected', i === acSelectedIdx));
+  if (items[acSelectedIdx]) {
+    items[acSelectedIdx].scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function showAcDetail(item) {
+  autocompleteDetail.textContent = item.documentation || item.detail || '';
+}
+
+function positionAutocomplete() {
+  const charWidth = measureCharWidth();
+  const lineEls = editorEl.querySelectorAll('.line');
+  if (cursorLine >= lineEls.length) return;
+  const lineEl = lineEls[cursorLine];
+  const editorRect = editorEl.getBoundingClientRect();
+  const lineRect = lineEl.getBoundingClientRect();
+
+  let left = editorRect.left + 12 + cursorCol * charWidth - editorEl.scrollLeft;
+  let top = lineRect.bottom;
+
+  // Ensure popup stays in viewport
+  if (left + 450 > window.innerWidth) left = window.innerWidth - 460;
+  if (top + 250 > window.innerHeight) top = lineRect.top - 250;
+
+  autocompletePopup.style.left = `${Math.max(0, left)}px`;
+  autocompletePopup.style.top = `${Math.max(0, top)}px`;
+}
+
+async function acceptCompletion(item) {
+  closeAutocomplete();
+  const insertText = item.insertText || item.label || '';
+  if (!insertText) return;
+
+  // Delete any filter text already typed
+  if (acFilterText) {
+    const content = await invoke('edit_replace_range', {
+      startLine: cursorLine, startCol: cursorCol - acFilterText.length,
+      endLine: cursorLine, endCol: cursorCol,
+      text: insertText,
+    });
+    cursorCol = cursorCol - acFilterText.length + insertText.length;
+    renderContent(content);
+  } else {
+    const content = await invoke('edit_insert', { line: cursorLine, col: cursorCol, text: insertText });
+    cursorCol += insertText.length;
+    renderContent(content);
+  }
+}
+
+function closeAutocomplete() {
+  acOpen = false;
+  acItems = [];
+  acFilterText = '';
+  autocompletePopup.classList.add('lsp-hidden');
+  autocompleteDetail.textContent = '';
+}
+
+function acKindClass(kind) {
+  const map = { 1: 'ac-icon-method', 2: 'ac-icon-function', 3: 'ac-icon-function',
+    4: 'ac-icon-field', 5: 'ac-icon-variable', 6: 'ac-icon-class',
+    7: 'ac-icon-interface', 8: 'ac-icon-module', 9: 'ac-icon-property',
+    12: 'ac-icon-enum', 13: 'ac-icon-keyword', 14: 'ac-icon-snippet',
+    16: 'ac-icon-file', 18: 'ac-icon-folder', 20: 'ac-icon-constant' };
+  return map[kind] || 'ac-icon-text';
+}
+
+function acKindLetter(kind) {
+  const map = { 1: 'M', 2: 'F', 3: 'C', 4: 'F', 5: 'V', 6: 'C', 7: 'I', 8: 'M',
+    9: 'P', 12: 'E', 13: 'K', 14: 'S', 16: '📄', 18: '📁', 20: 'C' };
+  return map[kind] || 'T';
+}
+
+// --- M6: Hover ---
+
+function scheduleHover(line, col) {
+  cancelHover();
+  hoverTimer = setTimeout(() => requestHover(line, col), 500);
+}
+
+function cancelHover() {
+  if (hoverTimer) {
+    clearTimeout(hoverTimer);
+    hoverTimer = null;
+  }
+}
+
+async function requestHover(line, col) {
+  const uri = getActiveUri();
+  if (!uri) return;
+  try {
+    const result = await invoke('lsp_hover', { uri, line, character: col });
+    if (!result || !result.contents) {
+      closeHover();
+      return;
+    }
+    hoverContent.textContent = '';
+    const text = typeof result.contents === 'string' ? result.contents : result.contents;
+    hoverContent.textContent = text;
+    hoverOpen = true;
+    hoverTooltip.classList.remove('lsp-hidden');
+    positionHover(line);
+  } catch {
+    closeHover();
+  }
+}
+
+function positionHover(line) {
+  const charWidth = measureCharWidth();
+  const lineEls = editorEl.querySelectorAll('.line');
+  if (line >= lineEls.length) return;
+  const lineEl = lineEls[line];
+  const editorRect = editorEl.getBoundingClientRect();
+  const lineRect = lineEl.getBoundingClientRect();
+
+  let left = editorRect.left + 12;
+  let top = lineRect.top - 10;
+
+  // Show above the line
+  const tooltipHeight = hoverTooltip.offsetHeight || 100;
+  if (top - tooltipHeight < 0) top = lineRect.bottom + 4;
+  else top = top - tooltipHeight;
+
+  hoverTooltip.style.left = `${Math.max(0, left)}px`;
+  hoverTooltip.style.top = `${Math.max(0, top)}px`;
+}
+
+function closeHover() {
+  hoverOpen = false;
+  hoverTooltip.classList.add('lsp-hidden');
+}
+
+// Mouse hover on editor lines
+editorEl.addEventListener('mousemove', (e) => {
+  if (isDragging || acOpen) return;
+  const pos = posFromMouse(e);
+  if (e.ctrlKey) {
+    // Ctrl+hover: show link underline
+    cancelHover();
+    closeHover();
+    return;
+  }
+  scheduleHover(pos.line, pos.col);
+});
+
+editorEl.addEventListener('mouseleave', () => {
+  cancelHover();
+  setTimeout(() => {
+    if (!hoverTooltip.matches(':hover')) closeHover();
+  }, 200);
+});
+
+hoverTooltip.addEventListener('mouseleave', () => {
+  closeHover();
+});
+
+// --- M6: Go-to-definition (Ctrl+Click / F12) ---
+
+async function goToDefinition() {
+  const uri = getActiveUri();
+  if (!uri) return;
+  try {
+    statusEl.textContent = 'Go to definition...';
+    const result = await invoke('lsp_definition', { uri, line: cursorLine, character: cursorCol });
+    if (!result || (Array.isArray(result) && result.length === 0)) {
+      statusEl.textContent = 'No definition found';
+      setTimeout(() => { statusEl.textContent = ''; }, 2000);
+      return;
+    }
+    const locations = Array.isArray(result) ? result : [result];
+    const loc = locations[0];
+    if (loc.uri && loc.range) {
+      await navigateToLocation(loc.uri, loc.range.start.line, loc.range.start.character);
+    }
+    statusEl.textContent = '';
+  } catch (err) {
+    statusEl.textContent = 'Definition unavailable';
+    setTimeout(() => { statusEl.textContent = ''; }, 2000);
+  }
+}
+
+async function navigateToLocation(uri, line, col) {
+  // Convert URI to file path
+  let path = uri;
+  if (path.startsWith('file:///')) path = path.substring(8);
+  else if (path.startsWith('file://')) path = path.substring(7);
+  // On Windows, handle /C:/... → C:\...
+  if (path.match(/^\/[a-zA-Z]:\//)) path = path.substring(1);
+  path = path.replace(/\//g, '\\');
+
+  try {
+    saveBufferState();
+    const content = await invoke('open_file', { path });
+    activeBufferPath = content.file_path;
+    cursorLine = line;
+    cursorCol = col;
+    clearSelection();
+    renderContent(content);
+    renderTabs();
+    editorEl.focus();
+  } catch (err) {
+    statusEl.textContent = `Cannot open: ${err}`;
+    setTimeout(() => { statusEl.textContent = ''; }, 2000);
+  }
+}
+
+// Ctrl+Click handler
+editorEl.addEventListener('click', async (e) => {
+  if (e.ctrlKey && e.button === 0) {
+    e.preventDefault();
+    const pos = posFromMouse(e);
+    cursorLine = pos.line;
+    cursorCol = pos.col;
+    await goToDefinition();
+  }
+});
+
+// --- M6: Find References (Shift+F12) ---
+
+async function findReferences() {
+  const uri = getActiveUri();
+  if (!uri) return;
+  try {
+    statusEl.textContent = 'Finding references...';
+    const result = await invoke('lsp_references', { uri, line: cursorLine, character: cursorCol });
+    if (!result || (Array.isArray(result) && result.length === 0)) {
+      statusEl.textContent = 'No references found';
+      setTimeout(() => { statusEl.textContent = ''; }, 2000);
+      return;
+    }
+    statusEl.textContent = '';
+    showReferencesPanel(result);
+  } catch (err) {
+    statusEl.textContent = 'References unavailable';
+    setTimeout(() => { statusEl.textContent = ''; }, 2000);
+  }
+}
+
+function showReferencesPanel(locations) {
+  refsOpen = true;
+  referencesList.innerHTML = '';
+  referencesTitle.textContent = `${locations.length} Reference${locations.length !== 1 ? 's' : ''}`;
+
+  for (const loc of locations) {
+    const div = document.createElement('div');
+    div.className = 'ref-item';
+
+    let path = loc.uri || '';
+    if (path.startsWith('file:///')) path = path.substring(8);
+    else if (path.startsWith('file://')) path = path.substring(7);
+    const name = path.split(/[/\\]/).pop() || path;
+
+    const fileSpan = document.createElement('span');
+    fileSpan.className = 'ref-file';
+    fileSpan.textContent = name;
+    div.appendChild(fileSpan);
+
+    const locSpan = document.createElement('span');
+    locSpan.className = 'ref-location';
+    const line = loc.range?.start?.line ?? 0;
+    const col = loc.range?.start?.character ?? 0;
+    locSpan.textContent = `:${line + 1}:${col + 1}`;
+    div.appendChild(locSpan);
+
+    div.addEventListener('click', () => {
+      closeReferences();
+      navigateToLocation(loc.uri, line, col);
+    });
+    referencesList.appendChild(div);
+  }
+  referencesPanel.classList.remove('lsp-hidden');
+}
+
+function closeReferences() {
+  refsOpen = false;
+  referencesPanel.classList.add('lsp-hidden');
+}
+
+referencesClose.addEventListener('click', closeReferences);
+
+// --- M6: Code Actions (Ctrl+.) ---
+
+async function requestCodeActions() {
+  const uri = getActiveUri();
+  if (!uri) return;
+
+  let startLine = cursorLine, startChar = cursorCol, endLine = cursorLine, endChar = cursorCol;
+  if (hasSelection()) {
+    const sel = getSelectionRange();
+    startLine = sel.startLine;
+    startChar = sel.startCol;
+    endLine = sel.endLine;
+    endChar = sel.endCol;
+  }
+
+  try {
+    const result = await invoke('lsp_code_action', {
+      uri, startLine, startCharacter: startChar, endLine, endCharacter: endChar,
+    });
+    if (!result || (Array.isArray(result) && result.length === 0)) {
+      statusEl.textContent = 'No code actions available';
+      setTimeout(() => { statusEl.textContent = ''; }, 2000);
+      return;
+    }
+    caItems = Array.isArray(result) ? result : [];
+    caSelectedIdx = 0;
+    codeActionsOpen = true;
+    renderCodeActions();
+    positionCodeActions();
+  } catch {
+    statusEl.textContent = 'Code actions unavailable';
+    setTimeout(() => { statusEl.textContent = ''; }, 2000);
+  }
+}
+
+function renderCodeActions() {
+  codeActionsList.innerHTML = '';
+  for (let i = 0; i < caItems.length; i++) {
+    const action = caItems[i];
+    const div = document.createElement('div');
+    div.className = 'ca-item' + (i === caSelectedIdx ? ' selected' : '') +
+      (action.isPreferred ? ' ca-item-preferred' : '');
+    div.textContent = action.title || 'Unnamed action';
+    div.addEventListener('click', () => executeCodeAction(action));
+    codeActionsList.appendChild(div);
+  }
+  codeActionsMenu.classList.remove('lsp-hidden');
+}
+
+function positionCodeActions() {
+  const charWidth = measureCharWidth();
+  const lineEls = editorEl.querySelectorAll('.line');
+  if (cursorLine >= lineEls.length) return;
+  const lineEl = lineEls[cursorLine];
+  const editorRect = editorEl.getBoundingClientRect();
+  const lineRect = lineEl.getBoundingClientRect();
+
+  let left = editorRect.left + 12 + cursorCol * charWidth - editorEl.scrollLeft;
+  let top = lineRect.bottom + 2;
+
+  codeActionsMenu.style.left = `${Math.max(0, left)}px`;
+  codeActionsMenu.style.top = `${Math.max(0, top)}px`;
+}
+
+async function executeCodeAction(action) {
+  closeCodeActions();
+  if (action.command) {
+    await invoke('execute_command', { command: action.command.command || action.command });
+    setTimeout(refreshDiagnostics, 500);
+  }
+  if (action.edit && action.edit.changes) {
+    // Apply workspace edits
+    for (const [uri, edits] of Object.entries(action.edit.changes)) {
+      for (const edit of edits) {
+        const r = edit.range;
+        await invoke('edit_replace_range', {
+          startLine: r.start.line, startCol: r.start.character,
+          endLine: r.end.line, endCol: r.end.character,
+          text: edit.newText,
+        });
+      }
+    }
+    const content = await invoke('get_content');
+    renderContent(content);
+  }
+}
+
+function closeCodeActions() {
+  codeActionsOpen = false;
+  codeActionsMenu.classList.add('lsp-hidden');
+}
+
+// --- M6: Signature Help ---
+
+async function requestSignatureHelp(triggerChar) {
+  const uri = getActiveUri();
+  if (!uri) return;
+  try {
+    const result = await invoke('lsp_signature_help', {
+      uri, line: cursorLine, character: cursorCol, triggerCharacter: triggerChar || null,
+    });
+    if (!result || !result.signatures || result.signatures.length === 0) {
+      closeSignatureHelp();
+      return;
+    }
+    sigHelpOpen = true;
+    const sig = result.signatures[result.activeSignature ?? 0];
+    signatureLabel.innerHTML = escapeHtml(sig.label);
+
+    // Highlight active parameter
+    if (sig.parameters && sig.parameters.length > 0) {
+      const activeParam = sig.parameters[result.activeParameter ?? 0];
+      if (activeParam) {
+        const paramLabel = typeof activeParam.label === 'string' ? activeParam.label : sig.label.substring(activeParam.label[0], activeParam.label[1]);
+        const idx = sig.label.indexOf(paramLabel);
+        if (idx !== -1) {
+          signatureLabel.innerHTML =
+            escapeHtml(sig.label.substring(0, idx)) +
+            '<span class="sig-active-param">' + escapeHtml(paramLabel) + '</span>' +
+            escapeHtml(sig.label.substring(idx + paramLabel.length));
+        }
+      }
+    }
+
+    const docText = typeof sig.documentation === 'string' ? sig.documentation :
+      sig.documentation?.value || '';
+    signatureDocs.textContent = docText;
+
+    signatureHelp.classList.remove('lsp-hidden');
+    positionSignatureHelp();
+  } catch {
+    closeSignatureHelp();
+  }
+}
+
+function positionSignatureHelp() {
+  const charWidth = measureCharWidth();
+  const lineEls = editorEl.querySelectorAll('.line');
+  if (cursorLine >= lineEls.length) return;
+  const lineEl = lineEls[cursorLine];
+  const editorRect = editorEl.getBoundingClientRect();
+  const lineRect = lineEl.getBoundingClientRect();
+
+  let left = editorRect.left + 12 + cursorCol * charWidth - editorEl.scrollLeft;
+  let top = lineRect.top - signatureHelp.offsetHeight - 4;
+  if (top < 0) top = lineRect.bottom + 4;
+
+  signatureHelp.style.left = `${Math.max(0, left)}px`;
+  signatureHelp.style.top = `${Math.max(0, top)}px`;
+}
+
+function closeSignatureHelp() {
+  sigHelpOpen = false;
+  signatureHelp.classList.add('lsp-hidden');
+}
+
+// --- M6: Document Symbols (Ctrl+Shift+O) ---
+
+async function openSymbolOutline() {
+  const uri = getActiveUri();
+  if (!uri) { statusEl.textContent = 'No file open'; return; }
+
+  try {
+    statusEl.textContent = 'Loading symbols...';
+    const result = await invoke('lsp_document_symbols', { uri });
+    statusEl.textContent = '';
+    if (!result || (Array.isArray(result) && result.length === 0)) {
+      statusEl.textContent = 'No symbols found';
+      setTimeout(() => { statusEl.textContent = ''; }, 2000);
+      return;
+    }
+    symbolItems = flattenSymbols(Array.isArray(result) ? result : []);
+    symbolSelectedIdx = 0;
+    symbolsOpen = true;
+    renderSymbolList('');
+    symbolsPalette.classList.remove('palette-hidden');
+    symbolsInput.value = '';
+    symbolsInput.focus();
+  } catch (err) {
+    statusEl.textContent = 'Symbols unavailable';
+    setTimeout(() => { statusEl.textContent = ''; }, 2000);
+  }
+}
+
+function flattenSymbols(symbols, prefix) {
+  const result = [];
+  for (const sym of symbols) {
+    const name = prefix ? `${prefix}.${sym.name}` : sym.name;
+    const line = sym.range?.start?.line ?? sym.selectionRange?.start?.line ?? sym.location?.range?.start?.line ?? 0;
+    const col = sym.range?.start?.character ?? sym.selectionRange?.start?.character ?? sym.location?.range?.start?.character ?? 0;
+    result.push({ name, detail: sym.detail || '', kind: sym.kind, line, col });
+    if (sym.children) {
+      result.push(...flattenSymbols(sym.children, name));
+    }
+  }
+  return result;
+}
+
+function renderSymbolList(query) {
+  symbolsList.innerHTML = '';
+  const q = query.toLowerCase();
+  const filtered = q ? symbolItems.filter(s => s.name.toLowerCase().includes(q)) : symbolItems;
+  for (let i = 0; i < Math.min(filtered.length, 50); i++) {
+    const sym = filtered[i];
+    const div = document.createElement('div');
+    div.className = 'symbol-item' + (i === symbolSelectedIdx ? ' selected' : '');
+
+    const icon = document.createElement('span');
+    icon.className = 'symbol-icon ' + symbolKindClass(sym.kind);
+    icon.textContent = symbolKindLetter(sym.kind);
+    div.appendChild(icon);
+
+    const name = document.createElement('span');
+    name.className = 'symbol-name';
+    name.textContent = sym.name;
+    div.appendChild(name);
+
+    if (sym.detail) {
+      const detail = document.createElement('span');
+      detail.className = 'symbol-detail';
+      detail.textContent = sym.detail;
+      div.appendChild(detail);
+    }
+
+    div.addEventListener('click', () => {
+      closeSymbolOutline();
+      cursorLine = sym.line;
+      cursorCol = sym.col;
+      clearSelection();
+      renderCursor();
+      updateStatusBar();
+    });
+    symbolsList.appendChild(div);
+  }
+}
+
+function symbolKindClass(kind) {
+  const map = { 5: 'symbol-icon-method', 11: 'symbol-icon-function', 4: 'symbol-icon-class',
+    10: 'symbol-icon-interface', 12: 'symbol-icon-variable', 6: 'symbol-icon-property',
+    13: 'symbol-icon-constant', 9: 'symbol-icon-enum', 1: 'symbol-icon-module' };
+  return map[kind] || 'symbol-icon-variable';
+}
+
+function symbolKindLetter(kind) {
+  const map = { 5: 'M', 11: 'F', 4: 'C', 10: 'I', 12: 'V', 6: 'P', 13: 'K', 9: 'E', 1: 'M' };
+  return map[kind] || 'S';
+}
+
+function closeSymbolOutline() {
+  symbolsOpen = false;
+  symbolsPalette.classList.add('palette-hidden');
+  editorEl.focus();
+}
+
+symbolsInput.addEventListener('input', () => {
+  symbolSelectedIdx = 0;
+  renderSymbolList(symbolsInput.value);
+});
+
+symbolsInput.addEventListener('keydown', (e) => {
+  const total = symbolsList.children.length;
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    symbolSelectedIdx = Math.min(symbolSelectedIdx + 1, total - 1);
+    updateSymbolSelection();
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    symbolSelectedIdx = Math.max(symbolSelectedIdx - 1, 0);
+    updateSymbolSelection();
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    const items = symbolsList.querySelectorAll('.symbol-item');
+    if (items[symbolSelectedIdx]) items[symbolSelectedIdx].click();
+  } else if (e.key === 'Escape') {
+    closeSymbolOutline();
+  }
+});
+
+symbolsBackdrop.addEventListener('click', closeSymbolOutline);
+
+function updateSymbolSelection() {
+  const items = symbolsList.querySelectorAll('.symbol-item');
+  items.forEach((el, i) => el.classList.toggle('selected', i === symbolSelectedIdx));
+  if (items[symbolSelectedIdx]) items[symbolSelectedIdx].scrollIntoView({ block: 'nearest' });
+}
+
+// --- M6: Formatting (Ctrl+Shift+F) ---
+
+async function formatDocument() {
+  const uri = getActiveUri();
+  if (!uri) return;
+  try {
+    statusEl.textContent = 'Formatting...';
+    const result = await invoke('lsp_format', { uri, tabSize: 2, insertSpaces: true });
+    if (result && Array.isArray(result) && result.length > 0) {
+      // Apply edits from end to start to preserve positions
+      const edits = result.slice().sort((a, b) => {
+        if (b.range.start.line !== a.range.start.line) return b.range.start.line - a.range.start.line;
+        return b.range.start.character - a.range.start.character;
+      });
+      for (const edit of edits) {
+        await invoke('edit_replace_range', {
+          startLine: edit.range.start.line, startCol: edit.range.start.character,
+          endLine: edit.range.end.line, endCol: edit.range.end.character,
+          text: edit.newText,
+        });
+      }
+      const content = await invoke('get_content');
+      renderContent(content);
+      statusEl.textContent = 'Formatted';
+    } else {
+      statusEl.textContent = 'No formatting changes';
+    }
+    setTimeout(() => { statusEl.textContent = ''; }, 2000);
+  } catch (err) {
+    statusEl.textContent = 'Formatting unavailable';
+    setTimeout(() => { statusEl.textContent = ''; }, 2000);
+  }
+}
+
+// --- M6: Global close on Escape ---
+
+function closeLspPopups() {
+  if (acOpen) closeAutocomplete();
+  if (hoverOpen) closeHover();
+  if (sigHelpOpen) closeSignatureHelp();
+  if (codeActionsOpen) closeCodeActions();
+  if (refsOpen) closeReferences();
+  if (symbolsOpen) closeSymbolOutline();
+}
+
+// Close popups when clicking outside
+document.addEventListener('click', (e) => {
+  if (acOpen && !autocompletePopup.contains(e.target) && e.target !== editorEl) closeAutocomplete();
+  if (codeActionsOpen && !codeActionsMenu.contains(e.target)) closeCodeActions();
+});
+
 // ─── Cleanup ─────────────────────────────────────────────────
 
 // Track all polling intervals so they can be cleaned up on reload
@@ -1857,7 +2731,7 @@ async function init() {
     renderContent(content);
     renderTabs();
     editorEl.focus();
-    statusEl.textContent = 'Ready — Ctrl+O to open file, Ctrl+B for explorer, Ctrl+Shift+P for commands';
+    statusEl.textContent = 'Ready — Ctrl+O open, Ctrl+B explorer, Ctrl+Space autocomplete, F12 go-to-def';
     pollExtHostStatus();
     pollStatusBarItems();
   } catch (err) {

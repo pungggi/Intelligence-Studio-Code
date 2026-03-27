@@ -3,14 +3,17 @@
 //! Uses TCP on localhost with length-prefixed JSON messages.
 //! Cross-platform (Linux, macOS, Windows).
 //! Runs on a dedicated Tokio runtime in a background thread.
+//!
+//! M6: Adds request/response pattern with correlation IDs for LSP features.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 const IPC_HOST: &str = "127.0.0.1";
 const IPC_PORT: u16 = 17532;
@@ -49,6 +52,7 @@ pub enum DiagnosticSeverity {
 /// Messages sent from the editor to the Extension Host.
 /// M5: All document-related messages include an optional `workspace_id` field
 /// for future multi-workspace routing. Defaults to "default" for single workspace.
+/// M6: Adds LSP request messages with request_id for request/response correlation.
 #[derive(Debug, Serialize)]
 #[serde(tag = "method", content = "params")]
 #[allow(dead_code)]
@@ -76,6 +80,12 @@ pub enum OutgoingMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         workspace_id: Option<String>,
     },
+    #[serde(rename = "textDocument/didSave")]
+    DidSave {
+        uri: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+    },
     #[serde(rename = "executeCommand")]
     ExecuteCommand { command: String, args: Vec<serde_json::Value> },
     #[serde(rename = "listCommands")]
@@ -85,7 +95,15 @@ pub enum OutgoingMessage {
         request_id: String,
         value: Option<serde_json::Value>,
     },
+    /// M6: Generic LSP request with correlation ID.
+    #[serde(rename = "lsp/request")]
+    LspRequest {
+        request_id: String,
+        method: String,
+        params: serde_json::Value,
+    },
 }
+
 
 /// Messages received from the Extension Host.
 #[derive(Debug, Deserialize)]
@@ -153,6 +171,12 @@ pub struct DecorationRange {
     pub hover_message: Option<String>,
 }
 
+/// M6: Pending request awaiting a response from Extension Host.
+type PendingRequests = Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>;
+
+/// M6: Default timeout for LSP requests (10 seconds).
+const LSP_REQUEST_TIMEOUT_MS: u64 = 10_000;
+
 /// Handle to the IPC bridge for sending messages.
 #[derive(Clone)]
 pub struct IpcHandle {
@@ -165,6 +189,10 @@ pub struct IpcHandle {
     status_bar_items: Arc<Mutex<Vec<StatusBarItem>>>,
     output_lines: Arc<Mutex<Vec<OutputLine>>>,
     decorations: Arc<Mutex<Vec<TextDecoration>>>,
+    pending_requests: PendingRequests,
+    request_counter: Arc<Mutex<u64>>,
+    /// M6: Tokio runtime handle for spawning async tasks from sync context.
+    rt_handle: Arc<Mutex<Option<tokio::runtime::Handle>>>,
 }
 
 impl IpcHandle {
@@ -229,6 +257,60 @@ impl IpcHandle {
             .cloned()
             .collect()
     }
+
+    /// M6: Generate a unique request ID.
+    fn next_request_id(&self) -> String {
+        let mut counter = lock_or_default(&self.request_counter);
+        *counter += 1;
+        format!("req-{}", *counter)
+    }
+
+    /// M6: Send an LSP request and wait for a response (blocking, for Tauri commands).
+    /// Returns the response JSON value or an error on timeout/failure.
+    pub fn request_sync(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let rt_handle = {
+            let guard = lock_or_default(&self.rt_handle);
+            guard.clone().ok_or_else(|| "IPC runtime not ready".to_string())?
+        };
+
+        let request_id = self.next_request_id();
+        let (tx, rx) = oneshot::channel();
+
+        // Register pending request
+        lock_or_default(&self.pending_requests).insert(request_id.clone(), tx);
+
+        // Send the request
+        self.send(OutgoingMessage::LspRequest {
+            request_id: request_id.clone(),
+            method: method.to_string(),
+            params,
+        });
+
+        // Block on the response with timeout
+        let pending = self.pending_requests.clone();
+        let req_id = request_id.clone();
+        rt_handle.block_on(async move {
+            match tokio::time::timeout(
+                tokio::time::Duration::from_millis(LSP_REQUEST_TIMEOUT_MS),
+                rx,
+            ).await {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(_)) => {
+                    // Channel was dropped (e.g., disconnect)
+                    Err("LSP request cancelled".to_string())
+                }
+                Err(_) => {
+                    // Timeout — remove from pending
+                    lock_or_default(&pending).remove(&req_id);
+                    Err("LSP request timed out".to_string())
+                }
+            }
+        })
+    }
 }
 
 /// Start the IPC bridge. Returns a handle for sending messages.
@@ -243,6 +325,9 @@ pub fn start_ipc_bridge() -> IpcHandle {
     let status_bar_items = Arc::new(Mutex::new(Vec::new()));
     let output_lines = Arc::new(Mutex::new(Vec::new()));
     let decorations = Arc::new(Mutex::new(Vec::new()));
+    let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
+    let request_counter = Arc::new(Mutex::new(0u64));
+    let rt_handle: Arc<Mutex<Option<tokio::runtime::Handle>>> = Arc::new(Mutex::new(None));
 
     let handle = IpcHandle {
         sender: tx,
@@ -254,6 +339,9 @@ pub fn start_ipc_bridge() -> IpcHandle {
         status_bar_items: status_bar_items.clone(),
         output_lines: output_lines.clone(),
         decorations: decorations.clone(),
+        pending_requests: pending_requests.clone(),
+        request_counter,
+        rt_handle: rt_handle.clone(),
     };
 
     std::thread::Builder::new()
@@ -264,8 +352,11 @@ pub fn start_ipc_bridge() -> IpcHandle {
                 .build()
                 .expect("Failed to create Tokio runtime");
 
+            // Store the runtime handle so request_sync can use it
+            *lock_or_default(&rt_handle) = Some(rt.handle().clone());
+
             rt.block_on(async move {
-                ipc_loop(rx, diagnostics, connected, commands, notifications, ui_requests, status_bar_items, output_lines, decorations).await;
+                ipc_loop(rx, diagnostics, connected, commands, notifications, ui_requests, status_bar_items, output_lines, decorations, pending_requests).await;
             });
         })
         .expect("Failed to spawn IPC bridge thread");
@@ -283,6 +374,7 @@ async fn ipc_loop(
     status_bar_items: Arc<Mutex<Vec<StatusBarItem>>>,
     output_lines: Arc<Mutex<Vec<OutputLine>>>,
     decorations: Arc<Mutex<Vec<TextDecoration>>>,
+    pending_requests: PendingRequests,
 ) {
     let addr = format!("{}:{}", IPC_HOST, IPC_PORT);
     let mut retry_count: u32 = 0;
@@ -307,7 +399,7 @@ async fn ipc_loop(
                 retry_count = 0;
                 delay_ms = INITIAL_RETRY_DELAY_MS;
 
-                if let Err(e) = handle_connection(stream, &mut rx, &diagnostics, &commands, &notifications, &ui_requests, &status_bar_items, &output_lines, &decorations).await {
+                if let Err(e) = handle_connection(stream, &mut rx, &diagnostics, &commands, &notifications, &ui_requests, &status_bar_items, &output_lines, &decorations, &pending_requests).await {
                     log::warn!("[IPC] Connection lost: {}", e);
                 }
 
@@ -342,6 +434,7 @@ async fn handle_connection(
     status_bar_items: &Arc<Mutex<Vec<StatusBarItem>>>,
     output_lines: &Arc<Mutex<Vec<OutputLine>>>,
     decorations: &Arc<Mutex<Vec<TextDecoration>>>,
+    pending_requests: &PendingRequests,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
 
@@ -353,6 +446,7 @@ async fn handle_connection(
     let sb_clone = status_bar_items.clone();
     let out_clone = output_lines.clone();
     let dec_clone = decorations.clone();
+    let pending_clone = pending_requests.clone();
     let mut read_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         let mut accumulated = Vec::new();
@@ -394,7 +488,7 @@ async fn handle_connection(
 
                         let payload = &accumulated[4..4 + frame_len];
                         match serde_json::from_slice::<IncomingMessage>(payload) {
-                            Ok(msg) => handle_incoming(&msg, &diag_clone, &cmd_clone, &notif_clone, &ui_clone, &sb_clone, &out_clone, &dec_clone),
+                            Ok(msg) => handle_incoming(&msg, &diag_clone, &cmd_clone, &notif_clone, &ui_clone, &sb_clone, &out_clone, &dec_clone, &pending_clone),
                             Err(e) => log::warn!("[IPC] Malformed message: {}", e),
                         }
 
@@ -442,8 +536,22 @@ fn handle_incoming(
     status_bar_items: &Arc<Mutex<Vec<StatusBarItem>>>,
     output_lines: &Arc<Mutex<Vec<OutputLine>>>,
     decorations: &Arc<Mutex<Vec<TextDecoration>>>,
+    pending_requests: &PendingRequests,
 ) {
     match msg.method.as_str() {
+        // M6: LSP response correlation
+        "lsp/response" => {
+            if let Some(params) = &msg.params {
+                let request_id = params.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let result = params.get("result").cloned().unwrap_or(serde_json::Value::Null);
+                let mut store = lock_or_default(pending_requests);
+                if let Some(sender) = store.remove(&request_id) {
+                    let _ = sender.send(result);
+                } else {
+                    log::warn!("[IPC] No pending request for response id: {}", request_id);
+                }
+            }
+        }
         "publishDiagnostics" => {
             if let Some(params) = &msg.params {
                 let uri = params

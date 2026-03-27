@@ -456,6 +456,128 @@ fn notify_change(path_str: &str, version: u32, text: &str, ipc: &IpcHandle) {
     });
 }
 
+// --- M6: LSP Tauri Commands ---
+
+/// Request hover information at a position.
+#[tauri::command]
+fn lsp_hover(
+    uri: String,
+    line: usize,
+    character: usize,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({ "uri": uri, "line": line, "character": character });
+    state.ipc.request_sync("textDocument/hover", params)
+}
+
+/// Request completions at a position.
+#[tauri::command]
+fn lsp_completion(
+    uri: String,
+    line: usize,
+    character: usize,
+    trigger_kind: Option<u32>,
+    trigger_character: Option<String>,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "uri": uri,
+        "line": line,
+        "character": character,
+        "triggerKind": trigger_kind.unwrap_or(1),
+        "triggerCharacter": trigger_character,
+    });
+    state.ipc.request_sync("textDocument/completion", params)
+}
+
+/// Request go-to-definition at a position.
+#[tauri::command]
+fn lsp_definition(
+    uri: String,
+    line: usize,
+    character: usize,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({ "uri": uri, "line": line, "character": character });
+    state.ipc.request_sync("textDocument/definition", params)
+}
+
+/// Request find references at a position.
+#[tauri::command]
+fn lsp_references(
+    uri: String,
+    line: usize,
+    character: usize,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({ "uri": uri, "line": line, "character": character });
+    state.ipc.request_sync("textDocument/references", params)
+}
+
+/// Request code actions for a range.
+#[tauri::command]
+fn lsp_code_action(
+    uri: String,
+    start_line: usize,
+    start_character: usize,
+    end_line: usize,
+    end_character: usize,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "uri": uri,
+        "startLine": start_line,
+        "startCharacter": start_character,
+        "endLine": end_line,
+        "endCharacter": end_character,
+    });
+    state.ipc.request_sync("textDocument/codeAction", params)
+}
+
+/// Request signature help at a position.
+#[tauri::command]
+fn lsp_signature_help(
+    uri: String,
+    line: usize,
+    character: usize,
+    trigger_character: Option<String>,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "uri": uri,
+        "line": line,
+        "character": character,
+        "triggerCharacter": trigger_character,
+    });
+    state.ipc.request_sync("textDocument/signatureHelp", params)
+}
+
+/// Request document symbols (outline).
+#[tauri::command]
+fn lsp_document_symbols(
+    uri: String,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({ "uri": uri });
+    state.ipc.request_sync("textDocument/documentSymbol", params)
+}
+
+/// Request document formatting.
+#[tauri::command]
+fn lsp_format(
+    uri: String,
+    tab_size: Option<u32>,
+    insert_spaces: Option<bool>,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "uri": uri,
+        "tabSize": tab_size.unwrap_or(2),
+        "insertSpaces": insert_spaces.unwrap_or(true),
+    });
+    state.ipc.request_sync("textDocument/formatting", params)
+}
+
 // --- Response types ---
 
 #[derive(serde::Serialize, Clone)]
@@ -536,9 +658,18 @@ pub fn run() {
             respond_ui_request,
             get_status_bar_items,
             get_output_lines,
+            // M6: LSP commands
+            lsp_hover,
+            lsp_completion,
+            lsp_definition,
+            lsp_references,
+            lsp_code_action,
+            lsp_signature_help,
+            lsp_document_symbols,
+            lsp_format,
         ])
         .setup(|app| {
-            log::info!("CoreCode M5 starting...");
+            log::info!("CoreCode M6 starting...");
 
             let app_handle = app.handle().clone();
             std::thread::Builder::new()

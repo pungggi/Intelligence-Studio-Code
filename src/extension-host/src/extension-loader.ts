@@ -11,6 +11,7 @@
 import { readFileSync, readdirSync, existsSync, realpathSync } from "fs";
 import { join, resolve, relative, isAbsolute } from "path";
 import { VscodeApiShim } from "./vscode-api-shim";
+import { LanguageClient } from "./language-client";
 
 interface ExtensionManifest {
   name: string;
@@ -168,6 +169,18 @@ export class ExtensionLoader {
     try {
       // Inject vscode API into the module's require cache before loading
       const vscodeApi = this.apiShim.createVscodeApi();
+
+      // M6: Build vscode-languageclient shim with LanguageClient that has vscodeApi attached
+      const languageClientShim = {
+        LanguageClient: class extends LanguageClient {
+          constructor(id: string, name: string, serverOptions: unknown, clientOptions: unknown) {
+            super(id, name, serverOptions as import("./language-client").ServerOptions, clientOptions as import("./language-client").ClientOptions);
+            this.setVscodeApi(vscodeApi);
+          }
+        },
+        TransportKind: { stdio: 0, ipc: 1, pipe: 2, socket: 3 },
+      };
+
       const Module = require("module");
       const originalResolve = Module._resolveFilename;
       Module._resolveFilename = function (
@@ -177,6 +190,9 @@ export class ExtensionLoader {
         if (request === "vscode") {
           return "vscode";
         }
+        if (request === "vscode-languageclient" || request === "vscode-languageclient/node") {
+          return "vscode-languageclient";
+        }
         return originalResolve.call(this, request, ...args);
       };
       require.cache["vscode"] = {
@@ -184,6 +200,12 @@ export class ExtensionLoader {
         filename: "vscode",
         loaded: true,
         exports: vscodeApi,
+      } as NodeJS.Module;
+      require.cache["vscode-languageclient"] = {
+        id: "vscode-languageclient",
+        filename: "vscode-languageclient",
+        loaded: true,
+        exports: languageClientShim,
       } as NodeJS.Module;
 
       // Load the extension module, then restore the global monkeypatch
