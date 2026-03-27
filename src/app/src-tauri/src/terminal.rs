@@ -36,12 +36,26 @@ pub struct TerminalInfo {
     pub title: String,
 }
 
+/// Wrapper that makes `Box<dyn MasterPty>` safe to send across threads.
+///
+/// # Safety
+/// All concrete portable-pty master implementations (`UnixMasterPty`,
+/// `ConPtyMaster`, `WinPtyMaster`) hold only file-descriptor / OS-handle
+/// types that are inherently Send.  The trait itself lacks a `Send` supertrait
+/// only to preserve object-safety across crate versions; no implementation is
+/// thread-hostile.
+struct SendableMaster(Box<dyn portable_pty::MasterPty>);
+// SAFETY: see struct doc above.
+unsafe impl Send for SendableMaster {}
+
 /// A live PTY session.
 struct PtySession {
     /// Writer half of the PTY master — used to send keystrokes to the shell.
     writer: Box<dyn Write + Send>,
     /// Handle to the child process.
     child: Box<dyn portable_pty::Child + Send>,
+    /// Master PTY — kept alive for resize support.
+    master: SendableMaster,
     /// Human-readable title (shell name).
     title: String,
 }
@@ -112,6 +126,7 @@ impl TerminalManager {
             PtySession {
                 writer,
                 child,
+                master: SendableMaster(pair.master),
                 title,
             },
         );
@@ -132,12 +147,16 @@ impl TerminalManager {
 
     /// Resize a terminal's PTY.
     pub fn resize(&mut self, terminal_id: &str, cols: u16, rows: u16) -> Result<()> {
-        // portable-pty doesn't expose resize on the session after creation
-        // without keeping the master around. We store it via the writer,
-        // but resize requires the MasterPty. For now, resize is a best-effort no-op.
-        // TODO: Keep MasterPty reference for resize support.
-        let _ = (terminal_id, cols, rows);
-        log::warn!("[Terminal] Resize requested but not yet implemented for active sessions");
+        let session = self
+            .sessions
+            .get_mut(terminal_id)
+            .context("Terminal not found")?;
+        session.master.0.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
         Ok(())
     }
 

@@ -1918,12 +1918,13 @@ function createWebviewTab(panelId, title, _enableScripts) {
 
   const iframe = document.createElement('iframe');
   iframe.className = 'webview-iframe';
-  // allow-same-origin is needed for acquireVsCodeApi state storage; scripts enabled per panel option
-  iframe.setAttribute('sandbox', 'allow-scripts allow-forms allow-same-origin');
+  // allow-same-origin is intentionally omitted: combining it with allow-scripts
+  // allows sandbox escapes. acquireVsCodeApi state is stored in a JS closure instead.
+  iframe.setAttribute('sandbox', 'allow-scripts allow-forms');
   container.appendChild(iframe);
 
   webviewPanelMap.set(panelId, { container, iframe, title: title || 'Preview' });
-  renderTabs();
+  // revealWebviewTab calls renderTabs() — no need to call it separately here.
   revealWebviewTab(panelId);
 }
 

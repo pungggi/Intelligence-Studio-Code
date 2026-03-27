@@ -785,6 +785,12 @@ fn terminal_create(
     rows: u32,
     state: tauri::State<AppState>,
 ) -> Result<String, String> {
+    // Reject shell paths that contain traversal sequences.
+    if let Some(ref s) = shell {
+        if s.contains("..") {
+            return Err("Invalid shell path: path traversal not allowed".to_string());
+        }
+    }
     let mut mgr = state.terminal_mgr.lock().map_err(|e| e.to_string())?;
     mgr.create(
         &app,

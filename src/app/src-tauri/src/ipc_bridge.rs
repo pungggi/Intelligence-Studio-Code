@@ -145,6 +145,19 @@ fn lock_or_default<T: Default>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T>
     })
 }
 
+/// Maximum number of webview panel events buffered before events are dropped.
+const MAX_WEBVIEW_EVENTS: usize = 100;
+
+/// Push a webview panel event, dropping it (with a warning) if the queue is full.
+fn push_webview_event(store: &Arc<Mutex<Vec<WebviewPanelEvent>>>, event: WebviewPanelEvent) {
+    let mut guard = lock_or_default(store);
+    if guard.len() < MAX_WEBVIEW_EVENTS {
+        guard.push(event);
+    } else {
+        log::warn!("[IPC] Webview event queue full — dropping '{}' event for panel '{}'", event.kind, event.panel_id);
+    }
+}
+
 /// A notification message from the Extension Host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Notification {
@@ -720,35 +733,34 @@ fn handle_incoming(
                 let title = params.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
                 let column = params.get("column").and_then(|v| v.as_u64()).map(|n| n as u32);
                 let enable_scripts = params.get("enable_scripts").and_then(|v| v.as_bool());
-                let mut store = lock_or_default(webview_events);
-                store.push(WebviewPanelEvent { kind: "create".to_string(), panel_id, title, view_type, column, enable_scripts, html: None, message: None });
+                push_webview_event(webview_events, WebviewPanelEvent { kind: "create".to_string(), panel_id, title, view_type, column, enable_scripts, html: None, message: None });
             }
         }
         "webview/setHtml" => {
             if let Some(params) = &msg.params {
                 let panel_id = params.get("panel_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let html = params.get("html").and_then(|v| v.as_str()).map(|s| s.to_string());
-                lock_or_default(webview_events).push(WebviewPanelEvent { kind: "setHtml".to_string(), panel_id, title: None, view_type: None, column: None, enable_scripts: None, html, message: None });
+                push_webview_event(webview_events, WebviewPanelEvent { kind: "setHtml".to_string(), panel_id, title: None, view_type: None, column: None, enable_scripts: None, html, message: None });
             }
         }
         "webview/postMessage" => {
             if let Some(params) = &msg.params {
                 let panel_id = params.get("panel_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let message = params.get("message").cloned();
-                lock_or_default(webview_events).push(WebviewPanelEvent { kind: "postMessage".to_string(), panel_id, title: None, view_type: None, column: None, enable_scripts: None, html: None, message });
+                push_webview_event(webview_events, WebviewPanelEvent { kind: "postMessage".to_string(), panel_id, title: None, view_type: None, column: None, enable_scripts: None, html: None, message });
             }
         }
         "webview/reveal" => {
             if let Some(params) = &msg.params {
                 let panel_id = params.get("panel_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let column = params.get("column").and_then(|v| v.as_u64()).map(|n| n as u32);
-                lock_or_default(webview_events).push(WebviewPanelEvent { kind: "reveal".to_string(), panel_id, title: None, view_type: None, column, enable_scripts: None, html: None, message: None });
+                push_webview_event(webview_events, WebviewPanelEvent { kind: "reveal".to_string(), panel_id, title: None, view_type: None, column, enable_scripts: None, html: None, message: None });
             }
         }
         "webview/close" => {
             if let Some(params) = &msg.params {
                 let panel_id = params.get("panel_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                lock_or_default(webview_events).push(WebviewPanelEvent { kind: "close".to_string(), panel_id, title: None, view_type: None, column: None, enable_scripts: None, html: None, message: None });
+                push_webview_event(webview_events, WebviewPanelEvent { kind: "close".to_string(), panel_id, title: None, view_type: None, column: None, enable_scripts: None, html: None, message: None });
             }
         }
         _ => {
