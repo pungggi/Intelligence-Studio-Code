@@ -7,24 +7,54 @@
  * 3. Routes messages between extensions and the frontend
  */
 
-import { resolve } from "path";
+import { resolve, relative, isAbsolute } from "path";
+import { realpathSync, existsSync } from "fs";
 import { ExtensionLoader } from "./extension-loader";
 import { IpcServer } from "./ipc-server";
 import { VscodeApiShim } from "./vscode-api-shim";
 
 const IPC_HOST = process.env.CORECODE_IPC_HOST ?? "127.0.0.1";
 const IPC_PORT = parseInt(process.env.CORECODE_IPC_PORT ?? "17532", 10);
+const IPC_TOKEN = process.env.CORECODE_IPC_TOKEN ?? "";
 
 async function main(): Promise<void> {
   console.log("[ExtensionHost] Starting...");
 
   const apiShim = new VscodeApiShim();
   const extensionLoader = new ExtensionLoader(apiShim);
-  const ipcServer = new IpcServer(IPC_HOST, IPC_PORT);
+  const ipcServer = new IpcServer(IPC_HOST, IPC_PORT, IPC_TOKEN);
 
   // Start IPC server and wait for frontend connection
   await ipcServer.start();
   console.log(`[ExtensionHost] IPC server listening on ${IPC_HOST}:${IPC_PORT}`);
+
+  // Collect allowed extension directories for path validation
+  const bundledDir =
+    process.env.CORECODE_EXTENSIONS ??
+    resolve(__dirname, "../../../test-extensions");
+  const userExtDir = process.env.CORECODE_USER_EXTENSIONS ?? "";
+  const allowedExtDirs: string[] = [];
+  if (existsSync(bundledDir)) {
+    try { allowedExtDirs.push(realpathSync(resolve(bundledDir))); } catch { /* skip */ }
+  }
+  if (userExtDir && existsSync(userExtDir)) {
+    try { allowedExtDirs.push(realpathSync(resolve(userExtDir))); } catch { /* skip */ }
+  }
+
+  /** Validate that an extension path is inside an allowed extensions directory. */
+  function isAllowedExtensionPath(extPath: string): boolean {
+    const absPath = resolve(extPath);
+    let realPath: string;
+    try {
+      realPath = existsSync(absPath) ? realpathSync(absPath) : absPath;
+    } catch {
+      return false;
+    }
+    return allowedExtDirs.some((dir) => {
+      const rel = relative(dir, realPath);
+      return !rel.startsWith("..") && !isAbsolute(rel);
+    });
+  }
 
   // Forward IPC messages to the API shim, with M8 extension lifecycle hooks
   ipcServer.onMessage(async (msg) => {
@@ -32,6 +62,11 @@ async function main(): Promise<void> {
     if (msg.method === "extension/installed") {
       const p = msg.params as { path: string };
       if (p?.path) {
+        // Validate path is within allowed extension directories
+        if (!isAllowedExtensionPath(p.path)) {
+          console.error(`[ExtensionHost] Rejected extension load — path outside allowed directories: ${p.path}`);
+          return;
+        }
         console.log(`[ExtensionHost] Hot-loading extension from: ${p.path}`);
         try {
           await extensionLoader.loadAndActivateSingle(p.path);
@@ -59,11 +94,6 @@ async function main(): Promise<void> {
   });
 
   // Scan and activate extensions from all configured directories
-  const bundledDir =
-    process.env.CORECODE_EXTENSIONS ??
-    resolve(__dirname, "../../../test-extensions");
-  const userExtDir = process.env.CORECODE_USER_EXTENSIONS ?? "";
-
   const extensionDirs = [bundledDir];
   if (userExtDir && userExtDir !== bundledDir) {
     extensionDirs.push(userExtDir);

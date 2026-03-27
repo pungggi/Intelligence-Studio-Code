@@ -44,6 +44,18 @@ pub struct ExtensionManager {
     registry_path: PathBuf,
 }
 
+/// Validate that an extension identifier component contains no path traversal sequences.
+/// Rejects `/`, `\`, `..`, and empty strings.
+fn validate_extension_id_component(component: &str, label: &str) -> Result<(), String> {
+    if component.is_empty() {
+        return Err(format!("Invalid {label}: must not be empty"));
+    }
+    if component.contains('/') || component.contains('\\') || component.contains("..") {
+        return Err(format!("Invalid {label}: contains path traversal characters"));
+    }
+    Ok(())
+}
+
 impl ExtensionManager {
     pub fn new() -> Result<Self, String> {
         let data_dir = dirs::data_local_dir()
@@ -94,6 +106,10 @@ impl ExtensionManager {
         description: Option<&str>,
         vsix_bytes: &[u8],
     ) -> Result<InstalledExtension, String> {
+        // Validate namespace and name to prevent path traversal
+        validate_extension_id_component(namespace, "namespace")?;
+        validate_extension_id_component(name, "extension name")?;
+
         let extension_id = format!("{namespace}.{name}");
         let install_dir = self.extensions_dir.join(&extension_id);
 
@@ -268,6 +284,11 @@ impl ExtensionManager {
     }
 
     pub fn uninstall(&self, extension_id: &str) -> Result<(), String> {
+        // Validate extension_id to prevent path traversal (e.g., "../../important_data")
+        if extension_id.contains('/') || extension_id.contains('\\') || extension_id.contains("..") || extension_id.is_empty() {
+            return Err(format!("Invalid extension ID: {extension_id}"));
+        }
+
         let install_dir = self.extensions_dir.join(extension_id);
         if install_dir.exists() {
             std::fs::remove_dir_all(&install_dir)

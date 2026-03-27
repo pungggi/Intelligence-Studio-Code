@@ -115,6 +115,9 @@ pub enum OutgoingMessage {
         key: String,
         value: serde_json::Value,
     },
+    /// IPC authentication handshake — must be the first message sent on connection.
+    #[serde(rename = "ipc/auth")]
+    IpcAuth { token: String },
 }
 
 
@@ -328,7 +331,7 @@ pub fn find_free_port() -> u16 {
 
 /// Start the IPC bridge. Returns a handle for sending messages.
 /// The bridge runs in a background thread with its own Tokio runtime.
-pub fn start_ipc_bridge(port: u16) -> IpcHandle {
+pub fn start_ipc_bridge(port: u16, auth_token: &str) -> IpcHandle {
     let (tx, rx) = mpsc::channel::<OutgoingMessage>(256);
     let diagnostics = Arc::new(Mutex::new(Vec::new()));
     let connected = Arc::new(Mutex::new(false));
@@ -355,6 +358,7 @@ pub fn start_ipc_bridge(port: u16) -> IpcHandle {
         request_counter,
     };
 
+    let token_for_thread = auth_token.to_string();
     std::thread::Builder::new()
         .name("ipc-bridge".to_string())
         .spawn(move || {
@@ -364,7 +368,7 @@ pub fn start_ipc_bridge(port: u16) -> IpcHandle {
                 .expect("Failed to create Tokio runtime");
 
             rt.block_on(async move {
-                ipc_loop(port, rx, diagnostics, connected, commands, notifications, ui_requests, status_bar_items, output_lines, decorations, pending_requests).await;
+                ipc_loop(port, &token_for_thread, rx, diagnostics, connected, commands, notifications, ui_requests, status_bar_items, output_lines, decorations, pending_requests).await;
             });
         })
         .expect("Failed to spawn IPC bridge thread");
@@ -374,6 +378,7 @@ pub fn start_ipc_bridge(port: u16) -> IpcHandle {
 
 async fn ipc_loop(
     port: u16,
+    auth_token: &str,
     mut rx: mpsc::Receiver<OutgoingMessage>,
     diagnostics: Arc<Mutex<Vec<Diagnostic>>>,
     connected: Arc<Mutex<bool>>,
@@ -408,7 +413,7 @@ async fn ipc_loop(
                 retry_count = 0;
                 delay_ms = INITIAL_RETRY_DELAY_MS;
 
-                if let Err(e) = handle_connection(stream, &mut rx, &diagnostics, &commands, &notifications, &ui_requests, &status_bar_items, &output_lines, &decorations, &pending_requests).await {
+                if let Err(e) = handle_connection(stream, auth_token, &mut rx, &diagnostics, &commands, &notifications, &ui_requests, &status_bar_items, &output_lines, &decorations, &pending_requests).await {
                     log::warn!("[IPC] Connection lost: {}", e);
                 }
 
@@ -435,6 +440,7 @@ async fn ipc_loop(
 
 async fn handle_connection(
     stream: TcpStream,
+    auth_token: &str,
     rx: &mut mpsc::Receiver<OutgoingMessage>,
     diagnostics: &Arc<Mutex<Vec<Diagnostic>>>,
     commands: &Arc<Mutex<Vec<String>>>,
@@ -446,6 +452,17 @@ async fn handle_connection(
     pending_requests: &PendingRequests,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
+
+    // Send auth token as the first message immediately on connection
+    {
+        let auth_msg = OutgoingMessage::IpcAuth { token: auth_token.to_string() };
+        let json = serde_json::to_vec(&auth_msg)
+            .context("Failed to serialize auth message")?;
+        let len = (json.len() as u32).to_le_bytes();
+        writer.write_all(&len).await?;
+        writer.write_all(&json).await?;
+        log::info!("[IPC] Auth token sent");
+    }
 
     // Spawn reader task
     let diag_clone = diagnostics.clone();

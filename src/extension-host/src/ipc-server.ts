@@ -4,6 +4,10 @@
  * Cross-platform: uses TCP on localhost instead of Unix Domain Sockets.
  * Protocol: Length-prefixed JSON frames.
  * Each frame is [4 bytes LE length][JSON payload].
+ *
+ * Security: Requires authentication via a shared secret token.
+ * The first message on any new connection must be an `ipc/auth` message
+ * containing the expected token. Unauthenticated connections are rejected.
  */
 
 import { createServer, Server, Socket } from "net";
@@ -13,6 +17,9 @@ const IPC_PORT = parseInt(process.env.CORECODE_IPC_PORT ?? "0", 10);
 
 /** Maximum IPC frame size (10 MB). Must match Rust side. */
 const MAX_FRAME_SIZE = 10 * 1024 * 1024;
+
+/** Timeout for authentication handshake (5 seconds). */
+const AUTH_TIMEOUT_MS = 5000;
 
 export interface IpcMessage {
   method: string;
@@ -29,10 +36,14 @@ export class IpcServer {
   private bufferLength: number = 0;
   private host: string;
   private port: number;
+  private authToken: string;
+  private authenticated: boolean = false;
+  private authTimer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(host?: string, port?: number) {
+  constructor(host?: string, port?: number, authToken?: string) {
     this.host = host ?? IPC_HOST;
     this.port = port ?? IPC_PORT;
+    this.authToken = authToken ?? "";
   }
 
   async start(): Promise<void> {
@@ -44,8 +55,22 @@ export class IpcServer {
           this.client.destroy();
         }
         this.client = socket;
+        this.authenticated = false;
         this.bufferChunks = [];
         this.bufferLength = 0;
+
+        // Start auth timeout — disconnect if not authenticated in time
+        if (this.authToken) {
+          this.authTimer = setTimeout(() => {
+            if (!this.authenticated) {
+              console.error("[IPC] Auth timeout — disconnecting unauthenticated client");
+              socket.destroy();
+            }
+          }, AUTH_TIMEOUT_MS);
+        } else {
+          // No token configured — skip auth (development mode)
+          this.authenticated = true;
+        }
 
         socket.on("data", (data: Buffer) => {
           this.onData(data);
@@ -54,6 +79,11 @@ export class IpcServer {
         socket.on("close", () => {
           console.log("[IPC] Frontend disconnected");
           this.client = null;
+          this.authenticated = false;
+          if (this.authTimer) {
+            clearTimeout(this.authTimer);
+            this.authTimer = null;
+          }
         });
 
         socket.on("error", (err: Error) => {
@@ -108,6 +138,35 @@ export class IpcServer {
 
       try {
         const msg: IpcMessage = JSON.parse(payload.toString("utf-8"));
+
+        // Gate on authentication: first message must be ipc/auth with correct token
+        if (!this.authenticated) {
+          if (msg.method === "ipc/auth" && this.authToken) {
+            const providedToken = (msg.params as { token?: string })?.token;
+            if (providedToken && providedToken === this.authToken) {
+              this.authenticated = true;
+              if (this.authTimer) {
+                clearTimeout(this.authTimer);
+                this.authTimer = null;
+              }
+              console.log("[IPC] Client authenticated successfully");
+            } else {
+              console.error("[IPC] Auth failed — invalid token, disconnecting");
+              this.client?.destroy();
+              this.bufferChunks = [];
+              this.bufferLength = 0;
+              return;
+            }
+          } else {
+            console.error("[IPC] Received message before authentication, disconnecting");
+            this.client?.destroy();
+            this.bufferChunks = [];
+            this.bufferLength = 0;
+            return;
+          }
+          continue; // Don't forward auth message to handler
+        }
+
         this.messageHandler?.(msg);
       } catch (err) {
         console.error("[IPC] Failed to parse message:", err);

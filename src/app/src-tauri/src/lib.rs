@@ -834,8 +834,9 @@ pub fn run() {
     env_logger::init();
 
     let ipc_port = ipc_bridge::find_free_port();
+    let ipc_token = ext_host::generate_ipc_token();
     log::info!("CoreCode IPC port: {}", ipc_port);
-    let ipc = ipc_bridge::start_ipc_bridge(ipc_port);
+    let ipc = ipc_bridge::start_ipc_bridge(ipc_port, &ipc_token);
 
     let marketplace_client = marketplace::MarketplaceClient::new()
         .expect("Failed to create marketplace client");
@@ -914,10 +915,11 @@ pub fn run() {
 
             let app_handle = app.handle().clone();
             let ext_dir = user_extensions_dir.clone();
+            let token = ipc_token.clone();
             std::thread::Builder::new()
                 .name("ext-host-mgr".to_string())
                 .spawn(move || {
-                    if let Err(e) = ext_host::start_extension_host(&app_handle, ipc_port, &ext_dir) {
+                    if let Err(e) = ext_host::start_extension_host(&app_handle, ipc_port, &ext_dir, &token) {
                         log::error!("Failed to start Extension Host: {}", e);
                     }
                 })

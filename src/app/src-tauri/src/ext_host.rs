@@ -37,9 +37,16 @@ pub fn kill_extension_host() {
 /// Maximum number of restart attempts before giving up.
 const MAX_RESTARTS: u32 = 5;
 
+/// Generate a 64-character hex token from OS CSPRNG for IPC authentication.
+pub fn generate_ipc_token() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).expect("Failed to generate random bytes for IPC token");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Start the Extension Host as a child process.
 /// Automatically restarts on crash with exponential backoff.
-pub fn start_extension_host(_app: &AppHandle, ipc_port: u16, user_extensions_dir: &str) -> Result<()> {
+pub fn start_extension_host(_app: &AppHandle, ipc_port: u16, user_extensions_dir: &str, ipc_token: &str) -> Result<()> {
     let host_script = match find_ext_host_script() {
         Some(script) => script,
         None => {
@@ -59,6 +66,7 @@ pub fn start_extension_host(_app: &AppHandle, ipc_port: u16, user_extensions_dir
             .env("CORECODE_MODE", "embedded")
             .env("CORECODE_IPC_HOST", "127.0.0.1")
             .env("CORECODE_IPC_PORT", ipc_port.to_string())
+            .env("CORECODE_IPC_TOKEN", ipc_token)
             .env("CORECODE_USER_EXTENSIONS", user_extensions_dir)
             .spawn();
 

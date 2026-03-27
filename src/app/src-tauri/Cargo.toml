@@ -50,3 +50,6 @@ tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros", "
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 zip = "2"
 dirs = "5"
+
+# Cryptographic random for IPC auth token
+getrandom = "0.2"
