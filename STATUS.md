@@ -1,6 +1,6 @@
 # CoreCode — Project Status
 
-**Last updated:** 2026-03-26
+**Last updated:** 2026-03-27
 
 ---
 
@@ -88,6 +88,8 @@ All 4 spikes passed validation:
 
 ## M4: MVP Beta — IN PROGRESS
 
+**Progress: ~85% (backend + frontend wiring complete; PRD stretch goals remain)**
+
 ### Completed (Backend + Extension Host + HTML/CSS)
 
 | Feature | Layer | Status |
@@ -105,16 +107,48 @@ All 4 spikes passed validation:
 | **Output panel UI** | index.html, style.css | Done — collapsible panel with channel selector |
 | **Status bar items UI** | index.html, style.css | Done — extension-contributed items in status bar |
 
-### Pending (Frontend JS wiring)
+### Completed (Frontend JS wiring in editor.js)
 
-| Feature | Description |
-|:--------|:------------|
-| **Selection rendering** | Shift+Arrow, Ctrl+A, click-drag, selection highlight overlays |
-| **Clipboard** | Ctrl+C (copy), Ctrl+X (cut), Ctrl+V (paste) using selection |
-| **Undo/Redo keybindings** | Ctrl+Z / Ctrl+Shift+Z wired to `edit_undo` / `edit_redo` |
-| **Find/Replace wiring** | Ctrl+F / Ctrl+H open find bar, navigate matches, replace |
-| **Status bar polling** | Poll `get_status_bar_items`, render extension items |
-| **Output panel toggle** | Ctrl+\` to toggle, poll `get_output_lines`, channel switching |
+| # | Feature | Description |
+|:--|:--------|:------------|
+| 1 | **Undo/Redo keybindings** | Done — Ctrl+Z → `edit_undo`, Ctrl+Shift+Z / Ctrl+Y → `edit_redo` |
+| 2 | **Selection rendering** | Done — anchor/head tracking, Shift+Arrow, Ctrl+A, click-drag, Shift+click, highlight overlays |
+| 3 | **Clipboard** | Done — Ctrl+C (copy), Ctrl+X (cut), Ctrl+V (paste), selection-aware with multi-line support |
+| 4 | **Find/Replace wiring** | Done — Ctrl+F/H opens find bar, live search, match highlighting, prev/next navigation, replace single/all |
+| 5 | **Status bar polling** | Done — polls `get_status_bar_items` every 2s, renders extension items, click → command |
+| 6 | **Output panel toggle** | Done — Ctrl+\` toggles panel, polls `get_output_lines`, channel selector, clear/close |
+
+### Not Yet Tracked (PRD M4 scope beyond STATUS.md)
+
+The PRD defines M4 as "Top 20 Extensions, Performance-Optimierung, macOS+Linux". The following items from the PRD's M4 scope are not yet addressed:
+
+| Item | Status | Notes |
+|:-----|:-------|:------|
+| **Top 20 extension compatibility** | Not started | Requires LSP client, completion provider, hover provider, code actions — major API surface |
+| **Performance optimization** | Not started | Need profiling baseline; current HTML-based rendering is a placeholder for eventual wgpu |
+| **macOS + Linux validation** | Not started | Architecture is cross-platform (Tauri + Rust), but untested on non-Windows |
+| **Multi-project / workspace support** | Not designed | See architectural note below |
+
+### Architectural Note: Extension Host & Multi-Project
+
+**Current model:** Single `EditorState` + single Extension Host process. No multi-project concept.
+
+**VS Code model:** Each window gets its own Extension Host process (N projects = N Node.js processes, ~200-400MB each).
+
+**Proposed efficient model for CoreCode:** Shared Extension Host with workspace-scoped routing.
+
+Key requirements for shared Extension Host:
+1. **Workspace-tagged IPC** — add `workspaceId` to all IPC messages
+2. **Per-workspace document collections** — host maintains separate `TextDocument` sets per workspace
+3. **Per-workspace configuration** — `workspace.getConfiguration()` resolves against correct workspace settings
+4. **LSP server strategy** — share servers that support `workspace/didChangeWorkspaceFolders`, isolate others as per-workspace child processes
+5. **Diagnostic/UI routing** — notifications, status bar items, QuickPick requests need window affinity
+6. **Activation scoping** — activation events evaluated per-workspace (e.g., `onLanguage:python` only in Python projects)
+7. **Error isolation** — per-workspace error boundaries so one workspace crash doesn't affect others
+
+**Memory impact:** Reduces from O(N × extensions) to O(extensions + N × LSP-servers). For 3 projects: ~400MB vs ~900MB.
+
+**Recommendation:** Design the workspace-tagged IPC protocol now (M4), implement single-workspace first, extend to multi-workspace in M5.
 
 ---
 
