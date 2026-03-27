@@ -573,6 +573,42 @@ export class VscodeApiShim {
         this.handleLspRequest(p.request_id, p.method, p.params);
         break;
       }
+      // M8: Settings change notification
+      case "settings/changed": {
+        const sp = msg.params as { key: string; value: unknown };
+        if (sp.key && sp.value !== undefined) {
+          this.configOverrides.set(sp.key, sp.value);
+          console.log(`[ApiShim] Setting updated: ${sp.key}`);
+        }
+        break;
+      }
+      // M8: Settings definitions request
+      case "settings/getDefinitions": {
+        const defs: Array<{ key: string; type_name: string; default_value: unknown; description: string; category?: string }> = [];
+        for (const [key, value] of this.configDefaults.entries()) {
+          defs.push({
+            key,
+            type_name: typeof value,
+            default_value: value,
+            description: "",
+            category: key.split(".")[0] ?? "general",
+          });
+        }
+        // Send as a request/response using the same pattern as LSP
+        const reqParams = msg.params as { request_id?: string } | undefined;
+        if (reqParams?.request_id) {
+          this.sendOutgoing({
+            method: "lsp/response",
+            params: { request_id: reqParams.request_id, result: { definitions: defs } },
+          });
+        }
+        break;
+      }
+      // M8: Extension installed — handled by host.ts/extension-loader directly
+      case "extension/installed":
+      case "extension/uninstalled":
+        // These are handled at the host level, not in the API shim
+        break;
       default:
         console.log(`[ApiShim] Unknown method: ${msg.method}`);
     }

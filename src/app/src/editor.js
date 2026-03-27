@@ -1,14 +1,14 @@
 /**
- * CoreCode M7 — Canvas-based Editor Frontend
+ * CoreCode M8 — Canvas-based Editor Frontend
  *
- * M7 changes:
- * - DOM-based line rendering replaced with Canvas2D
- * - Virtual scrolling: only visible lines fetched/rendered
- * - Edit commands return lightweight EditResult (no line data)
- * - O(1) mouse position mapping (arithmetic, no DOM queries)
- * - Token-colored text drawn directly on canvas
+ * M8 changes:
+ * - Extension marketplace (Open VSX) with search, install, uninstall
+ * - Activity bar for panel switching (Explorer, Extensions, Settings)
+ * - Settings editor UI with live persistence
+ * - Multi-directory extension loading with hot-install
  *
- * Carried from M1-M6:
+ * Carried from M1-M7:
+ * - Canvas2D rendering, virtual scrolling, O(1) edit responses
  * - Syntax highlighting, diagnostics, command palette
  * - Undo/redo, selection, clipboard, find/replace
  * - Tabs, file explorer, minimap
@@ -1047,6 +1047,9 @@ function filterPalette(query) {
     { label: 'Save File', command: '__builtin:save' },
     { label: 'Toggle Sidebar', command: '__builtin:toggleSidebar' },
     { label: 'Close Tab', command: '__builtin:closeTab' },
+    { label: 'Extensions: Open Marketplace', command: '__builtin:extensions' },
+    { label: 'Preferences: Open Settings', command: '__builtin:settings' },
+    { label: 'Extensions: Check for Updates', command: '__builtin:checkExtUpdates' },
   ].filter(b => !q || b.label.toLowerCase().includes(q));
   renderPaletteList(builtins);
 }
@@ -1099,6 +1102,21 @@ async function executePaletteCommand(command) {
     toggleSidebar();
   } else if (command === '__builtin:closeTab') {
     if (activeBufferPath) await closeTab(activeBufferPath);
+  } else if (command === '__builtin:extensions') {
+    switchPanel('extensions');
+  } else if (command === '__builtin:settings') {
+    switchPanel('settings');
+  } else if (command === '__builtin:checkExtUpdates') {
+    try {
+      const updates = await invoke('check_extension_updates');
+      if (updates.length === 0) {
+        showToast('All extensions are up to date', 'info');
+      } else {
+        showToast(`${updates.length} extension update(s) available`, 'info');
+      }
+    } catch (err) {
+      showToast(`Failed to check updates: ${err}`, 'error');
+    }
   } else {
     await invoke('execute_command', { command });
     setTimeout(refreshDiagnostics, 500);
@@ -2645,6 +2663,424 @@ document.addEventListener('click', (e) => {
   if (acOpen && !autocompletePopup.contains(e.target) && e.target !== editorEl) closeAutocomplete();
   if (codeActionsOpen && !codeActionsMenu.contains(e.target)) closeCodeActions();
 });
+
+// ─── M8: Activity Bar & Panel Switching ───────────────────────
+
+let activePanel = 'none'; // 'explorer' | 'extensions' | 'settings' | 'none'
+const activityBar = document.getElementById('activity-bar');
+const extensionsPanel = document.getElementById('extensions-panel');
+const settingsPanel = document.getElementById('settings-panel');
+const extSearchInput = document.getElementById('ext-search-input');
+const extListEl = document.getElementById('ext-list');
+const settingsSearchInput = document.getElementById('settings-search-input');
+const settingsListEl = document.getElementById('settings-list');
+
+// Activity bar panel switching
+function switchPanel(panel) {
+  // Hide all panels
+  sidebarEl.classList.add('sidebar-hidden');
+  extensionsPanel.classList.add('sidebar-hidden');
+  settingsPanel.classList.add('sidebar-hidden');
+
+  // Update active button
+  activityBar.querySelectorAll('.activity-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.panel === panel);
+  });
+
+  if (activePanel === panel) {
+    // Toggle off
+    activePanel = 'none';
+    sidebarOpen = false;
+  } else {
+    activePanel = panel;
+    sidebarOpen = true;
+    if (panel === 'explorer') {
+      sidebarEl.classList.remove('sidebar-hidden');
+      if (!explorerRoot) openFolderDialog();
+    } else if (panel === 'extensions') {
+      extensionsPanel.classList.remove('sidebar-hidden');
+      extSearchInput.focus();
+      loadInstalledExtensions();
+    } else if (panel === 'settings') {
+      settingsPanel.classList.remove('sidebar-hidden');
+      settingsSearchInput.focus();
+      loadSettings();
+    }
+  }
+
+  if (activePanel === 'none') {
+    activityBar.querySelectorAll('.activity-btn').forEach(btn => btn.classList.remove('active'));
+  }
+
+  setTimeout(() => { resizeCanvases(); requestRender(); }, 50);
+}
+
+activityBar.addEventListener('click', (e) => {
+  const btn = e.target.closest('.activity-btn');
+  if (btn) switchPanel(btn.dataset.panel);
+});
+
+// Close buttons for extension and settings panels
+document.getElementById('ext-panel-close')?.addEventListener('click', () => switchPanel('extensions'));
+document.getElementById('settings-panel-close')?.addEventListener('click', () => switchPanel('settings'));
+
+// Extension tabs (Marketplace / Installed)
+let extActiveTab = 'marketplace';
+document.getElementById('ext-tabs')?.addEventListener('click', (e) => {
+  const tab = e.target.closest('.ext-tab');
+  if (!tab) return;
+  extActiveTab = tab.dataset.tab;
+  document.querySelectorAll('.ext-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === extActiveTab));
+  if (extActiveTab === 'marketplace') {
+    searchExtensions(extSearchInput.value);
+  } else {
+    loadInstalledExtensions();
+  }
+});
+
+// ─── M8: Extension Marketplace ────────────────────────────────
+
+let marketplaceResults = [];
+let installedExtensions = [];
+let extSearchDebounce = null;
+
+extSearchInput?.addEventListener('input', () => {
+  clearTimeout(extSearchDebounce);
+  extSearchDebounce = setTimeout(() => {
+    if (extActiveTab === 'marketplace') {
+      searchExtensions(extSearchInput.value);
+    } else {
+      filterInstalledExtensions(extSearchInput.value);
+    }
+  }, 300);
+});
+
+async function searchExtensions(query) {
+  if (!query || query.length < 2) {
+    extListEl.innerHTML = '';
+    return;
+  }
+  try {
+    const result = await invoke('marketplace_search', { query, offset: 0, limit: 20 });
+    marketplaceResults = result.extensions || [];
+    renderExtensionList(marketplaceResults, 'marketplace');
+  } catch (err) {
+    console.error('Marketplace search error:', err);
+    extListEl.textContent = 'Search failed';
+  }
+}
+
+async function loadInstalledExtensions() {
+  try {
+    installedExtensions = await invoke('marketplace_list_installed');
+    renderExtensionList(installedExtensions, 'installed');
+  } catch (err) {
+    console.error('Failed to load installed extensions:', err);
+  }
+}
+
+function filterInstalledExtensions(query) {
+  const q = query.toLowerCase();
+  const filtered = q
+    ? installedExtensions.filter(e =>
+        (e.name || '').toLowerCase().includes(q) ||
+        (e.display_name || '').toLowerCase().includes(q) ||
+        (e.namespace || '').toLowerCase().includes(q)
+      )
+    : installedExtensions;
+  renderExtensionList(filtered, 'installed');
+}
+
+function renderExtensionList(extensions, mode) {
+  extListEl.innerHTML = '';
+  if (extensions.length === 0) {
+    const empty = document.createElement('div');
+    empty.style.cssText = 'padding: 16px 12px; color: var(--fg-dim); font-size: 12px; text-align: center;';
+    empty.textContent = mode === 'marketplace' ? 'Type to search extensions...' : 'No extensions installed';
+    extListEl.appendChild(empty);
+    return;
+  }
+
+  const installedIds = new Set(installedExtensions.map(e => e.id));
+
+  for (const ext of extensions) {
+    const card = document.createElement('div');
+    card.className = 'ext-card';
+
+    const header = document.createElement('div');
+    header.className = 'ext-card-header';
+
+    const icon = document.createElement('div');
+    icon.className = 'ext-card-icon';
+    icon.textContent = (ext.display_name || ext.name || '?')[0].toUpperCase();
+
+    const info = document.createElement('div');
+    info.className = 'ext-card-info';
+
+    const name = document.createElement('div');
+    name.className = 'ext-card-name';
+    name.textContent = ext.display_name || ext.name;
+
+    const publisher = document.createElement('div');
+    publisher.className = 'ext-card-publisher';
+    publisher.textContent = ext.namespace || ext.publisher_name || '';
+
+    info.appendChild(name);
+    info.appendChild(publisher);
+    header.appendChild(icon);
+    header.appendChild(info);
+    card.appendChild(header);
+
+    if (ext.description) {
+      const desc = document.createElement('div');
+      desc.className = 'ext-card-desc';
+      desc.textContent = ext.description;
+      card.appendChild(desc);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'ext-card-actions';
+
+    if (mode === 'marketplace') {
+      const extId = `${ext.namespace}.${ext.name}`;
+      const isInstalled = installedIds.has(extId);
+
+      if (!isInstalled) {
+        const installBtn = document.createElement('button');
+        installBtn.className = 'ext-install-btn';
+        installBtn.textContent = 'Install';
+        installBtn.addEventListener('click', async () => {
+          installBtn.disabled = true;
+          installBtn.textContent = 'Installing...';
+          try {
+            // Get full extension info to find download URL
+            const fullInfo = await invoke('marketplace_get_extension', {
+              namespace: ext.namespace,
+              name: ext.name,
+            });
+            const downloadUrl = fullInfo.files?.download;
+            if (!downloadUrl) {
+              throw new Error('No download URL available');
+            }
+            await invoke('install_extension', {
+              namespace: ext.namespace,
+              name: ext.name,
+              downloadUrl,
+            });
+            installBtn.textContent = 'Installed';
+            installedExtensions = await invoke('marketplace_list_installed');
+          } catch (err) {
+            console.error('Install failed:', err);
+            installBtn.textContent = 'Failed';
+            installBtn.disabled = false;
+          }
+        });
+        actions.appendChild(installBtn);
+      } else {
+        const installed = document.createElement('span');
+        installed.style.cssText = 'font-size: 11px; color: var(--accent);';
+        installed.textContent = 'Installed';
+        actions.appendChild(installed);
+      }
+
+      if (ext.download_count != null) {
+        const dl = document.createElement('span');
+        dl.className = 'ext-downloads';
+        dl.textContent = formatCount(ext.download_count) + ' downloads';
+        actions.appendChild(dl);
+      }
+    } else {
+      // Installed mode
+      const uninstallBtn = document.createElement('button');
+      uninstallBtn.className = 'ext-uninstall-btn';
+      uninstallBtn.textContent = 'Uninstall';
+      uninstallBtn.addEventListener('click', async () => {
+        uninstallBtn.disabled = true;
+        uninstallBtn.textContent = 'Removing...';
+        try {
+          await invoke('uninstall_extension', { extensionId: ext.id });
+          installedExtensions = await invoke('marketplace_list_installed');
+          renderExtensionList(installedExtensions, 'installed');
+        } catch (err) {
+          console.error('Uninstall failed:', err);
+          uninstallBtn.textContent = 'Failed';
+          uninstallBtn.disabled = false;
+        }
+      });
+      actions.appendChild(uninstallBtn);
+
+      const version = document.createElement('span');
+      version.className = 'ext-downloads';
+      version.textContent = 'v' + (ext.version || '?');
+      actions.appendChild(version);
+    }
+
+    card.appendChild(actions);
+    extListEl.appendChild(card);
+  }
+}
+
+function formatCount(n) {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
+  return String(n);
+}
+
+// ─── M8: Settings UI ──────────────────────────────────────────
+
+let allSettings = {};
+let settingDefinitions = [];
+
+async function loadSettings() {
+  try {
+    allSettings = await invoke('get_settings');
+    renderSettings();
+  } catch (err) {
+    console.error('Failed to load settings:', err);
+  }
+}
+
+function getNestedValue(obj, dottedKey) {
+  const parts = dottedKey.split('.');
+  let current = obj;
+  for (const part of parts) {
+    if (current == null || typeof current !== 'object') return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+function renderSettings() {
+  settingsListEl.innerHTML = '';
+  const filter = (settingsSearchInput?.value || '').toLowerCase();
+
+  // Flatten settings object for display
+  const entries = flattenSettings(allSettings);
+
+  for (const [key, value] of entries) {
+    if (filter && !key.toLowerCase().includes(filter)) continue;
+
+    const item = document.createElement('div');
+    item.className = 'setting-item';
+
+    const keyEl = document.createElement('div');
+    keyEl.className = 'setting-key';
+    keyEl.textContent = key;
+    item.appendChild(keyEl);
+
+    const control = document.createElement('div');
+    control.className = 'setting-control';
+
+    if (typeof value === 'boolean') {
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = value;
+      checkbox.addEventListener('change', () => {
+        updateSetting(key, checkbox.checked);
+      });
+      control.appendChild(checkbox);
+      const label = document.createElement('span');
+      label.textContent = value ? 'Enabled' : 'Disabled';
+      label.style.cssText = 'font-size: 12px; color: var(--fg-dim);';
+      control.appendChild(label);
+    } else if (typeof value === 'number') {
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.value = value;
+      input.addEventListener('change', () => {
+        updateSetting(key, Number(input.value));
+      });
+      control.appendChild(input);
+    } else if (typeof value === 'string') {
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = value;
+      input.addEventListener('change', () => {
+        updateSetting(key, input.value);
+      });
+      control.appendChild(input);
+    } else {
+      const display = document.createElement('span');
+      display.style.cssText = 'font-size: 12px; color: var(--fg-dim);';
+      display.textContent = JSON.stringify(value);
+      control.appendChild(display);
+    }
+
+    item.appendChild(control);
+    settingsListEl.appendChild(item);
+  }
+
+  if (settingsListEl.children.length === 0) {
+    const empty = document.createElement('div');
+    empty.style.cssText = 'padding: 16px 12px; color: var(--fg-dim); font-size: 12px; text-align: center;';
+    empty.textContent = 'No settings configured yet';
+    settingsListEl.appendChild(empty);
+  }
+}
+
+function flattenSettings(obj, prefix = '') {
+  const entries = [];
+  for (const [key, value] of Object.entries(obj)) {
+    const fullKey = prefix ? `${prefix}.${key}` : key;
+    if (value != null && typeof value === 'object' && !Array.isArray(value)) {
+      entries.push(...flattenSettings(value, fullKey));
+    } else {
+      entries.push([fullKey, value]);
+    }
+  }
+  return entries;
+}
+
+async function updateSetting(key, value) {
+  try {
+    await invoke('update_setting', { key, value });
+    // Update local cache
+    const parts = key.split('.');
+    let current = allSettings;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!current[parts[i]] || typeof current[parts[i]] !== 'object') {
+        current[parts[i]] = {};
+      }
+      current = current[parts[i]];
+    }
+    current[parts[parts.length - 1]] = value;
+  } catch (err) {
+    console.error('Failed to update setting:', err);
+  }
+}
+
+settingsSearchInput?.addEventListener('input', () => {
+  renderSettings();
+});
+
+// ─── M8: Updated Sidebar Toggle ───────────────────────────────
+
+// Override the original toggleSidebar to use the activity bar
+const _origToggleSidebar = toggleSidebar;
+toggleSidebar = function() {
+  if (activePanel === 'explorer') {
+    switchPanel('explorer'); // toggle off
+  } else {
+    switchPanel('explorer');
+  }
+};
+
+// ─── M8: Keyboard Shortcuts ───────────────────────────────────
+
+// Add Ctrl+Shift+X for extensions and Ctrl+, for settings
+const _origKeydown = document.onkeydown;
+document.addEventListener('keydown', (e) => {
+  if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'x') {
+    e.preventDefault();
+    switchPanel('extensions');
+    return;
+  }
+  if (e.ctrlKey && !e.shiftKey && e.key === ',') {
+    e.preventDefault();
+    switchPanel('settings');
+    return;
+  }
+}, true); // capture phase to intercept before other handlers
 
 // ─── Cleanup ─────────────────────────────────────────────────
 

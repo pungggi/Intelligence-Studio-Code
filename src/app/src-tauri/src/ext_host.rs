@@ -34,7 +34,7 @@ const MAX_RESTARTS: u32 = 5;
 
 /// Start the Extension Host as a child process.
 /// Automatically restarts on crash with exponential backoff.
-pub fn start_extension_host(_app: &AppHandle, ipc_port: u16) -> Result<()> {
+pub fn start_extension_host(_app: &AppHandle, ipc_port: u16, user_extensions_dir: &str) -> Result<()> {
     let host_script = match find_ext_host_script() {
         Some(script) => script,
         None => {
@@ -54,6 +54,7 @@ pub fn start_extension_host(_app: &AppHandle, ipc_port: u16) -> Result<()> {
             .env("CORECODE_MODE", "embedded")
             .env("CORECODE_IPC_HOST", "127.0.0.1")
             .env("CORECODE_IPC_PORT", ipc_port.to_string())
+            .env("CORECODE_USER_EXTENSIONS", user_extensions_dir)
             .spawn();
 
         match child {

@@ -268,6 +268,69 @@ export class ExtensionLoader {
     }
   }
 
+  /**
+   * M8: Load and activate a single extension from its directory path.
+   * Used for hot-loading newly installed extensions.
+   */
+  async loadAndActivateSingle(extensionPath: string): Promise<void> {
+    const absPath = resolve(extensionPath);
+    const manifestPath = join(absPath, "package.json");
+    if (!existsSync(manifestPath)) {
+      throw new Error(`No package.json found at ${absPath}`);
+    }
+
+    const manifest: ExtensionManifest = JSON.parse(
+      readFileSync(manifestPath, "utf-8")
+    );
+
+    if (!manifest.name || typeof manifest.name !== "string") {
+      throw new Error(`Invalid extension manifest: missing 'name'`);
+    }
+
+    const id = `${manifest.publisher ?? "unknown"}.${manifest.name}`;
+
+    // Deactivate existing version if loaded
+    if (this.extensions.has(id)) {
+      await this.deactivateExtension(id);
+    }
+
+    this.extensions.set(id, {
+      id,
+      manifest,
+      module: null,
+      isActive: false,
+      extensionPath: absPath,
+    });
+
+    // Register configuration defaults
+    const configProps = manifest.contributes?.configuration?.properties;
+    if (configProps) {
+      this.apiShim.registerConfigurationDefaults(configProps);
+    }
+
+    console.log(`[ExtLoader] Hot-discovered: ${id} v${manifest.version}`);
+    await this.activate(id);
+  }
+
+  /**
+   * M8: Deactivate and remove a single extension by ID.
+   */
+  async deactivateExtension(extensionId: string): Promise<void> {
+    const ext = this.extensions.get(extensionId);
+    if (!ext) return;
+
+    if (ext.isActive && ext.module?.deactivate) {
+      try {
+        await ext.module.deactivate();
+        console.log(`[ExtLoader] Deactivated: ${extensionId}`);
+      } catch (err) {
+        console.error(`[ExtLoader] Error deactivating ${extensionId}:`, err);
+      }
+    }
+
+    this.extensions.delete(extensionId);
+  }
+
   getActivationErrors(): Map<string, string> {
     return this.activationErrors;
   }

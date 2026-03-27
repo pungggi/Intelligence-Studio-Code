@@ -45,3 +45,8 @@ anyhow = "1"
 
 # Async
 tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros", "time"] }
+
+# Marketplace & extension management
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+zip = "2"
+dirs = "5"

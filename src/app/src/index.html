@@ -20,6 +20,13 @@
     </div>
 
     <div id="main-area">
+      <!-- M8: Activity bar for switching sidebar panels -->
+      <div id="activity-bar">
+        <button class="activity-btn active" data-panel="explorer" title="Explorer (Ctrl+B)">&#128193;</button>
+        <button class="activity-btn" data-panel="extensions" title="Extensions (Ctrl+Shift+X)">&#9881;</button>
+        <button class="activity-btn" data-panel="settings" title="Settings (Ctrl+,)">&#9776;</button>
+      </div>
+
       <!-- M5: File explorer sidebar -->
       <div id="sidebar" class="sidebar-hidden">
         <div id="sidebar-header">
@@ -27,6 +34,34 @@
           <button id="sidebar-close" title="Close sidebar">&times;</button>
         </div>
         <div id="file-tree"></div>
+      </div>
+
+      <!-- M8: Extensions sidebar panel -->
+      <div id="extensions-panel" class="sidebar-hidden">
+        <div id="sidebar-header-ext">
+          <span id="ext-panel-title">Extensions</span>
+          <button id="ext-panel-close" title="Close">&times;</button>
+        </div>
+        <div id="ext-search-box">
+          <input id="ext-search-input" type="text" placeholder="Search extensions..." autocomplete="off" />
+        </div>
+        <div id="ext-tabs">
+          <button class="ext-tab active" data-tab="marketplace">Marketplace</button>
+          <button class="ext-tab" data-tab="installed">Installed</button>
+        </div>
+        <div id="ext-list"></div>
+      </div>
+
+      <!-- M8: Settings sidebar panel -->
+      <div id="settings-panel" class="sidebar-hidden">
+        <div id="sidebar-header-settings">
+          <span id="settings-panel-title">Settings</span>
+          <button id="settings-panel-close" title="Close">&times;</button>
+        </div>
+        <div id="settings-search-box">
+          <input id="settings-search-input" type="text" placeholder="Search settings..." autocomplete="off" />
+        </div>
+        <div id="settings-list"></div>
       </div>
 
       <div id="editor-area">

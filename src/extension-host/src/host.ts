@@ -26,8 +26,30 @@ async function main(): Promise<void> {
   await ipcServer.start();
   console.log(`[ExtensionHost] IPC server listening on ${IPC_HOST}:${IPC_PORT}`);
 
-  // Forward IPC messages to the API shim
-  ipcServer.onMessage((msg) => {
+  // Forward IPC messages to the API shim, with M8 extension lifecycle hooks
+  ipcServer.onMessage(async (msg) => {
+    // M8: Handle extension install/uninstall at host level
+    if (msg.method === "extension/installed") {
+      const p = msg.params as { path: string };
+      if (p?.path) {
+        console.log(`[ExtensionHost] Hot-loading extension from: ${p.path}`);
+        try {
+          await extensionLoader.loadAndActivateSingle(p.path);
+          console.log(`[ExtensionHost] Extension hot-loaded successfully`);
+        } catch (err) {
+          console.error(`[ExtensionHost] Failed to hot-load extension:`, err);
+        }
+      }
+      return;
+    }
+    if (msg.method === "extension/uninstalled") {
+      const p = msg.params as { id: string };
+      if (p?.id) {
+        console.log(`[ExtensionHost] Deactivating extension: ${p.id}`);
+        await extensionLoader.deactivateExtension(p.id);
+      }
+      return;
+    }
     apiShim.handleFrontendMessage(msg);
   });
 
@@ -36,13 +58,21 @@ async function main(): Promise<void> {
     ipcServer.send(msg);
   });
 
-  // Scan and activate extensions
-  const extensionsDir =
+  // Scan and activate extensions from all configured directories
+  const bundledDir =
     process.env.CORECODE_EXTENSIONS ??
     resolve(__dirname, "../../../test-extensions");
+  const userExtDir = process.env.CORECODE_USER_EXTENSIONS ?? "";
 
-  console.log(`[ExtensionHost] Scanning extensions in: ${extensionsDir}`);
-  await extensionLoader.scanAndActivate(extensionsDir);
+  const extensionDirs = [bundledDir];
+  if (userExtDir && userExtDir !== bundledDir) {
+    extensionDirs.push(userExtDir);
+  }
+
+  for (const dir of extensionDirs) {
+    console.log(`[ExtensionHost] Scanning extensions in: ${dir}`);
+    await extensionLoader.scanAndActivate(dir);
+  }
 
   const active = extensionLoader.getActiveExtensions();
   console.log(

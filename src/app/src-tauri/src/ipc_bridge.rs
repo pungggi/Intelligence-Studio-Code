@@ -103,6 +103,18 @@ pub enum OutgoingMessage {
         method: String,
         params: serde_json::Value,
     },
+    /// M8: Notify Extension Host that an extension was installed.
+    #[serde(rename = "extension/installed")]
+    ExtensionInstalled { path: String },
+    /// M8: Notify Extension Host that an extension was uninstalled.
+    #[serde(rename = "extension/uninstalled")]
+    ExtensionUninstalled { id: String },
+    /// M8: Notify Extension Host that a setting changed.
+    #[serde(rename = "settings/changed")]
+    SettingsChanged {
+        key: String,
+        value: serde_json::Value,
+    },
 }
 
 

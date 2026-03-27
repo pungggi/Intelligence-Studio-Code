@@ -1,7 +1,10 @@
 mod editor;
 mod ext_host;
+mod extension_mgr;
 mod highlighting;
 mod ipc_bridge;
+mod marketplace;
+mod settings;
 
 use editor::WorkspaceState;
 use ipc_bridge::{IpcHandle, OutgoingMessage};
@@ -15,6 +18,9 @@ const MAX_INSERT_SIZE: usize = 1024 * 1024;
 struct AppState {
     workspace: Mutex<WorkspaceState>,
     ipc: IpcHandle,
+    marketplace: marketplace::MarketplaceClient,
+    extension_mgr: Mutex<extension_mgr::ExtensionManager>,
+    settings: Mutex<settings::SettingsStore>,
 }
 
 // --- Path validation ---
@@ -587,6 +593,174 @@ fn lsp_format(
     state.ipc.request_sync("textDocument/formatting", params)
 }
 
+// --- M8: Marketplace Commands ---
+
+#[tauri::command]
+async fn marketplace_search(
+    query: String,
+    offset: usize,
+    limit: usize,
+    state: tauri::State<'_, AppState>,
+) -> Result<marketplace::MarketplaceSearchResult, String> {
+    state.marketplace.search(&query, offset, limit).await
+}
+
+#[tauri::command]
+async fn marketplace_get_extension(
+    namespace: String,
+    name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<marketplace::ExtensionInfo, String> {
+    state.marketplace.get_extension(&namespace, &name).await
+}
+
+#[tauri::command]
+fn marketplace_list_installed(
+    state: tauri::State<AppState>,
+) -> Result<Vec<extension_mgr::InstalledExtension>, String> {
+    let mgr = state.extension_mgr.lock().map_err(|e| e.to_string())?;
+    Ok(mgr.list_installed())
+}
+
+#[tauri::command]
+async fn install_extension(
+    namespace: String,
+    name: String,
+    download_url: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<extension_mgr::InstalledExtension, String> {
+    // Get extension details for display name and description
+    let info = state.marketplace.get_extension(&namespace, &name).await.ok();
+
+    // Download the VSIX
+    let vsix_bytes = state.marketplace.download_vsix(&download_url).await?;
+
+    let version = info.as_ref().map(|i| i.version.as_str()).unwrap_or("0.0.0");
+    let display_name = info.as_ref().and_then(|i| i.display_name.as_deref());
+    let description = info.as_ref().and_then(|i| i.description.as_deref());
+
+    let installed = {
+        let mgr = state.extension_mgr.lock().map_err(|e| e.to_string())?;
+        mgr.install_from_vsix(&namespace, &name, version, display_name, description, &vsix_bytes)?
+    };
+
+    // Notify Extension Host about the new extension
+    state.ipc.send(OutgoingMessage::ExtensionInstalled {
+        path: installed.path.clone(),
+    });
+
+    Ok(installed)
+}
+
+#[tauri::command]
+fn uninstall_extension(
+    extension_id: String,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    let mgr = state.extension_mgr.lock().map_err(|e| e.to_string())?;
+    mgr.uninstall(&extension_id)?;
+
+    state.ipc.send(OutgoingMessage::ExtensionUninstalled {
+        id: extension_id,
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn check_extension_updates(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<extension_mgr::ExtensionUpdateInfo>, String> {
+    let installed_versions = {
+        let mgr = state.extension_mgr.lock().map_err(|e| e.to_string())?;
+        mgr.get_installed_versions()
+    };
+
+    let mut updates = Vec::new();
+    for (id, current_version) in &installed_versions {
+        let parts: Vec<&str> = id.splitn(2, '.').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let (namespace, name) = (parts[0], parts[1]);
+
+        match state.marketplace.get_extension(namespace, name).await {
+            Ok(info) => {
+                if info.version != *current_version {
+                    let download_url = info
+                        .files
+                        .get("download")
+                        .cloned()
+                        .unwrap_or_default();
+                    updates.push(extension_mgr::ExtensionUpdateInfo {
+                        id: id.clone(),
+                        current_version: current_version.clone(),
+                        latest_version: info.version,
+                        download_url,
+                    });
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to check updates for {id}: {e}");
+            }
+        }
+    }
+
+    Ok(updates)
+}
+
+#[tauri::command]
+fn get_extensions_dir(state: tauri::State<AppState>) -> Result<String, String> {
+    let mgr = state.extension_mgr.lock().map_err(|e| e.to_string())?;
+    Ok(mgr.extensions_dir().to_string_lossy().to_string())
+}
+
+// --- M8: Settings Commands ---
+
+#[tauri::command]
+fn get_settings(state: tauri::State<AppState>) -> Result<serde_json::Value, String> {
+    let store = state.settings.lock().map_err(|e| e.to_string())?;
+    Ok(store.read_all())
+}
+
+#[tauri::command]
+fn update_setting(
+    key: String,
+    value: serde_json::Value,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    let store = state.settings.lock().map_err(|e| e.to_string())?;
+    store.update(&key, value.clone())?;
+
+    // Notify Extension Host about the setting change
+    state.ipc.send(OutgoingMessage::SettingsChanged {
+        key,
+        value,
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn reset_setting(key: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let store = state.settings.lock().map_err(|e| e.to_string())?;
+    store.reset(&key)?;
+
+    state.ipc.send(OutgoingMessage::SettingsChanged {
+        key,
+        value: serde_json::Value::Null,
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn get_setting_definitions(
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    state.ipc.request_sync("settings/getDefinitions", serde_json::json!({}))
+}
+
 // --- Response types ---
 
 #[derive(serde::Serialize, Clone)]
@@ -653,6 +827,16 @@ pub fn run() {
     log::info!("CoreCode IPC port: {}", ipc_port);
     let ipc = ipc_bridge::start_ipc_bridge(ipc_port);
 
+    let marketplace_client = marketplace::MarketplaceClient::new()
+        .expect("Failed to create marketplace client");
+    let ext_mgr = extension_mgr::ExtensionManager::new()
+        .expect("Failed to create extension manager");
+    let settings_store = settings::SettingsStore::new()
+        .expect("Failed to create settings store");
+
+    // Get user extensions directory path for Extension Host
+    let user_extensions_dir = ext_mgr.extensions_dir().to_string_lossy().to_string();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -660,6 +844,9 @@ pub fn run() {
         .manage(AppState {
             workspace: Mutex::new(WorkspaceState::new()),
             ipc,
+            marketplace: marketplace_client,
+            extension_mgr: Mutex::new(ext_mgr),
+            settings: Mutex::new(settings_store),
         })
         .invoke_handler(tauri::generate_handler![
             open_file,
@@ -698,15 +885,29 @@ pub fn run() {
             lsp_signature_help,
             lsp_document_symbols,
             lsp_format,
+            // M8: Marketplace commands
+            marketplace_search,
+            marketplace_get_extension,
+            marketplace_list_installed,
+            install_extension,
+            uninstall_extension,
+            check_extension_updates,
+            get_extensions_dir,
+            // M8: Settings commands
+            get_settings,
+            update_setting,
+            reset_setting,
+            get_setting_definitions,
         ])
         .setup(move |app| {
-            log::info!("CoreCode M7 starting...");
+            log::info!("CoreCode M8 starting...");
 
             let app_handle = app.handle().clone();
+            let ext_dir = user_extensions_dir.clone();
             std::thread::Builder::new()
                 .name("ext-host-mgr".to_string())
                 .spawn(move || {
-                    if let Err(e) = ext_host::start_extension_host(&app_handle, ipc_port) {
+                    if let Err(e) = ext_host::start_extension_host(&app_handle, ipc_port, &ext_dir) {
                         log::error!("Failed to start Extension Host: {}", e);
                     }
                 })
