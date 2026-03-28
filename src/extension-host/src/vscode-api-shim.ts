@@ -21,12 +21,15 @@
  */
 
 import type { IpcMessage } from "./ipc-server";
+import * as nodeFs from "node:fs/promises";
+import * as nodePath from "node:path";
+import { createGitExtension } from "./git-api";
 
 // --- Event Emitter ---
 
 type Listener<T> = (e: T) => void;
 
-class EventEmitter<T> {
+export class EventEmitter<T> {
   private listeners: Listener<T>[] = [];
 
   event = (listener: Listener<T>): { dispose: () => void } => {
@@ -46,6 +49,10 @@ class EventEmitter<T> {
         console.error("[ApiShim] Event listener error:", err);
       }
     }
+  }
+
+  dispose(): void {
+    this.listeners = [];
   }
 }
 
@@ -108,6 +115,34 @@ export class Range {
   }
 }
 
+export class Selection extends Range {
+  readonly anchor: Position;
+  readonly active: Position;
+
+  constructor(
+    anchorOrLine: number | Position,
+    anchorCharOrActive: number | Position,
+    activeLine?: number,
+    activeChar?: number
+  ) {
+    if (anchorOrLine instanceof Position && anchorCharOrActive instanceof Position) {
+      super(anchorOrLine, anchorCharOrActive);
+      this.anchor = anchorOrLine;
+      this.active = anchorCharOrActive as Position;
+    } else {
+      const anchor = new Position(anchorOrLine as number, anchorCharOrActive as number);
+      const active = new Position(activeLine!, activeChar!);
+      super(anchor, active);
+      this.anchor = anchor;
+      this.active = active;
+    }
+  }
+
+  get isReversed(): boolean {
+    return this.anchor.isAfter(this.active);
+  }
+}
+
 // --- Uri ---
 
 export class Uri {
@@ -153,6 +188,80 @@ export class Uri {
     }
     return `${this.scheme}://${this.authority}${this.path}${this.query}${this.fragment}`;
   }
+}
+
+// --- Disposable ---
+
+export class Disposable {
+  private _fn: () => void;
+
+  constructor(callOnDispose: () => void) {
+    this._fn = callOnDispose;
+  }
+
+  dispose(): void {
+    this._fn();
+  }
+
+  static from(...disposables: { dispose(): void }[]): Disposable {
+    return new Disposable(() => {
+      for (const d of disposables) {
+        try { d.dispose(); } catch { /* ignore */ }
+      }
+    });
+  }
+}
+
+// --- MarkdownString ---
+
+export class MarkdownString {
+  value: string;
+  isTrusted?: boolean;
+  supportHtml?: boolean;
+
+  constructor(value: string = "", _supportThemeIcons: boolean = false) {
+    this.value = value;
+  }
+
+  appendText(value: string): MarkdownString {
+    this.value += value.replace(/[\\`*_{}[\]()#+\-.!]/g, "\\$&");
+    return this;
+  }
+
+  appendMarkdown(value: string): MarkdownString {
+    this.value += value;
+    return this;
+  }
+
+  appendCodeblock(value: string, language: string = ""): MarkdownString {
+    this.value += `\n\`\`\`${language}\n${value}\n\`\`\`\n`;
+    return this;
+  }
+}
+
+// --- ThemeColor / ThemeIcon ---
+
+export class ThemeColor {
+  constructor(public readonly id: string) {}
+}
+
+export class ThemeIcon {
+  static readonly File = new ThemeIcon("file");
+  static readonly Folder = new ThemeIcon("folder");
+
+  constructor(
+    public readonly id: string,
+    public readonly color?: ThemeColor
+  ) {}
+}
+
+// --- FileType ---
+
+export enum FileType {
+  Unknown = 0,
+  File = 1,
+  Directory = 2,
+  SymbolicLink = 64,
 }
 
 // --- TextDocument ---
@@ -414,6 +523,41 @@ export interface WorkspaceEdit {
   entries(): [Uri, TextEdit[]][];
 }
 
+/** Concrete WorkspaceEdit implementation used by extensions. */
+export class WorkspaceEditImpl implements WorkspaceEdit {
+  private _changes = new Map<string, TextEdit[]>();
+
+  replace(uri: Uri, range: Range, newText: string): void {
+    const key = uri.toString();
+    if (!this._changes.has(key)) this._changes.set(key, []);
+    this._changes.get(key)!.push({ range, newText });
+  }
+
+  insert(uri: Uri, position: Position, newText: string): void {
+    this.replace(uri, new Range(position, position), newText);
+  }
+
+  delete(uri: Uri, range: Range): void {
+    this.replace(uri, range, '');
+  }
+
+  set(uri: Uri, edits: TextEdit[]): void {
+    this._changes.set(uri.toString(), edits ? [...edits] : []);
+  }
+
+  has(uri: Uri): boolean {
+    return this._changes.has(uri.toString());
+  }
+
+  get size(): number {
+    return this._changes.size;
+  }
+
+  entries(): [Uri, TextEdit[]][] {
+    return Array.from(this._changes.entries()).map(([uriStr, edits]) => [Uri.parse(uriStr), edits]);
+  }
+}
+
 export interface SignatureHelp {
   signatures: SignatureInformation[];
   activeSignature: number;
@@ -473,6 +617,51 @@ export interface CancellationToken {
   onCancellationRequested: (listener: () => void) => { dispose(): void };
 }
 
+/** Standard PromiseLike alias used by VS Code extension API. */
+export type Thenable<T> = PromiseLike<T>;
+
+/** Fully-functional cancellation token source (matches the VS Code API spec). */
+export class CancellationTokenSource {
+  private _cancelled = false;
+  private _listeners: Array<() => void> = [];
+  readonly token: CancellationToken;
+
+  constructor() {
+    const self = this;
+    this.token = {
+      get isCancellationRequested() { return self._cancelled; },
+      onCancellationRequested(listener: () => void): { dispose(): void } {
+        if (self._cancelled) {
+          try { listener(); } catch { /* ignore */ }
+          return { dispose: () => {} };
+        }
+        self._listeners.push(listener);
+        return {
+          dispose() {
+            const idx = self._listeners.indexOf(listener);
+            if (idx >= 0) self._listeners.splice(idx, 1);
+          },
+        };
+      },
+    };
+  }
+
+  cancel(): void {
+    if (!this._cancelled) {
+      this._cancelled = true;
+      const listeners = this._listeners.splice(0);
+      for (const l of listeners) {
+        try { l(); } catch { /* ignore listener errors */ }
+      }
+    }
+  }
+
+  dispose(): void {
+    this._cancelled = true;
+    this._listeners.length = 0;
+  }
+}
+
 const nullCancellationToken: CancellationToken = {
   isCancellationRequested: false,
   onCancellationRequested: () => ({ dispose: () => {} }),
@@ -485,12 +674,341 @@ interface ProviderEntry<T> {
   triggerCharacters?: string[];
 }
 
+// --- Authentication types ---
+
+export interface AuthSession {
+  id: string;
+  accessToken: string;
+  account: { id: string; label: string };
+  scopes: string[];
+}
+
+/** GitHub Device Flow — polls until user authorizes or grant expires. */
+async function githubDeviceFlow(clientId: string, scopes: string[]): Promise<AuthSession> {
+  const https = await import("node:https");
+
+  function post(hostname: string, path: string, body: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const req = https.request({ hostname, path, method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json', 'Content-Length': Buffer.byteLength(body) } }, (res) => {
+        let data = '';
+        res.on('data', (c: unknown) => { data += c; });
+        res.on('end', () => resolve(data));
+      });
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    });
+  }
+
+  // Step 1: Request device code
+  const codeRes = JSON.parse(await post('github.com', '/login/device/code', `client_id=${clientId}&scope=${encodeURIComponent(scopes.join(' '))}`));
+  const { device_code, user_code, verification_uri, expires_in, interval } = codeRes;
+  if (!device_code) throw new Error('[Auth] GitHub device flow failed: ' + JSON.stringify(codeRes));
+
+  console.log(`[Auth] GitHub: open ${verification_uri} and enter code: ${user_code}`);
+  // Surface the user_code via an info notification so editor.js can show it
+  process.stdout.write(JSON.stringify({ method: 'githubAuthPrompt', params: { user_code, verification_uri } }) + '\n');
+
+  // Step 2: Poll for access token
+  const deadline = Date.now() + expires_in * 1000;
+  const pollInterval = (interval ?? 5) * 1000;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, pollInterval));
+    const tokenRes = JSON.parse(await post('github.com', '/login/oauth/access_token', `client_id=${clientId}&device_code=${device_code}&grant_type=urn:ietf:params:oauth:grant-type:device_code`));
+    if (tokenRes.access_token) {
+      // Fetch user info
+      let userId = 'github-user', userName = 'GitHub User';
+      try {
+        const userRes = await new Promise<string>((resolve, reject) => {
+          const req = https.request({ hostname: 'api.github.com', path: '/user', headers: { 'Authorization': `Bearer ${tokenRes.access_token}`, 'User-Agent': 'CoreCode', 'Accept': 'application/vnd.github+json' } }, (res) => {
+            let d = ''; res.on('data', (c: unknown) => { d += c; }); res.on('end', () => resolve(d));
+          });
+          req.on('error', reject); req.end();
+        });
+        const u = JSON.parse(userRes);
+        userId = String(u.id ?? userId);
+        userName = u.login ?? userName;
+      } catch { /* use defaults */ }
+
+      return { id: `github-${userId}`, accessToken: tokenRes.access_token, account: { id: userId, label: userName }, scopes };
+    }
+    if (tokenRes.error === 'authorization_pending') continue;
+    if (tokenRes.error === 'slow_down') { await new Promise(r => setTimeout(r, 5000)); continue; }
+    throw new Error('[Auth] GitHub device flow error: ' + tokenRes.error);
+  }
+  throw new Error('[Auth] GitHub device flow timed out');
+}
+
+// --- Glob helpers ---
+
+/** Convert a VS Code glob pattern to a RegExp (handles **, *, ?, {a,b}). */
+function globToRegex(pattern: string): RegExp {
+  // Normalize separators, then tokenize to avoid double-escaping
+  const norm = pattern.replace(/\\/g, '/');
+  let out = '';
+  let i = 0;
+  while (i < norm.length) {
+    const ch = norm[i];
+    if (ch === '*' && norm[i + 1] === '*') {
+      out += '.*';
+      i += 2;
+      if (norm[i] === '/') i++;
+    } else if (ch === '*') {
+      out += '[^/]*';
+      i++;
+    } else if (ch === '?') {
+      out += '[^/]';
+      i++;
+    } else if (ch === '{') {
+      const end = norm.indexOf('}', i);
+      const alts = end === -1 ? [norm.slice(i + 1)] : norm.slice(i + 1, end).split(',');
+      out += '(' + alts.map(a => a.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')';
+      i = end === -1 ? norm.length : end + 1;
+    } else if ('.+^$|[]()\\'.includes(ch)) {
+      out += '\\' + ch;
+      i++;
+    } else {
+      out += ch;
+      i++;
+    }
+  }
+  return new RegExp(`^${out}$`);
+}
+
 // --- Configuration ---
 
 interface ConfigurationSection {
   get<T>(key: string, defaultValue?: T): T | undefined;
   has(key: string): boolean;
   update(key: string, value: unknown): Promise<void>;
+}
+
+// --- vscode.tasks types ---
+
+export enum TaskScope {
+  Global = 1,
+  Workspace = 2,
+}
+
+export enum TaskRevealKind {
+  Always = 1,
+  Silent = 2,
+  Never = 3,
+}
+
+export enum TaskPanelKind {
+  Shared = 1,
+  Dedicated = 2,
+  New = 3,
+}
+
+export class TaskGroup {
+  static readonly Clean = new TaskGroup('clean', 'Clean');
+  static readonly Build = new TaskGroup('build', 'Build');
+  static readonly Rebuild = new TaskGroup('rebuild', 'Rebuild');
+  static readonly Test = new TaskGroup('test', 'Test');
+
+  readonly id: string;
+  readonly label: string;
+  isDefault?: boolean;
+
+  constructor(id: string, label: string) {
+    this.id = id;
+    this.label = label;
+  }
+}
+
+export interface ShellQuotedString {
+  value: string;
+  quoting: number; // ShellQuoting enum value
+}
+
+export class ShellExecution {
+  commandLine?: string;
+  command?: string | ShellQuotedString;
+  args?: (string | ShellQuotedString)[];
+  options?: { cwd?: string; env?: Record<string, string> };
+
+  constructor(
+    commandOrConfig: string | ShellQuotedString,
+    argsOrOptions?: (string | ShellQuotedString)[] | { cwd?: string; env?: Record<string, string> },
+    options?: { cwd?: string; env?: Record<string, string> }
+  ) {
+    if (Array.isArray(argsOrOptions)) {
+      // new ShellExecution(command, args, options?)
+      this.command = commandOrConfig;
+      this.args = argsOrOptions;
+      this.options = options;
+    } else if (typeof commandOrConfig === 'string' && !argsOrOptions) {
+      // new ShellExecution(commandLine)
+      this.commandLine = commandOrConfig;
+    } else if (typeof commandOrConfig === 'string' && !Array.isArray(argsOrOptions)) {
+      // new ShellExecution(commandLine, options)
+      this.commandLine = commandOrConfig;
+      this.options = argsOrOptions as { cwd?: string; env?: Record<string, string> };
+    } else {
+      this.command = commandOrConfig;
+      this.options = options;
+    }
+  }
+}
+
+export class ProcessExecution {
+  process: string;
+  args: string[];
+  options?: { cwd?: string; env?: Record<string, string> };
+
+  constructor(
+    process: string,
+    argsOrOptions?: string[] | { cwd?: string; env?: Record<string, string> },
+    options?: { cwd?: string; env?: Record<string, string> }
+  ) {
+    this.process = process;
+    if (Array.isArray(argsOrOptions)) {
+      this.args = argsOrOptions;
+      this.options = options;
+    } else {
+      this.args = [];
+      this.options = argsOrOptions as { cwd?: string; env?: Record<string, string> } | undefined;
+    }
+  }
+}
+
+export class Task {
+  definition: { type: string; [key: string]: unknown };
+  scope?: TaskScope | { uri?: { fsPath: string } };
+  name: string;
+  source?: string;
+  execution?: ShellExecution | ProcessExecution;
+  isBackground = false;
+  problemMatchers: string[] = [];
+  group?: TaskGroup;
+  presentationOptions: {
+    reveal?: TaskRevealKind;
+    echo?: boolean;
+    focus?: boolean;
+    panel?: TaskPanelKind;
+    showReuseMessage?: boolean;
+    clear?: boolean;
+  } = {};
+  detail?: string;
+
+  constructor(
+    definition: { type: string; [key: string]: unknown },
+    scope: TaskScope | { uri?: { fsPath: string } } | undefined,
+    name: string,
+    source: string,
+    execution?: ShellExecution | ProcessExecution,
+    problemMatchers?: string | string[]
+  ) {
+    this.definition = definition;
+    this.scope = scope;
+    this.name = name;
+    this.source = source;
+    this.execution = execution;
+    if (problemMatchers) {
+      this.problemMatchers = Array.isArray(problemMatchers) ? problemMatchers : [problemMatchers];
+    }
+  }
+}
+
+// --- Notebook API Types ---
+
+export enum NotebookCellKind {
+  Markup = 1,
+  Code = 2,
+}
+
+export class NotebookCellOutputItem {
+  constructor(public readonly data: Uint8Array, public readonly mime: string) {}
+
+  static text(value: string, mime = "text/plain"): NotebookCellOutputItem {
+    return new NotebookCellOutputItem(new TextEncoder().encode(value), mime);
+  }
+  static stdout(value: string): NotebookCellOutputItem {
+    return new NotebookCellOutputItem(
+      new TextEncoder().encode(value),
+      "application/vnd.code.notebook.stdout"
+    );
+  }
+  static stderr(value: string): NotebookCellOutputItem {
+    return new NotebookCellOutputItem(
+      new TextEncoder().encode(value),
+      "application/vnd.code.notebook.stderr"
+    );
+  }
+  static error(value: Error): NotebookCellOutputItem {
+    return new NotebookCellOutputItem(
+      new TextEncoder().encode(JSON.stringify({ name: value.name, message: value.message, stack: value.stack })),
+      "application/vnd.code.notebook.error"
+    );
+  }
+  static json(value: unknown, mime = "application/json"): NotebookCellOutputItem {
+    return new NotebookCellOutputItem(new TextEncoder().encode(JSON.stringify(value)), mime);
+  }
+}
+
+export class NotebookCellOutput {
+  constructor(
+    public items: NotebookCellOutputItem[],
+    public metadata?: Record<string, unknown>
+  ) {}
+}
+
+export class NotebookRange {
+  constructor(public readonly start: number, public readonly end: number) {}
+  get isEmpty(): boolean { return this.start === this.end; }
+  with(change: { start?: number; end?: number }): NotebookRange {
+    return new NotebookRange(change.start ?? this.start, change.end ?? this.end);
+  }
+}
+
+export class NotebookCellData {
+  outputs?: NotebookCellOutput[];
+  metadata?: Record<string, unknown>;
+  executionSummary?: { success?: boolean; timing?: { startTime: number; endTime: number } };
+  constructor(
+    public kind: NotebookCellKind,
+    public value: string,
+    public languageId: string
+  ) {}
+}
+
+export class NotebookData {
+  metadata?: Record<string, unknown>;
+  constructor(public cells: NotebookCellData[]) {}
+}
+
+export class NotebookEdit {
+  newCellMetadata?: Record<string, unknown>;
+  newNotebookMetadata?: Record<string, unknown>;
+
+  constructor(public range: NotebookRange, public newCells: NotebookCellData[]) {}
+
+  static updateCellMetadata(index: number, newMetadata: Record<string, unknown>): NotebookEdit {
+    const edit = new NotebookEdit(new NotebookRange(index, index + 1), []);
+    edit.newCellMetadata = newMetadata;
+    return edit;
+  }
+  static updateNotebookMetadata(newMetadata: Record<string, unknown>): NotebookEdit {
+    const edit = new NotebookEdit(new NotebookRange(0, 0), []);
+    edit.newNotebookMetadata = newMetadata;
+    return edit;
+  }
+  static insertCells(index: number, newCells: NotebookCellData[]): NotebookEdit {
+    return new NotebookEdit(new NotebookRange(index, index), newCells);
+  }
+  static deleteCells(range: NotebookRange): NotebookEdit {
+    return new NotebookEdit(range, []);
+  }
+  static replaceCells(range: NotebookRange, newCells: NotebookCellData[]): NotebookEdit {
+    return new NotebookEdit(range, newCells);
+  }
+}
+
+export enum NotebookControllerAffinity {
+  Default = 1,
+  Preferred = 2,
 }
 
 // --- Main Shim ---
@@ -509,17 +1027,61 @@ export class VscodeApiShim {
   private configDefaults = new Map<string, unknown>();
   private configOverrides = new Map<string, unknown>();
   private treeDataProviders = new Map<string, TreeDataProvider<unknown>>();
+  // Maps viewId -> (itemId -> element) for tree view children requests
+  private treeViewElements = new Map<string, Map<string, unknown>>();
+  private treeViewItemCounter = 0;
 
   private pendingUiRequests = new Map<
     string,
     { resolve: (value: unknown) => void; reject: (err: Error) => void; timer?: ReturnType<typeof setTimeout> }
   >();
   private uiRequestId = 0;
+  private _applyEditRequestId = 0;
   private statusBarItemId = 0;
   private decorationTypeId = 0;
   // M8b: WebView panel state keyed by panel_id
   private webviewPanelStates = new Map<string, WebviewPanelState>();
   private webviewPanelId = 0;
+
+  // Multi-workspace registry: workspace_id -> root_path
+  private workspaceRegistry = new Map<string, string>();
+  private _primaryWorkspaceRoot: string | null = null;
+
+  // Notebook serializers registered by extensions
+  private notebookSerializers = new Map<string, { deserializeNotebook: (...args: unknown[]) => unknown; serializeNotebook: (...args: unknown[]) => unknown }>();
+  private _onDidOpenNotebookDocument = new EventEmitter<unknown>();
+  private _onDidChangeNotebookDocument = new EventEmitter<unknown>();
+  private _onDidCloseNotebookDocument = new EventEmitter<unknown>();
+
+  // Active editor tracking
+  private _activeTextEditor: TextDocument | null = null;
+  private _onDidChangeActiveTextEditor = new EventEmitter<TextDocument | undefined>();
+
+  // Save events
+  private _onDidSaveTextDocument = new EventEmitter<TextDocument>();
+  private _onWillSaveTextDocument = new EventEmitter<{
+    document: TextDocument;
+    reason: number;
+    waitUntil: (thenable: Thenable<unknown>) => void;
+  }>();
+
+  // Diagnostics change event
+  private _onDidChangeDiagnostics = new EventEmitter<{ uris: string[] }>();
+
+  // Configuration change event
+  private _onDidChangeConfiguration = new EventEmitter<{ affectsConfiguration(section: string): boolean }>();
+
+  // Terminal API
+  private _terminalId = 0;
+  private _onDidOpenTerminal = new EventEmitter<unknown>();
+  private _onDidCloseTerminal = new EventEmitter<unknown>();
+  private pendingTerminals = new Map<string, { onReady: (id: string) => void }>();
+
+  // Decoration render options keyed by decoration type key
+  private decorationRenderOptions = new Map<string, DecorationRenderOptions>();
+
+  // Inline completion providers
+  private inlineCompletionProviders: Array<{ provider: { provideInlineCompletionItems: (...args: unknown[]) => unknown } }> = [];
 
   // M6: LSP provider registries
   private completionProviders: ProviderEntry<{ provideCompletionItems: (...args: unknown[]) => unknown }>[] = [];
@@ -530,6 +1092,9 @@ export class VscodeApiShim {
   private signatureHelpProviders: ProviderEntry<{ provideSignatureHelp: (...args: unknown[]) => unknown }>[] = [];
   private documentSymbolProviders: ProviderEntry<{ provideDocumentSymbols: (...args: unknown[]) => unknown }>[] = [];
   private formattingProviders: ProviderEntry<{ provideDocumentFormattingEdits: (...args: unknown[]) => unknown }>[] = [];
+  private inlayHintsProviders: ProviderEntry<{ provideInlayHints: (...args: unknown[]) => unknown }>[] = [];
+  private renameProviders: ProviderEntry<{ provideRenameEdits: (...args: unknown[]) => unknown; prepareRename?: (...args: unknown[]) => unknown }>[] = [];
+  private documentHighlightProviders: ProviderEntry<{ provideDocumentHighlights: (...args: unknown[]) => unknown }>[] = [];
 
   // Events
   private _onDidOpenTextDocument = new EventEmitter<TextDocument>();
@@ -545,6 +1110,22 @@ export class VscodeApiShim {
         this.configDefaults.set(key, schema.default);
       }
     }
+  }
+
+  /** Register a workspace window by its root path. Updates workspaceFolders. */
+  registerWorkspace(workspaceId: string, rootPath: string): void {
+    this.workspaceRegistry.set(workspaceId, rootPath);
+    if (!this._primaryWorkspaceRoot) {
+      this._primaryWorkspaceRoot = rootPath;
+    }
+    this._onDidChangeConfiguration.fire({ affectsConfiguration: () => true });
+  }
+
+  /** Unregister a workspace window when it is closed. */
+  unregisterWorkspace(workspaceId: string): void {
+    this.workspaceRegistry.delete(workspaceId);
+    const remaining = [...this.workspaceRegistry.values()];
+    this._primaryWorkspaceRoot = remaining[0] ?? null;
   }
 
   handleFrontendMessage(msg: IpcMessage): void {
@@ -609,6 +1190,10 @@ export class VscodeApiShim {
         if (sp.key && sp.value !== undefined) {
           this.configOverrides.set(sp.key, sp.value);
           console.log(`[ApiShim] Setting updated: ${sp.key}`);
+          const changedKey = sp.key;
+          this._onDidChangeConfiguration.fire({
+            affectsConfiguration: (section: string) => changedKey.startsWith(section),
+          });
         }
         break;
       }
@@ -639,6 +1224,30 @@ export class VscodeApiShim {
       case "extension/uninstalled":
         // These are handled at the host level, not in the API shim
         break;
+      // Save events
+      case "textDocument/didSave": {
+        const sp = msg.params as { uri: string };
+        const savedDoc = this.documents.get(sp.uri);
+        if (savedDoc) {
+          this._onWillSaveTextDocument.fire({
+            document: savedDoc,
+            reason: 1,
+            waitUntil: () => {},
+          });
+          this._onDidSaveTextDocument.fire(savedDoc);
+        }
+        break;
+      }
+      // Terminal created response
+      case "terminal/created": {
+        const tp = msg.params as { request_id: string; terminal_id: string };
+        const pending = this.pendingTerminals.get(tp.request_id);
+        if (pending) {
+          this.pendingTerminals.delete(tp.request_id);
+          pending.onReady(tp.terminal_id);
+        }
+        break;
+      }
       // M8b: Message from webview iframe to extension
       case "webview/messageFromWebview": {
         const wmp = msg.params as { panel_id: string; message: unknown };
@@ -684,7 +1293,8 @@ export class VscodeApiShim {
   private async dispatchLspRequest(method: string, params: Record<string, unknown>): Promise<unknown> {
     const uri = params.uri as string;
     const doc = this.documents.get(uri);
-    if (!doc && method !== "textDocument/formatting") {
+    const doclessOk = method === "textDocument/formatting" || method.startsWith("treeView/");
+    if (!doc && !doclessOk) {
       return null;
     }
 
@@ -787,6 +1397,157 @@ export class VscodeApiShim {
           }
         }
         return null;
+      }
+      case "textDocument/inlineCompletion": {
+        const position = new Position(params.line as number, params.character as number);
+        const inlineContext = { triggerKind: (params.triggerKind as number) ?? 0, selectedCompletionInfo: undefined };
+        for (const entry of this.inlineCompletionProviders) {
+          const result = await entry.provider.provideInlineCompletionItems(doc, position, inlineContext, nullCancellationToken);
+          if (result) {
+            const items = Array.isArray(result) ? result : (result as { items: unknown[] }).items ?? [];
+            const serialized = items.map((item: unknown) => {
+              const it = item as { insertText: string | { value: string }; range?: Range };
+              const text = typeof it.insertText === 'string' ? it.insertText : (it.insertText as { value: string })?.value ?? '';
+              return { insertText: text, range: it.range ? this.serializeRange(it.range) : undefined };
+            });
+            if (serialized.length > 0) return { items: serialized };
+          }
+        }
+        return { items: [] };
+      }
+      case "treeView/getChildren": {
+        const viewId = params.view_id as string;
+        const itemId = params.item_id as string | null;
+        const tvProvider = this.treeDataProviders.get(viewId);
+        if (!tvProvider) return [];
+        const elements = this.treeViewElements.get(viewId) ?? new Map<string, unknown>();
+        this.treeViewElements.set(viewId, elements);
+        const parentElement = itemId ? elements.get(itemId) : undefined;
+        const children = await tvProvider.getChildren(parentElement) ?? [];
+        const result = [];
+        for (const child of children) {
+          const treeItem = await tvProvider.getTreeItem(child);
+          const id = `tv-${++this.treeViewItemCounter}`;
+          elements.set(id, child);
+          const ti = treeItem as {
+            label: string | { label: string };
+            description?: string;
+            tooltip?: string;
+            collapsibleState?: number;
+            command?: { command: string; title: string; arguments?: unknown[] };
+            iconPath?: unknown;
+            contextValue?: string;
+          };
+          const label = typeof ti.label === 'string' ? ti.label : (ti.label as { label: string })?.label ?? '';
+          result.push({
+            id,
+            label,
+            description: ti.description ?? null,
+            tooltip: ti.tooltip ?? null,
+            collapsible_state: ti.collapsibleState ?? 0,
+            command: ti.command ? { command: ti.command.command, title: ti.command.title, args: ti.command.arguments ?? [] } : null,
+            context_value: ti.contextValue ?? null,
+          });
+        }
+        return result;
+      }
+      case "textDocument/inlayHint": {
+        const range = new Range(
+          params.startLine as number, 0,
+          params.endLine as number, 0
+        );
+        const allHints: unknown[] = [];
+        for (const entry of this.inlayHintsProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideInlayHints(doc, range, nullCancellationToken);
+            if (result && Array.isArray(result)) {
+              for (const hint of result) {
+                const h = hint as {
+                  position: Position;
+                  label: string | Array<{ value: string }>;
+                  kind?: number;
+                  paddingLeft?: boolean;
+                  paddingRight?: boolean;
+                };
+                const labelText = typeof h.label === 'string'
+                  ? h.label
+                  : h.label.map((p: { value: string }) => p.value).join('');
+                allHints.push({
+                  line: h.position.line,
+                  character: h.position.character,
+                  label: labelText,
+                  kind: h.kind ?? 1,
+                  paddingLeft: h.paddingLeft ?? false,
+                  paddingRight: h.paddingRight ?? false,
+                });
+              }
+            }
+          }
+        }
+        return allHints;
+      }
+      case "textDocument/prepareRename": {
+        const position = new Position(params.line as number, params.character as number);
+        for (const entry of this.renameProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            if (entry.provider.prepareRename) {
+              const result = await entry.provider.prepareRename(doc, position, nullCancellationToken);
+              if (result !== undefined) return result;
+            } else {
+              return { placeholder: "" };
+            }
+          }
+        }
+        return null;
+      }
+      case "textDocument/rename": {
+        const position = new Position(params.line as number, params.character as number);
+        const newName = params.newName as string;
+        for (const entry of this.renameProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideRenameEdits(doc, position, newName, nullCancellationToken);
+            if (result) {
+              const edit = result as WorkspaceEdit;
+              const changes: Array<{ uri: string; edits: Array<{ start_line: number; start_col: number; end_line: number; end_col: number; new_text: string }> }> = [];
+              for (const [editUri, textEdits] of edit.entries()) {
+                const uriStr = typeof editUri === 'string' ? editUri : editUri.toString();
+                changes.push({
+                  uri: uriStr,
+                  edits: (textEdits as TextEdit[]).map(te => ({
+                    start_line: te.range.start.line,
+                    start_col: te.range.start.character,
+                    end_line: te.range.end.line,
+                    end_col: te.range.end.character,
+                    new_text: te.newText,
+                  }))
+                });
+              }
+              return { changes };
+            }
+          }
+        }
+        return null;
+      }
+      case "textDocument/documentHighlight": {
+        const position = new Position(params.line as number, params.character as number);
+        for (const entry of this.documentHighlightProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideDocumentHighlights(doc, position, nullCancellationToken);
+            if (result && Array.isArray(result)) {
+              return result.map((h: unknown) => {
+                const hl = h as { range: Range; kind?: number };
+                return {
+                  start_line: hl.range.start.line,
+                  start_col: hl.range.start.character,
+                  end_line: hl.range.end.line,
+                  end_col: hl.range.end.character,
+                  kind: hl.kind ?? 1,
+                };
+              });
+            }
+          }
+        }
+        return [];
       }
       default:
         console.log(`[ApiShim] Unknown LSP method: ${method}`);
@@ -921,6 +1682,8 @@ export class VscodeApiShim {
     );
     this.documents.set(params.uri, doc);
     this._onDidOpenTextDocument.fire(doc);
+    this._activeTextEditor = doc;
+    this._onDidChangeActiveTextEditor.fire(doc);
     console.log(`[ApiShim] Document opened: ${params.uri} (lang: ${doc.languageId})`);
   }
 
@@ -947,6 +1710,11 @@ export class VscodeApiShim {
     if (doc) {
       this.documents.delete(params.uri);
       this._onDidCloseTextDocument.fire(doc);
+      if (this._activeTextEditor?.uri === doc.uri) {
+        const remaining = [...this.documents.values()];
+        this._activeTextEditor = remaining.length > 0 ? remaining[remaining.length - 1] : null;
+        this._onDidChangeActiveTextEditor.fire(this._activeTextEditor ?? undefined);
+      }
       console.log(`[ApiShim] Document closed: ${params.uri}`);
     }
   }
@@ -972,6 +1740,159 @@ export class VscodeApiShim {
       onDidOpenTextDocument: self._onDidOpenTextDocument.event,
       onDidChangeTextDocument: self._onDidChangeTextDocument.event,
       onDidCloseTextDocument: self._onDidCloseTextDocument.event,
+      onDidSaveTextDocument: self._onDidSaveTextDocument.event,
+      onWillSaveTextDocument: self._onWillSaveTextDocument.event,
+      get workspaceFolders() {
+        if (self.workspaceRegistry.size > 0) {
+          return [...self.workspaceRegistry.values()].map((root, index) => ({
+            uri: Uri.file(root),
+            name: root.split(/[\\/]/).pop() ?? "workspace",
+            index,
+          }));
+        }
+        const root = process.env.CORECODE_WORKSPACE_ROOT ?? process.cwd();
+        return [{ uri: Uri.file(root), name: root.split(/[\\/]/).pop() ?? "workspace", index: 0 }];
+      },
+      get rootPath(): string | undefined {
+        return self._primaryWorkspaceRoot ?? process.env.CORECODE_WORKSPACE_ROOT ?? process.cwd();
+      },
+      onDidChangeConfiguration: self._onDidChangeConfiguration.event,
+      createFileSystemWatcher(_pattern: string) {
+        const onCreate = new EventEmitter<Uri>();
+        const onChange = new EventEmitter<Uri>();
+        const onDelete = new EventEmitter<Uri>();
+        return {
+          onDidCreate: onCreate.event,
+          onDidChange: onChange.event,
+          onDidDelete: onDelete.event,
+          dispose() { onCreate.dispose(); onChange.dispose(); onDelete.dispose(); },
+        };
+      },
+      getWorkspaceFolder(uri: Uri) {
+        // Find the workspace folder that contains this URI's path.
+        const fsPath = uri.fsPath ?? (uri as unknown as { path: string }).path ?? "";
+        for (const [, root] of self.workspaceRegistry) {
+          if (fsPath.startsWith(root)) {
+            return { uri: Uri.file(root), name: root.split(/[\\/]/).pop() ?? "workspace", index: 0 };
+          }
+        }
+        const root = self._primaryWorkspaceRoot ?? process.env.CORECODE_WORKSPACE_ROOT ?? process.cwd();
+        return { uri: Uri.file(root), name: root.split(/[\\/]/).pop() ?? "workspace", index: 0 };
+      },
+      async findFiles(include: string, exclude?: string): Promise<Uri[]> {
+        const roots = self.workspaceRegistry.size > 0
+          ? [...self.workspaceRegistry.values()]
+          : [process.env.CORECODE_WORKSPACE_ROOT ?? process.cwd()];
+        const re = globToRegex(include);
+        const excludeRe = exclude ? globToRegex(exclude) : null;
+        const results: Uri[] = [];
+        for (const root of roots) {
+          async function walk(dir: string) {
+            let entries: import("node:fs").Dirent[];
+            try { entries = await nodeFs.readdir(dir, { withFileTypes: true }); } catch { return; }
+            for (const e of entries) {
+              if (e.name.startsWith('.')) continue;
+              const full = nodePath.join(dir, e.name);
+              const rel = nodePath.relative(root, full).replace(/\\/g, '/');
+              if (e.isDirectory()) {
+                if (!excludeRe || !excludeRe.test(rel)) await walk(full);
+              } else {
+                if (re.test(rel) && (!excludeRe || !excludeRe.test(rel))) {
+                  results.push(Uri.file(full));
+                }
+              }
+            }
+          }
+          await walk(root);
+        }
+        return results;
+      },
+      fs: {
+        async stat(uri: Uri): Promise<{ type: FileType; ctime: number; mtime: number; size: number }> {
+          try {
+            const s = await nodeFs.stat(uri.fsPath);
+            return {
+              type: s.isDirectory() ? FileType.Directory : s.isSymbolicLink() ? (FileType.SymbolicLink | FileType.File) : FileType.File,
+              ctime: Math.floor(s.ctimeMs),
+              mtime: Math.floor(s.mtimeMs),
+              size: s.size,
+            };
+          } catch { return { type: FileType.Unknown, ctime: 0, mtime: 0, size: 0 }; }
+        },
+        async readDirectory(uri: Uri): Promise<[string, FileType][]> {
+          try {
+            const entries = await nodeFs.readdir(uri.fsPath, { withFileTypes: true });
+            return entries.map(e => [
+              e.name,
+              e.isDirectory() ? FileType.Directory : e.isSymbolicLink() ? (FileType.SymbolicLink | FileType.File) : FileType.File,
+            ] as [string, FileType]);
+          } catch { return []; }
+        },
+        async readFile(uri: Uri): Promise<Uint8Array> {
+          try {
+            const buf = await nodeFs.readFile(uri.fsPath);
+            return new Uint8Array(buf);
+          } catch { return new Uint8Array(0); }
+        },
+        async writeFile(uri: Uri, content: Uint8Array): Promise<void> {
+          await nodeFs.writeFile(uri.fsPath, content);
+        },
+        async delete(uri: Uri, options?: { recursive?: boolean; useTrash?: boolean }): Promise<void> {
+          try {
+            if (options?.recursive) {
+              await nodeFs.rm(uri.fsPath, { recursive: true, force: true });
+            } else {
+              await nodeFs.unlink(uri.fsPath);
+            }
+          } catch { /* ignore */ }
+        },
+        async rename(source: Uri, target: Uri, _options?: { overwrite?: boolean }): Promise<void> {
+          await nodeFs.rename(source.fsPath, target.fsPath);
+        },
+        async createDirectory(uri: Uri): Promise<void> {
+          await nodeFs.mkdir(uri.fsPath, { recursive: true });
+        },
+        async copy(source: Uri, target: Uri, _options?: { overwrite?: boolean }): Promise<void> {
+          await nodeFs.copyFile(source.fsPath, target.fsPath);
+        },
+      },
+      async applyEdit(edit: WorkspaceEdit): Promise<boolean> {
+        const requestId = `we-${++self._applyEditRequestId}`;
+        const changes: Array<{ uri: string; edits: Array<{ start_line: number; start_col: number; end_line: number; end_col: number; new_text: string }> }> = [];
+
+        for (const [uri, textEdits] of edit.entries()) {
+          const uriStr = typeof uri === 'string' ? uri : uri.toString();
+          const serializedEdits = (textEdits as TextEdit[]).map(te => ({
+            start_line: te.range.start.line,
+            start_col: te.range.start.character,
+            end_line: te.range.end.line,
+            end_col: te.range.end.character,
+            new_text: te.newText,
+          }));
+          changes.push({ uri: uriStr, edits: serializedEdits });
+        }
+
+        if (changes.length === 0) return true;
+
+        self.sendOutgoing({
+          method: "workspace/applyEdit",
+          params: { request_id: requestId, changes },
+        });
+        return true;
+      },
+
+      registerNotebookSerializer(notebookType: string, serializer: { deserializeNotebook: (...args: unknown[]) => unknown; serializeNotebook: (...args: unknown[]) => unknown }): { dispose: () => void } {
+        self.notebookSerializers.set(notebookType, serializer);
+        return new Disposable(() => { self.notebookSerializers.delete(notebookType); });
+      },
+      onDidOpenNotebookDocument: self._onDidOpenNotebookDocument.event,
+      onDidChangeNotebookDocument: self._onDidChangeNotebookDocument.event,
+      onDidCloseNotebookDocument: self._onDidCloseNotebookDocument.event,
+      notebookDocuments: [] as unknown[],
+      async openNotebookDocument(_uriOrNotebookType: unknown, _content?: unknown): Promise<unknown> {
+        return Promise.reject(new Error("[CoreCode] Notebook documents are not yet fully supported"));
+      },
+
       getConfiguration(section?: string): ConfigurationSection {
         return {
           get<T>(key: string, defaultValue?: T): T | undefined {
@@ -1160,6 +2081,88 @@ export class VscodeApiShim {
         console.log("[ApiShim] DocumentFormattingEditProvider registered");
         return { dispose: () => { self.formattingProviders = self.formattingProviders.filter(e => e !== entry); } };
       },
+
+      registerDocumentRangeFormattingEditProvider(
+        selector: DocumentSelector,
+        provider: { provideDocumentRangeFormattingEdits: (...args: unknown[]) => unknown }
+      ): { dispose(): void } {
+        // Wrap as a full-document formatter so LSP dispatch can pick it up
+        const wrapped = {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          provideDocumentFormattingEdits: (...args: unknown[]) => {
+            const [doc, , options, token] = args as [TextDocument, unknown, FormattingOptions, CancellationToken];
+            return provider.provideDocumentRangeFormattingEdits(doc, new Range(new Position(0, 0), new Position(doc.lineCount, 0)), options, token);
+          },
+        };
+        const entry = { selector, provider: wrapped };
+        self.formattingProviders.push(entry);
+        console.log("[ApiShim] DocumentRangeFormattingEditProvider registered");
+        return { dispose: () => { self.formattingProviders = self.formattingProviders.filter(e => e !== entry); } };
+      },
+
+      registerCodeLensProvider(
+        _selector: DocumentSelector,
+        _provider: { provideCodeLenses: (...args: unknown[]) => unknown; resolveCodeLens?: (...args: unknown[]) => unknown }
+      ): { dispose(): void } {
+        console.log("[ApiShim] CodeLensProvider registered (stub — lens rendering not yet implemented)");
+        return { dispose: () => {} };
+      },
+
+      registerFoldingRangeProvider(
+        _selector: DocumentSelector,
+        _provider: { provideFoldingRanges: (...args: unknown[]) => unknown }
+      ): { dispose(): void } {
+        console.log("[ApiShim] FoldingRangeProvider registered (stub)");
+        return { dispose: () => {} };
+      },
+
+      registerInlineCompletionItemProvider(
+        _selector: DocumentSelector,
+        provider: { provideInlineCompletionItems: (...args: unknown[]) => unknown }
+      ): { dispose(): void } {
+        self.inlineCompletionProviders.push({ provider });
+        console.log("[ApiShim] InlineCompletionItemProvider registered");
+        return { dispose: () => { self.inlineCompletionProviders = self.inlineCompletionProviders.filter(p => p.provider !== provider); } };
+      },
+
+      registerInlayHintsProvider(
+        selector: DocumentSelector,
+        provider: { provideInlayHints: (...args: unknown[]) => unknown; resolveInlayHint?: (...args: unknown[]) => unknown }
+      ): { dispose(): void } {
+        self.inlayHintsProviders.push({ selector, provider });
+        console.log("[ApiShim] InlayHintsProvider registered");
+        return { dispose: () => { self.inlayHintsProviders = self.inlayHintsProviders.filter(p => p.provider !== provider); } };
+      },
+
+      registerRenameProvider(
+        selector: DocumentSelector,
+        provider: { provideRenameEdits: (...args: unknown[]) => unknown; prepareRename?: (...args: unknown[]) => unknown }
+      ): { dispose(): void } {
+        self.renameProviders.push({ selector, provider });
+        console.log("[ApiShim] RenameProvider registered");
+        return { dispose: () => { self.renameProviders = self.renameProviders.filter(p => p.provider !== provider); } };
+      },
+
+      registerDocumentHighlightProvider(
+        selector: DocumentSelector,
+        provider: { provideDocumentHighlights: (...args: unknown[]) => unknown }
+      ): { dispose(): void } {
+        self.documentHighlightProviders.push({ selector, provider });
+        console.log("[ApiShim] DocumentHighlightProvider registered");
+        return { dispose: () => { self.documentHighlightProviders = self.documentHighlightProviders.filter(p => p.provider !== provider); } };
+      },
+
+      match(selector: DocumentSelector, document: TextDocument): number {
+        return self.matchesSelector(selector, document) ? 10 : 0;
+      },
+
+      getDiagnostics(_resource?: Uri): Diagnostic[] | [Uri, Diagnostic[]][] {
+        // Stub — diagnostics are pushed outgoing; no local cache maintained
+        if (_resource) return [];
+        return [];
+      },
+
+      onDidChangeDiagnostics: self._onDidChangeDiagnostics.event,
     };
   }
 
@@ -1182,6 +2185,7 @@ export class VscodeApiShim {
       method: "publishDiagnostics",
       params: { uri, diagnostics: mapped },
     });
+    this._onDidChangeDiagnostics.fire({ uris: [uri] });
   }
 
   // --- vscode.window ---
@@ -1403,10 +2407,11 @@ export class VscodeApiShim {
         options: DecorationRenderOptions
       ): TextEditorDecorationType {
         const key = `dec-${++self.decorationTypeId}`;
+        self.decorationRenderOptions.set(key, options);
         return {
           key,
           dispose() {
-            // Clear all decorations of this type
+            self.decorationRenderOptions.delete(key);
           },
         };
       },
@@ -1416,9 +2421,21 @@ export class VscodeApiShim {
         const expandEmitter = new EventEmitter<{ element: T }>();
         const collapseEmitter = new EventEmitter<{ element: T }>();
         const selectionEmitter = new EventEmitter<{ selection: T[] }>();
+        const provider = options.treeDataProvider as TreeDataProvider<unknown>;
 
-        // Register the provider for later use
-        self.treeDataProviders.set(viewId, options.treeDataProvider as TreeDataProvider<unknown>);
+        self.treeDataProviders.set(viewId, provider);
+        self.treeViewElements.set(viewId, new Map());
+
+        // Notify frontend that this tree view is available
+        self.sendOutgoing({ method: "treeView/register", params: { view_id: viewId } });
+
+        // When data changes, notify frontend to re-fetch
+        if (provider.onDidChangeTreeData) {
+          provider.onDidChangeTreeData(() => {
+            self.treeViewElements.set(viewId, new Map()); // clear cached elements
+            self.sendOutgoing({ method: "treeView/update", params: { view_id: viewId } });
+          });
+        }
 
         console.log(`[ApiShim] TreeView registered: ${viewId}`);
 
@@ -1427,20 +2444,32 @@ export class VscodeApiShim {
           onDidCollapseElement: collapseEmitter.event,
           onDidChangeSelection: selectionEmitter.event,
           async reveal(_element: T) {
-            // Stub — frontend will handle tree reveal
+            self.sendOutgoing({ method: "treeView/reveal", params: { view_id: viewId } });
           },
           dispose() {
             self.treeDataProviders.delete(viewId);
+            self.treeViewElements.delete(viewId);
+            self.sendOutgoing({ method: "treeView/unregister", params: { view_id: viewId } });
           },
         };
       },
 
       registerTreeDataProvider<T>(viewId: string, provider: TreeDataProvider<T>): { dispose(): void } {
-        self.treeDataProviders.set(viewId, provider as TreeDataProvider<unknown>);
+        const p = provider as TreeDataProvider<unknown>;
+        self.treeDataProviders.set(viewId, p);
+        self.treeViewElements.set(viewId, new Map());
+        self.sendOutgoing({ method: "treeView/register", params: { view_id: viewId } });
+        if (p.onDidChangeTreeData) {
+          p.onDidChangeTreeData(() => {
+            self.treeViewElements.set(viewId, new Map());
+            self.sendOutgoing({ method: "treeView/update", params: { view_id: viewId } });
+          });
+        }
         console.log(`[ApiShim] TreeDataProvider registered: ${viewId}`);
         return {
           dispose() {
             self.treeDataProviders.delete(viewId);
+            self.treeViewElements.delete(viewId);
           },
         };
       },
@@ -1508,10 +2537,744 @@ export class VscodeApiShim {
         console.log(`[ApiShim] WebviewPanel created: ${panelId} (${viewType})`);
         return panel;
       },
+
+      get activeTextEditor() {
+        if (!self._activeTextEditor) return undefined;
+        const doc = self._activeTextEditor;
+        return {
+          document: doc,
+          selection: new Selection(new Position(0, 0), new Position(0, 0)),
+          selections: [new Selection(new Position(0, 0), new Position(0, 0))],
+          visibleRanges: [new Range(new Position(0, 0), new Position(0, 0))],
+          viewColumn: ViewColumn.One,
+          edit: async (_cb: unknown) => false,
+          insertSnippet: async (_snippet: unknown) => false,
+          setDecorations(type: unknown, ranges: unknown) {
+            const decType = type as TextEditorDecorationType;
+            if (!decType?.key) return;
+            const rangeArr = (Array.isArray(ranges) ? ranges : []) as Range[];
+            const opts = self.decorationRenderOptions.get(decType.key) ?? {};
+            const uri = typeof doc.uri === 'string' ? doc.uri : String(doc.uri);
+            self.sendOutgoing({
+              method: "setDecorations",
+              params: {
+                uri,
+                decoration_type: decType.key,
+                ranges: rangeArr.map(r => ({
+                  start_line: r.start?.line ?? 0,
+                  start_col: r.start?.character ?? 0,
+                  end_line: r.end?.line ?? 0,
+                  end_col: r.end?.character ?? 0,
+                  hover_message: null,
+                })),
+                background_color: opts.backgroundColor ?? null,
+                color: opts.color ?? null,
+                border: opts.border ?? null,
+                border_color: opts.borderColor ?? null,
+                after_text: opts.after?.contentText ?? null,
+              },
+            });
+          },
+          revealRange: (_range: unknown) => {},
+        };
+      },
+
+      onDidChangeActiveTextEditor: self._onDidChangeActiveTextEditor.event,
+      onDidChangeTextEditorSelection: new EventEmitter<unknown>().event,
+      onDidChangeTextEditorVisibleRanges: new EventEmitter<unknown>().event,
+
+      async withProgress<R>(
+        _options: { location: unknown; title?: string; cancellable?: boolean },
+        task: (
+          progress: { report(value: { message?: string; increment?: number }): void },
+          token: CancellationToken
+        ) => Thenable<R>
+      ): Promise<R> {
+        return task({ report: () => {} }, nullCancellationToken);
+      },
+
+      async showTextDocument(docOrUri: unknown, options?: { selection?: Range; viewColumn?: unknown; preview?: boolean; preserveFocus?: boolean }): Promise<unknown> {
+        let uriStr: string;
+        if (typeof docOrUri === 'object' && docOrUri !== null) {
+          const obj = docOrUri as { uri?: unknown; toString(): string };
+          if (obj.uri && typeof obj.uri === 'object') {
+            uriStr = (obj.uri as { toString(): string }).toString();
+          } else {
+            uriStr = obj.toString();
+          }
+        } else {
+          uriStr = String(docOrUri);
+        }
+        self.sendOutgoing({
+          method: "showTextDocument",
+          params: {
+            uri: uriStr,
+            selection: options?.selection ? {
+              start_line: options.selection.start.line,
+              start_character: options.selection.start.character,
+              end_line: options.selection.end.line,
+              end_character: options.selection.end.character,
+            } : null,
+            preserve_focus: options?.preserveFocus ?? false,
+          },
+        });
+        return self.window.activeTextEditor ?? {};
+      },
+
+      createTerminal(
+        nameOrOptions?: string | { name?: string; cwd?: string; shellPath?: string; shellArgs?: string[] | string; env?: Record<string, string> },
+        _shellPath?: string,
+        _shellArgs?: string[] | string
+      ): unknown {
+        const opts = typeof nameOrOptions === "object" ? nameOrOptions : { name: nameOrOptions };
+        const name = opts?.name ?? "Terminal";
+        const requestId = `ext-term-${++self._terminalId}`;
+        const writeQueue: string[] = [];
+        let resolvedId: string | null = null;
+
+        self.sendOutgoing({
+          method: "terminal/create",
+          params: { request_id: requestId, name, cwd: opts?.cwd ?? null, shell: (opts as { shellPath?: string })?.shellPath ?? null },
+        });
+
+        const terminal = {
+          name,
+          processId: Promise.resolve(undefined as number | undefined),
+          creationOptions: opts ?? {},
+          exitStatus: undefined as undefined,
+          state: { isInteractedWith: false },
+          sendText(text: string, addNewLine?: boolean) {
+            const data = addNewLine !== false ? text + "\n" : text;
+            if (resolvedId) {
+              self.sendOutgoing({ method: "terminal/write", params: { terminal_id: resolvedId, data } });
+            } else {
+              writeQueue.push(data);
+            }
+          },
+          show(_preserveFocus?: boolean) {
+            if (resolvedId) {
+              self.sendOutgoing({ method: "terminal/show", params: { terminal_id: resolvedId } });
+            }
+          },
+          hide() {},
+          dispose() {
+            if (resolvedId) {
+              self.sendOutgoing({ method: "terminal/close", params: { terminal_id: resolvedId } });
+            }
+          },
+        };
+
+        self.pendingTerminals.set(requestId, {
+          onReady(terminalId: string) {
+            resolvedId = terminalId;
+            for (const d of writeQueue) {
+              self.sendOutgoing({ method: "terminal/write", params: { terminal_id: terminalId, data: d } });
+            }
+            writeQueue.length = 0;
+            self._onDidOpenTerminal.fire(terminal);
+          },
+        });
+
+        return terminal;
+      },
+
+      onDidOpenTerminal: self._onDidOpenTerminal.event,
+      onDidCloseTerminal: self._onDidCloseTerminal.event,
+      onDidChangeTerminalState: new EventEmitter<unknown>().event,
+
+      get visibleTextEditors() {
+        if (!self._activeTextEditor) return [];
+        const doc = self._activeTextEditor;
+        return [{
+          document: doc,
+          selection: new Selection(new Position(0, 0), new Position(0, 0)),
+          selections: [new Selection(new Position(0, 0), new Position(0, 0))],
+          visibleRanges: [new Range(new Position(0, 0), new Position(0, 0))],
+          viewColumn: ViewColumn.One,
+          edit: async (_cb: unknown) => false,
+          insertSnippet: async (_snippet: unknown) => false,
+          setDecorations(type: unknown, ranges: unknown) {
+            const decType = type as TextEditorDecorationType;
+            if (!decType?.key) return;
+            const rangeArr = (Array.isArray(ranges) ? ranges : []) as Range[];
+            const opts = self.decorationRenderOptions.get(decType.key) ?? {};
+            const uri = typeof doc.uri === 'string' ? doc.uri : String(doc.uri);
+            self.sendOutgoing({
+              method: "setDecorations",
+              params: {
+                uri, decoration_type: decType.key,
+                ranges: rangeArr.map(r => ({ start_line: r.start?.line ?? 0, start_col: r.start?.character ?? 0, end_line: r.end?.line ?? 0, end_col: r.end?.character ?? 0, hover_message: null })),
+                background_color: opts.backgroundColor ?? null, color: opts.color ?? null,
+                border: opts.border ?? null, border_color: opts.borderColor ?? null,
+                after_text: opts.after?.contentText ?? null,
+              },
+            });
+          },
+          revealRange: (_range: unknown) => {},
+        }];
+      },
+
+      async showOpenDialog(_options?: { canSelectFiles?: boolean; canSelectFolders?: boolean; canSelectMany?: boolean; filters?: Record<string, string[]>; title?: string }): Promise<Uri[] | undefined> {
+        return undefined;
+      },
+
+      async showSaveDialog(_options?: { filters?: Record<string, string[]>; title?: string; defaultUri?: Uri }): Promise<Uri | undefined> {
+        return undefined;
+      },
+
+      registerWebviewViewProvider(_viewId: string, _provider: unknown, _options?: unknown): { dispose(): void } {
+        return { dispose: () => {} };
+      },
+    };
+  }
+
+  // --- vscode.env ---
+
+  get env() {
+    return {
+      appName: "CoreCode",
+      appRoot: process.env.CORECODE_APP_ROOT ?? "",
+      language: "en",
+      uriScheme: "corecode",
+      remoteName: undefined as string | undefined,
+      shell: process.env.SHELL ?? process.env.COMSPEC ?? "",
+      machineId: "corecode-local",
+      sessionId: String(Date.now()),
+      isNewAppInstall: false,
+      isTelemetryEnabled: false,
+      clipboard: {
+        readText: async (): Promise<string> => "",
+        writeText: async (_text: string): Promise<void> => {},
+      },
+      async openExternal(_uri: Uri): Promise<boolean> {
+        console.log(`[env] openExternal: ${_uri.toString()}`);
+        return false;
+      },
+      asExternalUri: async (uri: Uri): Promise<Uri> => uri,
+    };
+  }
+
+  // --- vscode.extensions ---
+
+  private _gitExtension: ReturnType<typeof createGitExtension> | null = null;
+
+  get extensions() {
+    const self = this;
+    return {
+      all: [] as unknown[],
+      getExtension(extensionId: string): unknown {
+        if (extensionId === 'vscode.git') {
+          if (!self._gitExtension) {
+            const root = process.env.CORECODE_WORKSPACE_ROOT ?? process.cwd();
+            self._gitExtension = createGitExtension(root);
+          }
+          return self._gitExtension;
+        }
+        return undefined;
+      },
+      onDidChange: new EventEmitter<void>().event,
+    };
+  }
+
+  // --- vscode.debug ---
+
+  // --- vscode.tasks private state ---
+  private _taskProviders = new Map<string, {
+    provideTasks(token: CancellationToken): unknown;
+    resolveTask?(task: Task, token: CancellationToken): unknown;
+  }>();
+  private _taskExecutions: Array<{ task: Task; terminate(): Promise<void> }> = [];
+  private _onDidStartTask = new EventEmitter<{ execution: { task: Task; terminate(): Promise<void> } }>();
+  private _onDidEndTask = new EventEmitter<{ execution: { task: Task; terminate(): Promise<void> } }>();
+  private _onDidStartTaskProcess = new EventEmitter<{ execution: { task: Task; terminate(): Promise<void> }; processId: number }>();
+  private _onDidEndTaskProcess = new EventEmitter<{ execution: { task: Task; terminate(): Promise<void> }; exitCode: number | undefined }>();
+
+  // --- vscode.debug private state ---
+  private _debugAdapterFactories = new Map<string, {
+    createDebugAdapterDescriptor(session: { type: string; name: string; configuration: Record<string, unknown> }, executable: unknown): Promise<{ command: string; args: string[] } | null> | { command: string; args: string[] } | null;
+  }>();
+  private _debugSessionCounter = 0;
+  private _onDidStartDebugSession = new EventEmitter<{ id: string; type: string; name: string }>();
+  private _onDidTerminateDebugSession = new EventEmitter<{ id: string; type: string; name: string }>();
+
+  get debug() {
+    const self = this;
+    return {
+      startDebugging: async (folder: unknown, nameOrConfig: unknown): Promise<boolean> => {
+        const config = (typeof nameOrConfig === 'object' && nameOrConfig !== null)
+          ? nameOrConfig as Record<string, unknown>
+          : { name: String(nameOrConfig), type: 'unknown', request: 'launch' };
+        const debugType = String(config['type'] ?? 'unknown');
+        const sessionId = `dap-${++self._debugSessionCounter}-${Date.now()}`;
+
+        // Resolve debug adapter executable via registered factory, or fall back to a
+        // well-known default mapping so extensions that ship their own adapter still work.
+        let adapterCmd = '';
+        let adapterArgs: string[] = [];
+
+        const factory = self._debugAdapterFactories.get(debugType);
+        if (factory) {
+          try {
+            const session = { id: sessionId, type: debugType, name: String(config['name'] ?? debugType), configuration: config as Record<string, unknown> };
+            const descriptor = await factory.createDebugAdapterDescriptor(session, undefined);
+            if (descriptor && 'command' in descriptor) {
+              adapterCmd = descriptor.command;
+              adapterArgs = descriptor.args ?? [];
+            }
+          } catch (err) {
+            console.error(`[ApiShim] DebugAdapterDescriptorFactory.createDebugAdapterDescriptor failed: ${err}`);
+          }
+        }
+
+        if (!adapterCmd) {
+          // No factory or factory returned null — report to the console and bail out.
+          console.warn(`[ApiShim] No debug adapter descriptor for type '${debugType}'. Ensure the extension calls registerDebugAdapterDescriptorFactory.`);
+          return false;
+        }
+
+        console.log(`[ApiShim] debug.startDebugging: session=${sessionId} adapter=${adapterCmd} args=${JSON.stringify(adapterArgs)}`);
+
+        self.sendOutgoing({
+          method: "debug/startSession",
+          params: {
+            session_id: sessionId,
+            adapter_cmd: adapterCmd,
+            adapter_args: adapterArgs,
+            launch_config: config,
+          },
+        });
+
+        self._onDidStartDebugSession.fire({ id: sessionId, type: debugType, name: String(config['name'] ?? debugType) });
+        return true;
+      },
+
+      stopDebugging: async (_session?: unknown): Promise<void> => {},
+
+      get activeDebugSession(): unknown { return undefined; },
+
+      activeDebugConsole: {
+        append: (_value: string) => {},
+        appendLine: (_value: string) => {},
+      },
+      breakpoints: [] as unknown[],
+      onDidStartDebugSession: self._onDidStartDebugSession.event,
+      onDidTerminateDebugSession: self._onDidTerminateDebugSession.event,
+      onDidChangeActiveDebugSession: new EventEmitter<unknown>().event,
+      onDidReceiveDebugSessionCustomEvent: new EventEmitter<unknown>().event,
+      onDidChangeBreakpoints: new EventEmitter<unknown>().event,
+
+      registerDebugConfigurationProvider: (_type: string, _provider: unknown): { dispose(): void } => {
+        return { dispose: () => {} };
+      },
+
+      registerDebugAdapterDescriptorFactory: (type: string, factory: unknown): { dispose(): void } => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        self._debugAdapterFactories.set(type, factory as any);
+        console.log(`[ApiShim] DebugAdapterDescriptorFactory registered for '${type}'`);
+        return { dispose: () => { self._debugAdapterFactories.delete(type); } };
+      },
+
+      registerDebugAdapterTrackerFactory: (_type: string, _factory: unknown): { dispose(): void } => {
+        return { dispose: () => {} };
+      },
+
+      addBreakpoints: (_breakpoints: unknown[]): void => {},
+      removeBreakpoints: (_breakpoints: unknown[]): void => {},
+    };
+  }
+
+  // --- vscode.tasks ---
+
+  get tasks() {
+    const self = this;
+    return {
+      registerTaskProvider(type: string, provider: {
+        provideTasks(token: CancellationToken): unknown;
+        resolveTask?(task: Task, token: CancellationToken): unknown;
+      }): { dispose(): void } {
+        console.log(`[ApiShim] TaskProvider registered for '${type}'`);
+        self._taskProviders.set(type, provider);
+        return { dispose: () => { self._taskProviders.delete(type); } };
+      },
+
+      async fetchTasks(filter?: { type?: string }): Promise<Task[]> {
+        const results: Task[] = [];
+        const targetType = filter?.type;
+        for (const [type, provider] of self._taskProviders) {
+          if (targetType && type !== targetType) continue;
+          try {
+            const provided = await Promise.resolve(provider.provideTasks(nullCancellationToken));
+            if (Array.isArray(provided)) {
+              results.push(...(provided as Task[]));
+            }
+          } catch (e) {
+            console.error(`[ApiShim] TaskProvider '${type}' provideTasks error:`, e);
+          }
+        }
+        return results;
+      },
+
+      async executeTask(task: Task): Promise<{ task: Task; terminate(): Promise<void> }> {
+        const execution = task.execution;
+        let commandLine = '';
+        let cwd: string | undefined;
+
+        if (execution instanceof ShellExecution) {
+          if (execution.commandLine) {
+            commandLine = execution.commandLine;
+          } else if (execution.command) {
+            const cmd = typeof execution.command === 'string' ? execution.command : execution.command.value;
+            const argStr = (execution.args ?? [])
+              .map(a => typeof a === 'string' ? a : a.value)
+              .join(' ');
+            commandLine = argStr ? `${cmd} ${argStr}` : cmd;
+          }
+          cwd = execution.options?.cwd;
+        } else if (execution instanceof ProcessExecution) {
+          const argStr = execution.args.join(' ');
+          commandLine = argStr ? `${execution.process} ${argStr}` : execution.process;
+          cwd = execution.options?.cwd;
+        }
+
+        const reveal = task.presentationOptions?.reveal ?? TaskRevealKind.Always;
+        const termOpts: { name: string; cwd?: string } = { name: `Task - ${task.name}` };
+        if (cwd) termOpts.cwd = cwd;
+        const term = self.window.createTerminal(termOpts) as {
+          sendText(text: string, addNewLine?: boolean): void;
+          show(preserveFocus?: boolean): void;
+          dispose(): void;
+        };
+
+        if (reveal === TaskRevealKind.Always) {
+          term.show(!(task.presentationOptions?.focus ?? false));
+        }
+
+        const taskExecution = {
+          task,
+          terminate: async () => {
+            term.dispose();
+            const idx = self._taskExecutions.indexOf(taskExecution);
+            if (idx >= 0) self._taskExecutions.splice(idx, 1);
+            self._onDidEndTask.fire({ execution: taskExecution });
+          },
+        };
+
+        self._taskExecutions.push(taskExecution);
+        self._onDidStartTask.fire({ execution: taskExecution });
+
+        if (commandLine) {
+          if (task.presentationOptions?.clear) {
+            term.sendText('clear', true);
+          }
+          term.sendText(commandLine, true);
+        }
+
+        return taskExecution;
+      },
+
+      get taskExecutions() { return self._taskExecutions as Array<{ task: Task; terminate(): Promise<void> }>; },
+      onDidStartTask: self._onDidStartTask.event,
+      onDidEndTask: self._onDidEndTask.event,
+      onDidStartTaskProcess: self._onDidStartTaskProcess.event,
+      onDidEndTaskProcess: self._onDidEndTaskProcess.event,
+    };
+  }
+
+  // --- vscode.authentication ---
+
+  private _authProviders = new Map<string, {
+    id: string;
+    label: string;
+    provider: { getSessions(scopes: string[]): Promise<AuthSession[]>; createSession(scopes: string[]): Promise<AuthSession>; removeSession(id: string): Promise<void> };
+  }>();
+  private _authSessions = new Map<string, AuthSession>();
+  private _onDidChangeSessions = new EventEmitter<{ provider: { id: string; label: string } }>();
+
+  get authentication() {
+    const self = this;
+
+    // Register a built-in GitHub provider using Device Flow on first access
+    if (!self._authProviders.has('github')) {
+      const ghSessionKey = 'corecode.auth.github';
+      const loadedSession = (() => {
+        try {
+          const raw = process.env[ghSessionKey];
+          return raw ? (JSON.parse(raw) as AuthSession) : null;
+        } catch { return null; }
+      })();
+      if (loadedSession) self._authSessions.set('github:' + loadedSession.scopes.join(','), loadedSession);
+
+      self._authProviders.set('github', {
+        id: 'github',
+        label: 'GitHub',
+        provider: {
+          async getSessions(scopes: string[]): Promise<AuthSession[]> {
+            const key = 'github:' + scopes.join(',');
+            const cached = self._authSessions.get(key);
+            return cached ? [cached] : [];
+          },
+          async createSession(scopes: string[]): Promise<AuthSession> {
+            // GitHub Device Flow — requires CORECODE_GITHUB_CLIENT_ID env var
+            const clientId = process.env.CORECODE_GITHUB_CLIENT_ID ?? '';
+            if (!clientId) throw new Error('[Auth] Set CORECODE_GITHUB_CLIENT_ID env var to enable GitHub auth');
+            const session = await githubDeviceFlow(clientId, scopes);
+            const key = 'github:' + scopes.join(',');
+            self._authSessions.set(key, session);
+            self._onDidChangeSessions.fire({ provider: { id: 'github', label: 'GitHub' } });
+            return session;
+          },
+          async removeSession(id: string): Promise<void> {
+            for (const [k, v] of self._authSessions.entries()) {
+              if (v.id === id) { self._authSessions.delete(k); break; }
+            }
+            self._onDidChangeSessions.fire({ provider: { id: 'github', label: 'GitHub' } });
+          },
+        },
+      });
+    }
+
+    return {
+      getSession: async (providerId: string, scopes: string[], options?: { createIfNone?: boolean; silent?: boolean }): Promise<AuthSession | undefined> => {
+        const prov = self._authProviders.get(providerId);
+        if (!prov) {
+          console.warn(`[Auth] No provider registered for '${providerId}'`);
+          return undefined;
+        }
+        const existing = await prov.provider.getSessions(scopes);
+        if (existing.length > 0) return existing[0];
+        if (options?.silent) return undefined;
+        if (options?.createIfNone) {
+          try { return await prov.provider.createSession(scopes); }
+          catch (e) { console.error(`[Auth] Failed to create session for ${providerId}:`, e); return undefined; }
+        }
+        return undefined;
+      },
+      onDidChangeSessions: self._onDidChangeSessions.event,
+      registerAuthenticationProvider: (id: string, label: string, provider: unknown, _options?: unknown): { dispose(): void } => {
+        const p = provider as { getSessions(scopes: string[]): Promise<AuthSession[]>; createSession(scopes: string[]): Promise<AuthSession>; removeSession(id: string): Promise<void> };
+        self._authProviders.set(id, { id, label, provider: p });
+        console.log(`[Auth] Provider registered: ${id} (${label})`);
+        return { dispose: () => { self._authProviders.delete(id); } };
+      },
+    };
+  }
+
+  // --- vscode.comments ---
+
+  get comments() {
+    const self = this;
+    return {
+      createCommentController: (controllerId: string, controllerLabel: string) => {
+        const threads = new Map<string, unknown>();
+        let threadCounter = 0;
+
+        function deleteThread(id: string) {
+          threads.delete(id);
+          self.sendOutgoing({ method: "comments/threadDelete", params: { id } });
+        }
+
+        const controller = {
+          id: controllerId,
+          label: controllerLabel,
+          commentingRangeProvider: undefined as unknown,
+          createCommentThread: (uri: Uri, range: Range, initialComments: unknown[]) => {
+            const id = `${controllerId}:${++threadCounter}`;
+
+            function pushUpdate(target: Record<string, unknown>) {
+              const rawComments = target.comments as Array<{
+                author?: { name?: string; iconPath?: { external?: string } };
+                body?: { value?: string } | string;
+                mode?: number;
+                timestamp?: Date;
+              }>;
+              const comments = (rawComments ?? []).map(c => ({
+                author: {
+                  name: c.author?.name ?? "Unknown",
+                  icon_url: c.author?.iconPath?.external ?? undefined,
+                },
+                body: typeof c.body === "string" ? c.body : (c.body?.value ?? ""),
+                mode: c.mode ?? 1,
+                timestamp: c.timestamp?.toISOString() ?? undefined,
+              }));
+              self.sendOutgoing({
+                method: "comments/threadUpdate",
+                params: {
+                  id,
+                  controller_id: controllerId,
+                  uri: uri.toString(),
+                  start_line: range.start.line,
+                  end_line: range.end.line,
+                  comments,
+                  collapsible_state: (target.collapsibleState as number) ?? 0,
+                  label: (target.label as string | undefined) ?? undefined,
+                  context_value: (target.contextValue as string | undefined) ?? undefined,
+                },
+              });
+            }
+
+            const threadData: Record<string, unknown> = {
+              id,
+              uri,
+              range,
+              comments: initialComments,
+              collapsibleState: 0,
+              label: undefined,
+              contextValue: undefined,
+              dispose: () => { deleteThread(id); },
+            };
+
+            const proxy = new Proxy(threadData, {
+              set(target, prop, value) {
+                target[prop as string] = value;
+                if (prop === "comments" || prop === "collapsibleState" || prop === "label") {
+                  pushUpdate(target);
+                }
+                return true;
+              },
+            });
+
+            threads.set(id, proxy);
+            pushUpdate(threadData);
+            return proxy;
+          },
+          dispose: () => {
+            for (const id of threads.keys()) {
+              self.sendOutgoing({ method: "comments/threadDelete", params: { id } });
+            }
+            threads.clear();
+          },
+        };
+        return controller;
+      },
+    };
+  }
+
+  // --- vscode.scm ---
+
+  get scm() {
+    const self = this;
+    return {
+      createSourceControl: (id: string, label: string, rootUri?: Uri) => {
+        const groups = new Map<string, { id: string; label: string; resourceStates: unknown[] }>();
+
+        function pushUpdate() {
+          const resource_groups = Array.from(groups.values()).map(g => ({
+            id: g.id,
+            label: g.label,
+            resources: (g.resourceStates as Array<{ resourceUri?: Uri; uri?: Uri; decorations?: { tooltip?: string; letter?: string; color?: { id?: string } } }>).map(r => {
+              const uri = (r.resourceUri ?? r.uri)?.toString() ?? "";
+              const dec = r.decorations ?? {};
+              return {
+                uri,
+                decoration_tooltip: dec.tooltip ?? undefined,
+                decoration_letter: dec.letter ?? undefined,
+                decoration_color: dec.color?.id ?? undefined,
+              };
+            }),
+          }));
+          self.sendOutgoing({
+            method: "scm/update",
+            params: {
+              id,
+              label,
+              root_uri: rootUri?.toString() ?? undefined,
+              resource_groups,
+              count: resource_groups.reduce((s, g) => s + g.resources.length, 0),
+            },
+          });
+        }
+
+        const sc = {
+          id,
+          label,
+          rootUri,
+          inputBox: { value: "", placeholder: "" },
+          count: 0,
+          statusBarCommands: undefined as unknown,
+          acceptInputCommand: undefined as unknown,
+          createResourceGroup: (gId: string, gLabel: string) => {
+            const group = { id: gId, label: gLabel, resourceStates: [] as unknown[], dispose: () => { groups.delete(gId); pushUpdate(); } };
+            // Proxy resourceStates so any assignment triggers pushUpdate
+            const proxy = new Proxy(group, {
+              set(target, prop, value) {
+                (target as Record<string | symbol, unknown>)[prop as string] = value;
+                if (prop === "resourceStates") pushUpdate();
+                return true;
+              },
+            });
+            groups.set(gId, proxy);
+            pushUpdate();
+            return proxy;
+          },
+          dispose: () => {
+            self.sendOutgoing({ method: "scm/remove", params: { id } });
+          },
+        };
+        return sc;
+      },
+      inputBox: { value: "" },
     };
   }
 
   // --- vscode.DiagnosticSeverity ---
+
+  // --- vscode.notebooks ---
+
+  get notebooks() {
+    const self = this;
+    return {
+      /** Create a notebook controller (kernel). Returns a functional stub. */
+      createNotebookController(
+        id: string,
+        notebookType: string,
+        label: string,
+        _handler?: (cells: unknown[], notebook: unknown, controller: unknown) => void | Thenable<void>
+      ) {
+        const _onDidChangeSelectedNotebooks = new EventEmitter<unknown>();
+        const controller = {
+          id,
+          notebookType,
+          label,
+          supportedLanguages: undefined as unknown,
+          supportsExecutionOrder: false,
+          description: undefined as unknown,
+          detail: undefined as unknown,
+          interruptHandler: undefined as unknown,
+          onDidChangeSelectedNotebooks: _onDidChangeSelectedNotebooks.event,
+          /** Create an execution context for a cell. Returns a no-op stub. */
+          createNotebookCellExecution(cell: unknown) {
+            return {
+              cell,
+              executionOrder: undefined as number | undefined,
+              token: nullCancellationToken,
+              start(_startTime?: number) {},
+              end(_success?: boolean | undefined, _endTime?: number) {},
+              clearOutput(_cell?: unknown): Thenable<void> { return Promise.resolve(); },
+              replaceOutput(_out: unknown, _cell?: unknown): Thenable<void> { return Promise.resolve(); },
+              appendOutput(_out: unknown, _cell?: unknown): Thenable<void> { return Promise.resolve(); },
+              replaceOutputItems(_items: unknown, _output: unknown): Thenable<void> { return Promise.resolve(); },
+              appendOutputItems(_items: unknown, _output: unknown): Thenable<void> { return Promise.resolve(); },
+            };
+          },
+          updateNotebookAffinity(_notebook: unknown, _affinity: NotebookControllerAffinity) {},
+          dispose() { _onDidChangeSelectedNotebooks.dispose(); },
+        };
+        // Fire didChange so extensions know the controller is available
+        self._onDidChangeConfiguration.fire({ affectsConfiguration: () => false });
+        return controller;
+      },
+
+      onDidOpenNotebookDocument: self._onDidOpenNotebookDocument.event,
+      onDidChangeNotebookDocument: self._onDidChangeNotebookDocument.event,
+      onDidCloseNotebookDocument: self._onDidCloseNotebookDocument.event,
+      onDidSaveNotebookDocument: new EventEmitter<unknown>().event,
+      /** All currently open notebook documents (empty until UI support is added). */
+      notebookDocuments: [] as unknown[],
+      openNotebookDocument(_uriOrNotebookType: unknown, _content?: unknown): Thenable<unknown> {
+        return Promise.reject(new Error("[CoreCode] Opening notebook documents is not yet supported"));
+      },
+    };
+  }
 
   get DiagnosticSeverity() {
     return DiagnosticSeverity;
@@ -1530,12 +3293,28 @@ export class VscodeApiShim {
       commands: this.commands,
       languages: this.languages,
       window: this.window,
+      env: this.env,
+      extensions: this.extensions,
+      debug: this.debug,
+      tasks: this.tasks,
+      authentication: this.authentication,
+      comments: this.comments,
+      notebooks: this.notebooks,
+      scm: this.scm,
       DiagnosticSeverity: this.DiagnosticSeverity,
       StatusBarAlignment: this.StatusBarAlignment,
       TreeItemCollapsibleState,
       Uri,
       Position,
       Range,
+      Selection,
+      // New utility classes
+      EventEmitter,
+      Disposable,
+      MarkdownString,
+      ThemeColor,
+      ThemeIcon,
+      FileType,
       // M6 exports
       CompletionItemKind,
       CompletionTriggerKind,
@@ -1545,16 +3324,47 @@ export class VscodeApiShim {
       CodeAction: {} as unknown,
       Location,
       TextEdit: {} as unknown,
-      WorkspaceEdit: {} as unknown,
+      WorkspaceEdit: WorkspaceEditImpl,
       Hover: {} as unknown,
       DocumentSymbol: {} as unknown,
       SymbolInformation: {} as unknown,
-      CancellationTokenSource: class CancellationTokenSource {
-        token: CancellationToken = nullCancellationToken;
-        cancel() { /* noop for now */ }
-        dispose() { /* noop */ }
-      },
+      CancellationTokenSource,
       ViewColumn,
+      // Task classes/enums
+      TaskScope,
+      TaskRevealKind,
+      TaskPanelKind,
+      TaskGroup,
+      Task,
+      ShellExecution,
+      ProcessExecution,
+      ShellQuoting: { Escape: 1, Strong: 2, Weak: 3 },
+      // DAP classes (top-level vscode exports)
+      DebugAdapterExecutable: class DebugAdapterExecutable {
+        command: string;
+        args: string[];
+        constructor(command: string, args: string[] = []) {
+          this.command = command;
+          this.args = args;
+        }
+      },
+      DebugAdapterServer: class DebugAdapterServer {
+        port: number;
+        host?: string;
+        constructor(port: number, host?: string) {
+          this.port = port;
+          this.host = host;
+        }
+      },
+      // Notebook API exports
+      NotebookCellKind,
+      NotebookCellOutputItem,
+      NotebookCellOutput,
+      NotebookRange,
+      NotebookCellData,
+      NotebookData,
+      NotebookEdit,
+      NotebookControllerAffinity,
     };
   }
 }

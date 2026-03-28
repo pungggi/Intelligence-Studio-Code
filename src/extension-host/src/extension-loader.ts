@@ -80,15 +80,58 @@ export class ExtensionLoader {
           readFileSync(manifestPath, "utf-8")
         );
 
-        // Validate required fields
+        // --- Validate required fields ---
         if (!manifest.name || typeof manifest.name !== "string") {
           console.warn(
             `[ExtLoader] Skipping ${entry.name}: missing or invalid 'name'`
           );
           continue;
         }
+        if (!manifest.version || typeof manifest.version !== "string") {
+          console.warn(
+            `[ExtLoader] Skipping ${entry.name}: missing or invalid 'version'`
+          );
+          continue;
+        }
 
         const id = `${manifest.publisher ?? "unknown"}.${manifest.name}`;
+
+        // --- Validate activationEvents (must be string[] if present) ---
+        if (manifest.activationEvents !== undefined) {
+          if (!Array.isArray(manifest.activationEvents)) {
+            console.warn(`[ExtLoader] ${id}: 'activationEvents' must be an array — ignoring it`);
+            manifest.activationEvents = [];
+          } else {
+            manifest.activationEvents = manifest.activationEvents.filter((ev) => {
+              if (typeof ev === "string") return true;
+              console.warn(`[ExtLoader] ${id}: non-string activationEvent entry dropped:`, ev);
+              return false;
+            });
+          }
+        }
+
+        // --- Validate contributes.commands entries ---
+        if (manifest.contributes?.commands !== undefined) {
+          if (!Array.isArray(manifest.contributes.commands)) {
+            console.warn(`[ExtLoader] ${id}: 'contributes.commands' must be an array — ignoring it`);
+            manifest.contributes.commands = [];
+          } else {
+            manifest.contributes.commands = manifest.contributes.commands.filter((cmd) => {
+              if (
+                cmd && typeof cmd === "object" &&
+                typeof (cmd as { command?: unknown }).command === "string" &&
+                typeof (cmd as { title?: unknown }).title === "string"
+              ) {
+                return true;
+              }
+              console.warn(
+                `[ExtLoader] ${id}: dropping invalid command entry (must have string 'command' and 'title'):`,
+                cmd
+              );
+              return false;
+            }) as Array<{ command: string; title: string }>;
+          }
+        }
 
         this.extensions.set(id, {
           id,

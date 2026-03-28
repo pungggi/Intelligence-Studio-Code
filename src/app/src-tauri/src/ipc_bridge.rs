@@ -124,9 +124,26 @@ pub enum OutgoingMessage {
     /// M8b: Notify Extension Host that the user closed a webview panel.
     #[serde(rename = "webview/closedByUser")]
     WebviewClosedByUser { panel_id: String },
+    /// Notify Extension Host that a terminal was successfully created.
+    #[serde(rename = "terminal/created")]
+    TerminalCreated {
+        request_id: String,
+        terminal_id: String,
+    },
     /// IPC authentication handshake — must be the first message sent on connection.
     #[serde(rename = "ipc/auth")]
     IpcAuth { token: String },
+    /// Register a workspace window with the Extension Host.
+    #[serde(rename = "workspace/register")]
+    WorkspaceRegister {
+        workspace_id: String,
+        root_path: String,
+    },
+    /// Unregister a workspace window from the Extension Host.
+    #[serde(rename = "workspace/unregister")]
+    WorkspaceUnregister {
+        workspace_id: String,
+    },
 }
 
 
@@ -138,9 +155,13 @@ pub struct IncomingMessage {
 }
 
 /// Thread-safe helper: lock a mutex, returning a default on poison.
+///
+/// Mutex poisoning indicates a previous thread panicked while holding the lock.
+/// Logged at ERROR because the data inside may be in a partially-modified state
+/// and the root cause (the panic) should always be investigated.
 fn lock_or_default<T: Default>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
-        log::warn!("[IPC] Recovering from poisoned mutex");
+        log::error!("[IPC] Recovering from poisoned mutex — a previous thread panicked while holding this lock; state may be inconsistent");
         poisoned.into_inner()
     })
 }
@@ -211,12 +232,195 @@ pub struct WebviewPanelEvent {
     pub message: Option<serde_json::Value>,
 }
 
+/// A terminal event from the Extension Host (create, write, show, close).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalEvent {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+}
+
+const MAX_TERMINAL_EVENTS: usize = 200;
+
+fn push_terminal_event(store: &Arc<Mutex<Vec<TerminalEvent>>>, event: TerminalEvent) {
+    let mut guard = lock_or_default(store);
+    if guard.len() < MAX_TERMINAL_EVENTS {
+        guard.push(event);
+    } else {
+        log::warn!("[IPC] Terminal event queue full — dropping '{}' event", event.kind);
+    }
+}
+
+/// A single text edit within a WorkspaceEdit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceTextEdit {
+    pub start_line: usize,
+    pub start_col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+    pub new_text: String,
+}
+
+/// A batch of text edits for one file, part of a WorkspaceEdit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceFileEdit {
+    pub uri: String,
+    pub edits: Vec<WorkspaceTextEdit>,
+}
+
+/// A workspace/applyEdit request from the Extension Host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceEditRequest {
+    pub request_id: String,
+    pub changes: Vec<WorkspaceFileEdit>,
+}
+
+const MAX_WORKSPACE_EDIT_REQUESTS: usize = 32;
+
+/// A debug/startSession request from the Extension Host.
+/// The Extension Host resolves the adapter executable path and sends this to Rust.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebugStartRequest {
+    pub session_id: String,
+    pub adapter_cmd: String,
+    pub adapter_args: Vec<String>,
+    pub launch_config: serde_json::Value,
+}
+
+const MAX_DEBUG_START_REQUESTS: usize = 16;
+
+fn push_debug_start_request(store: &Arc<Mutex<Vec<DebugStartRequest>>>, req: DebugStartRequest) {
+    let mut guard = lock_or_default(store);
+    if guard.len() >= MAX_DEBUG_START_REQUESTS {
+        log::warn!("[IPC] Debug start request queue full — dropping session '{}'", req.session_id);
+        return;
+    }
+    guard.push(req);
+}
+
+/// Tree view registration/update events from the Extension Host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeViewEvent {
+    pub event_type: String, // "register" | "update" | "unregister"
+    pub view_id: String,
+}
+
+const MAX_TREE_VIEW_EVENTS: usize = 64;
+
+/// A request from an extension to open a file in the editor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShowTextDocumentRequest {
+    pub uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<ShowTextDocumentSelection>,
+    #[serde(default)]
+    pub preserve_focus: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShowTextDocumentSelection {
+    pub start_line: usize,
+    pub start_character: usize,
+    pub end_line: usize,
+    pub end_character: usize,
+}
+
+const MAX_SHOW_TEXT_DOCUMENT: usize = 32;
+
+/// A single resource state within an SCM resource group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScmResourceState {
+    pub uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoration_tooltip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoration_letter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoration_color: Option<String>,
+}
+
+/// A resource group within an SCM source control.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScmResourceGroup {
+    pub id: String,
+    pub label: String,
+    pub resources: Vec<ScmResourceState>,
+}
+
+/// The full state of one SCM source control provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScmSourceControlState {
+    pub id: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_uri: Option<String>,
+    pub resource_groups: Vec<ScmResourceGroup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_bar_command: Option<String>,
+}
+
+/// A comment author within a review thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommentAuthor {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon_url: Option<String>,
+}
+
+/// A single comment within a review thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommentThreadComment {
+    pub author: CommentAuthor,
+    pub body: String,
+    pub mode: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+}
+
+/// A comment review thread anchored to a URI + line range.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommentThread {
+    pub id: String,
+    pub controller_id: String,
+    pub uri: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub comments: Vec<CommentThreadComment>,
+    pub collapsible_state: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_value: Option<String>,
+}
+
 /// A text decoration from an extension.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextDecoration {
     pub uri: String,
     pub decoration_type: String,
     pub ranges: Vec<DecorationRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub border: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub border_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,11 +451,17 @@ pub struct IpcHandle {
     ui_requests: Arc<Mutex<Vec<UiRequest>>>,
     status_bar_items: Arc<Mutex<Vec<StatusBarItem>>>,
     output_lines: Arc<Mutex<Vec<OutputLine>>>,
-    #[allow(dead_code)] // Planned for future milestone
     decorations: Arc<Mutex<Vec<TextDecoration>>>,
     pending_requests: PendingRequests,
     request_counter: Arc<Mutex<u64>>,
     webview_events: Arc<Mutex<Vec<WebviewPanelEvent>>>,
+    terminal_events: Arc<Mutex<Vec<TerminalEvent>>>,
+    debug_start_requests: Arc<Mutex<Vec<DebugStartRequest>>>,
+    workspace_edit_requests: Arc<Mutex<Vec<WorkspaceEditRequest>>>,
+    tree_view_events: Arc<Mutex<Vec<TreeViewEvent>>>,
+    show_text_document_requests: Arc<Mutex<Vec<ShowTextDocumentRequest>>>,
+    scm_states: Arc<Mutex<HashMap<String, ScmSourceControlState>>>,
+    comment_threads: Arc<Mutex<HashMap<String, CommentThread>>>,
 }
 
 impl IpcHandle {
@@ -308,8 +518,7 @@ impl IpcHandle {
         std::mem::take(&mut *store)
     }
 
-    /// Get decorations for a specific URI (planned for future milestone).
-    #[allow(dead_code)]
+    /// Get decorations for a specific URI.
     pub fn get_decorations_for_uri(&self, uri: &str) -> Vec<TextDecoration> {
         lock_or_default(&self.decorations)
             .iter()
@@ -322,6 +531,50 @@ impl IpcHandle {
     pub fn drain_webview_events(&self) -> Vec<WebviewPanelEvent> {
         let mut store = lock_or_default(&self.webview_events);
         std::mem::take(&mut *store)
+    }
+
+    /// Drain all pending terminal events from the Extension Host.
+    pub fn drain_terminal_events(&self) -> Vec<TerminalEvent> {
+        let mut store = lock_or_default(&self.terminal_events);
+        std::mem::take(&mut *store)
+    }
+
+    /// Drain all pending debug session start requests from the Extension Host.
+    pub fn drain_debug_start_requests(&self) -> Vec<DebugStartRequest> {
+        let mut store = lock_or_default(&self.debug_start_requests);
+        std::mem::take(&mut *store)
+    }
+
+    /// Drain all pending workspace edit requests from the Extension Host.
+    pub fn drain_workspace_edit_requests(&self) -> Vec<WorkspaceEditRequest> {
+        let mut store = lock_or_default(&self.workspace_edit_requests);
+        std::mem::take(&mut *store)
+    }
+
+    /// Drain all pending tree view events from the Extension Host.
+    pub fn drain_tree_view_events(&self) -> Vec<TreeViewEvent> {
+        let mut store = lock_or_default(&self.tree_view_events);
+        std::mem::take(&mut *store)
+    }
+
+    /// Drain all pending showTextDocument requests from the Extension Host.
+    pub fn drain_show_text_document_requests(&self) -> Vec<ShowTextDocumentRequest> {
+        let mut store = lock_or_default(&self.show_text_document_requests);
+        std::mem::take(&mut *store)
+    }
+
+    /// Get current SCM source control states (keyed by id) from Extension Host.
+    pub fn get_scm_states(&self) -> HashMap<String, ScmSourceControlState> {
+        lock_or_default(&self.scm_states).clone()
+    }
+
+    /// Get all comment threads for the given URI.
+    pub fn get_comment_threads_for_uri(&self, uri: &str) -> Vec<CommentThread> {
+        lock_or_default(&self.comment_threads)
+            .values()
+            .filter(|t| t.uri == uri)
+            .cloned()
+            .collect()
     }
 
     /// M6: Generate a unique request ID.
@@ -392,6 +645,13 @@ pub fn start_ipc_bridge(port: u16, auth_token: &str) -> IpcHandle {
     let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
     let request_counter = Arc::new(Mutex::new(0u64));
     let webview_events: Arc<Mutex<Vec<WebviewPanelEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let terminal_events: Arc<Mutex<Vec<TerminalEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let debug_start_requests: Arc<Mutex<Vec<DebugStartRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let workspace_edit_requests: Arc<Mutex<Vec<WorkspaceEditRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let tree_view_events: Arc<Mutex<Vec<TreeViewEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let show_text_document_requests: Arc<Mutex<Vec<ShowTextDocumentRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let scm_states: Arc<Mutex<HashMap<String, ScmSourceControlState>>> = Arc::new(Mutex::new(HashMap::new()));
+    let comment_threads: Arc<Mutex<HashMap<String, CommentThread>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let handle = IpcHandle {
         sender: tx,
@@ -406,6 +666,13 @@ pub fn start_ipc_bridge(port: u16, auth_token: &str) -> IpcHandle {
         pending_requests: pending_requests.clone(),
         request_counter,
         webview_events: webview_events.clone(),
+        terminal_events: terminal_events.clone(),
+        debug_start_requests: debug_start_requests.clone(),
+        workspace_edit_requests: workspace_edit_requests.clone(),
+        tree_view_events: tree_view_events.clone(),
+        show_text_document_requests: show_text_document_requests.clone(),
+        scm_states: scm_states.clone(),
+        comment_threads: comment_threads.clone(),
     };
 
     let token_for_thread = auth_token.to_string();
@@ -418,7 +685,7 @@ pub fn start_ipc_bridge(port: u16, auth_token: &str) -> IpcHandle {
                 .expect("Failed to create Tokio runtime");
 
             rt.block_on(async move {
-                ipc_loop(port, &token_for_thread, rx, diagnostics, connected, commands, notifications, ui_requests, status_bar_items, output_lines, decorations, pending_requests, webview_events).await;
+                ipc_loop(port, &token_for_thread, rx, diagnostics, connected, commands, notifications, ui_requests, status_bar_items, output_lines, decorations, pending_requests, webview_events, terminal_events, debug_start_requests, workspace_edit_requests, tree_view_events, show_text_document_requests, scm_states, comment_threads).await;
             });
         })
         .expect("Failed to spawn IPC bridge thread");
@@ -440,6 +707,13 @@ async fn ipc_loop(
     decorations: Arc<Mutex<Vec<TextDecoration>>>,
     pending_requests: PendingRequests,
     webview_events: Arc<Mutex<Vec<WebviewPanelEvent>>>,
+    terminal_events: Arc<Mutex<Vec<TerminalEvent>>>,
+    debug_start_requests: Arc<Mutex<Vec<DebugStartRequest>>>,
+    workspace_edit_requests: Arc<Mutex<Vec<WorkspaceEditRequest>>>,
+    tree_view_events: Arc<Mutex<Vec<TreeViewEvent>>>,
+    show_text_document_requests: Arc<Mutex<Vec<ShowTextDocumentRequest>>>,
+    scm_states: Arc<Mutex<HashMap<String, ScmSourceControlState>>>,
+    comment_threads: Arc<Mutex<HashMap<String, CommentThread>>>,
 ) {
     let addr = format!("{}:{}", IPC_HOST, port);
     let mut retry_count: u32 = 0;
@@ -464,7 +738,7 @@ async fn ipc_loop(
                 retry_count = 0;
                 delay_ms = INITIAL_RETRY_DELAY_MS;
 
-                if let Err(e) = handle_connection(stream, auth_token, &mut rx, &diagnostics, &commands, &notifications, &ui_requests, &status_bar_items, &output_lines, &decorations, &pending_requests, &webview_events).await {
+                if let Err(e) = handle_connection(stream, auth_token, &mut rx, &diagnostics, &commands, &notifications, &ui_requests, &status_bar_items, &output_lines, &decorations, &pending_requests, &webview_events, &terminal_events, &debug_start_requests, &workspace_edit_requests, &tree_view_events, &show_text_document_requests, &scm_states, &comment_threads).await {
                     log::warn!("[IPC] Connection lost: {}", e);
                 }
 
@@ -502,6 +776,13 @@ async fn handle_connection(
     decorations: &Arc<Mutex<Vec<TextDecoration>>>,
     pending_requests: &PendingRequests,
     webview_events: &Arc<Mutex<Vec<WebviewPanelEvent>>>,
+    terminal_events: &Arc<Mutex<Vec<TerminalEvent>>>,
+    debug_start_requests: &Arc<Mutex<Vec<DebugStartRequest>>>,
+    workspace_edit_requests: &Arc<Mutex<Vec<WorkspaceEditRequest>>>,
+    tree_view_events: &Arc<Mutex<Vec<TreeViewEvent>>>,
+    show_text_document_requests: &Arc<Mutex<Vec<ShowTextDocumentRequest>>>,
+    scm_states: &Arc<Mutex<HashMap<String, ScmSourceControlState>>>,
+    comment_threads: &Arc<Mutex<HashMap<String, CommentThread>>>,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
 
@@ -526,6 +807,13 @@ async fn handle_connection(
     let dec_clone = decorations.clone();
     let pending_clone = pending_requests.clone();
     let wv_clone = webview_events.clone();
+    let te_clone = terminal_events.clone();
+    let dsr_clone = debug_start_requests.clone();
+    let wer_clone = workspace_edit_requests.clone();
+    let tve_clone = tree_view_events.clone();
+    let std_clone = show_text_document_requests.clone();
+    let scm_clone = scm_states.clone();
+    let ct_clone = comment_threads.clone();
     let mut read_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         let mut accumulated = Vec::new();
@@ -534,16 +822,17 @@ async fn handle_connection(
             match reader.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    accumulated.extend_from_slice(&buf[..n]);
-
-                    // Guard against unbounded accumulation BEFORE processing
-                    if accumulated.len() > MAX_FRAME_SIZE + 4 {
+                    // Guard against unbounded accumulation BEFORE extending the buffer.
+                    // Checking after extend would allow a slow sender to allocate up to
+                    // MAX_FRAME_SIZE + one extra read-chunk before the check fires.
+                    if accumulated.len() + n > MAX_FRAME_SIZE + 4 {
                         log::error!(
-                            "[IPC] Accumulated buffer too large ({} bytes), dropping connection",
-                            accumulated.len()
+                            "[IPC] Accumulated buffer would exceed limit ({} + {} bytes), dropping connection",
+                            accumulated.len(), n
                         );
                         return;
                     }
+                    accumulated.extend_from_slice(&buf[..n]);
 
                     // Process complete frames
                     while accumulated.len() >= 4 {
@@ -567,7 +856,7 @@ async fn handle_connection(
 
                         let payload = &accumulated[4..4 + frame_len];
                         match serde_json::from_slice::<IncomingMessage>(payload) {
-                            Ok(msg) => handle_incoming(&msg, &diag_clone, &cmd_clone, &notif_clone, &ui_clone, &sb_clone, &out_clone, &dec_clone, &pending_clone, &wv_clone),
+                            Ok(msg) => handle_incoming(&msg, &diag_clone, &cmd_clone, &notif_clone, &ui_clone, &sb_clone, &out_clone, &dec_clone, &pending_clone, &wv_clone, &te_clone, &dsr_clone, &wer_clone, &tve_clone, &std_clone, &scm_clone, &ct_clone),
                             Err(e) => log::warn!("[IPC] Malformed message: {}", e),
                         }
 
@@ -617,6 +906,13 @@ fn handle_incoming(
     decorations: &Arc<Mutex<Vec<TextDecoration>>>,
     pending_requests: &PendingRequests,
     webview_events: &Arc<Mutex<Vec<WebviewPanelEvent>>>,
+    terminal_events: &Arc<Mutex<Vec<TerminalEvent>>>,
+    debug_start_requests: &Arc<Mutex<Vec<DebugStartRequest>>>,
+    workspace_edit_requests: &Arc<Mutex<Vec<WorkspaceEditRequest>>>,
+    tree_view_events: &Arc<Mutex<Vec<TreeViewEvent>>>,
+    show_text_document_requests: &Arc<Mutex<Vec<ShowTextDocumentRequest>>>,
+    scm_states: &Arc<Mutex<HashMap<String, ScmSourceControlState>>>,
+    comment_threads: &Arc<Mutex<HashMap<String, CommentThread>>>,
 ) {
     match msg.method.as_str() {
         // M6: LSP response correlation
@@ -725,6 +1021,35 @@ fn handle_incoming(
                 }
             }
         }
+        // Terminal events from Extension Host
+        "terminal/create" => {
+            if let Some(params) = &msg.params {
+                let request_id = params.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let name = params.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let cwd = params.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let shell = params.get("shell").and_then(|v| v.as_str()).map(|s| s.to_string());
+                push_terminal_event(terminal_events, TerminalEvent { kind: "create".to_string(), request_id: Some(request_id), terminal_id: None, name, cwd, shell, data: None });
+            }
+        }
+        "terminal/write" => {
+            if let Some(params) = &msg.params {
+                let terminal_id = params.get("terminal_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let data = params.get("data").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                push_terminal_event(terminal_events, TerminalEvent { kind: "write".to_string(), request_id: None, terminal_id: Some(terminal_id), name: None, cwd: None, shell: None, data: Some(data) });
+            }
+        }
+        "terminal/show" => {
+            if let Some(params) = &msg.params {
+                let terminal_id = params.get("terminal_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                push_terminal_event(terminal_events, TerminalEvent { kind: "show".to_string(), request_id: None, terminal_id, name: None, cwd: None, shell: None, data: None });
+            }
+        }
+        "terminal/close" => {
+            if let Some(params) = &msg.params {
+                let terminal_id = params.get("terminal_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                push_terminal_event(terminal_events, TerminalEvent { kind: "close".to_string(), request_id: None, terminal_id: Some(terminal_id), name: None, cwd: None, shell: None, data: None });
+            }
+        }
         // M8b: WebView panel events from Extension Host
         "webview/create" => {
             if let Some(params) = &msg.params {
@@ -761,6 +1086,89 @@ fn handle_incoming(
             if let Some(params) = &msg.params {
                 let panel_id = params.get("panel_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 push_webview_event(webview_events, WebviewPanelEvent { kind: "close".to_string(), panel_id, title: None, view_type: None, column: None, enable_scripts: None, html: None, message: None });
+            }
+        }
+        // WorkspaceEdit: Extension Host requests applying text edits across files.
+        "workspace/applyEdit" => {
+            if let Some(params) = &msg.params {
+                let request_id = params.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let changes: Vec<WorkspaceFileEdit> = params
+                    .get("changes")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let mut store = lock_or_default(workspace_edit_requests);
+                if store.len() < MAX_WORKSPACE_EDIT_REQUESTS {
+                    store.push(WorkspaceEditRequest { request_id, changes });
+                }
+            }
+        }
+        // DAP: Extension Host resolved the adapter executable and requests a session start.
+        "debug/startSession" => {
+            if let Some(params) = &msg.params {
+                let session_id = params.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let adapter_cmd = params.get("adapter_cmd").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let adapter_args = params.get("adapter_args")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                let launch_config = params.get("launch_config").cloned().unwrap_or(serde_json::Value::Null);
+                if !session_id.is_empty() && !adapter_cmd.is_empty() {
+                    push_debug_start_request(debug_start_requests, DebugStartRequest { session_id, adapter_cmd, adapter_args, launch_config });
+                }
+            }
+        }
+        "treeView/register" | "treeView/update" | "treeView/unregister" | "treeView/reveal" => {
+            if let Some(params) = &msg.params {
+                let view_id = params.get("view_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if !view_id.is_empty() {
+                    let event_type = msg.method.trim_start_matches("treeView/").to_string();
+                    let mut guard = lock_or_default(tree_view_events);
+                    if guard.len() < MAX_TREE_VIEW_EVENTS {
+                        guard.push(TreeViewEvent { event_type, view_id });
+                    }
+                }
+            }
+        }
+        "showTextDocument" => {
+            if let Some(params) = &msg.params {
+                if let Ok(req) = serde_json::from_value::<ShowTextDocumentRequest>(params.clone()) {
+                    let mut store = lock_or_default(show_text_document_requests);
+                    if store.len() < MAX_SHOW_TEXT_DOCUMENT {
+                        store.push(req);
+                    }
+                }
+            }
+        }
+        // SCM: Extension Host pushes updated source control state.
+        "scm/update" => {
+            if let Some(params) = &msg.params {
+                if let Ok(sc) = serde_json::from_value::<ScmSourceControlState>(params.clone()) {
+                    lock_or_default(scm_states).insert(sc.id.clone(), sc);
+                }
+            }
+        }
+        "scm/remove" => {
+            if let Some(params) = &msg.params {
+                let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if !id.is_empty() {
+                    lock_or_default(scm_states).remove(id);
+                }
+            }
+        }
+        // Comments: Extension Host pushes comment thread state.
+        "comments/threadUpdate" => {
+            if let Some(params) = &msg.params {
+                if let Ok(thread) = serde_json::from_value::<CommentThread>(params.clone()) {
+                    lock_or_default(comment_threads).insert(thread.id.clone(), thread);
+                }
+            }
+        }
+        "comments/threadDelete" => {
+            if let Some(params) = &msg.params {
+                let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if !id.is_empty() {
+                    lock_or_default(comment_threads).remove(id);
+                }
             }
         }
         _ => {

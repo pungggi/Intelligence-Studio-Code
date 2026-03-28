@@ -380,11 +380,11 @@ VisibleContent { lines: Vec<HighlightedLine>, first_line, total_lines, file_path
 | **Settings editor UI** | Visual settings editor reading/writing JSON config | P2 | Done |
 | **WebView support** | `vscode.window.createWebviewPanel` — embedded HTML views for extensions | P1 | Done |
 | **Integrated terminal** | PTY-based terminal emulator panel (xterm.js or custom) | P1 | Done |
-| **Accessibility** | Screen reader support: AT-SPI (Linux), NSAccessibility (macOS), UIA (Windows) | P1 | Planned |
+| **Accessibility** | Screen reader support: hidden textarea proxy, ARIA live announcer, platform AT via WebView | P1 | In Progress |
 | **Keyboard navigation** | Full keyboard-only navigation, focus management, ARIA | P1 | Done |
 | **High-contrast themes** | Built-in high-contrast light and dark themes | P2 | Done |
-| **Top 20 extension testing** | Full compatibility matrix validation for target extensions | P0 | Planned |
-| **Multi-workspace** | Shared Extension Host serving multiple project windows (workspace-scoped routing) | P1 | Planned |
+| **Top 20 extension testing** | Compatibility matrix (52 ✅ / 5 ⚠️ / 1 ❌ across 58 extensions) — see `docs/extension-compatibility.md` | P0 | In Progress |
+| **Multi-workspace** | Shared Extension Host serving multiple project windows (workspace-scoped routing) | P1 | Done |
 
 ### M8a: Extension Ecosystem (Complete)
 
@@ -489,6 +489,81 @@ vscode.window
 vscode.ViewColumn  (Active, Beside, One, Two, Three)
 ```
 
+---
+
+## M9: Debug Adapter Protocol (DAP) — COMPLETE
+
+**Goal:** Full DAP session lifecycle — spawn adapter, receive events, render debug UI.
+
+### Deliverables
+
+| Feature | Description | Files |
+|:--------|:------------|:------|
+| **DAP session manager** | Spawn adapter process, DAP Content-Length framing, event queue | `debug.rs` |
+| **Debug sidebar** | Run & Debug panel: Call Stack, Variables, Breakpoints list | `index.html`, `style.css`, `editor.js` |
+| **Breakpoint gutter** | Click gutter to toggle breakpoints; red dots on gutter; F9 hotkey | `editor.js` |
+| **Stopped line marker** | Yellow arrow in gutter at current stopped frame | `editor.js` |
+| **Debug toolbar** | Start/Continue, Step Over, Step Into, Step Out, Restart, Stop buttons | `index.html`, `style.css`, `editor.js` |
+| **Debug Console tab** | Bottom panel tab showing adapter `output` events (stdout/stderr/info) | `index.html`, `style.css`, `editor.js` |
+| **`registerDebugAdapterDescriptorFactory`** | Extensions register factory → shim resolves adapter executable | `vscode-api-shim.ts` |
+| **`debug.startDebugging`** | Sends `debug/startSession` IPC → Rust spawns adapter, sends `initialize` + `launch`/`attach` | `vscode-api-shim.ts`, `ipc_bridge.rs`, `lib.rs` |
+| **`vscode.DebugAdapterExecutable`** | Top-level class for constructing adapter descriptors | `vscode-api-shim.ts` |
+| **`vscode.DebugAdapterServer`** | Top-level class for socket-based adapters | `vscode-api-shim.ts` |
+
+### New Tauri Commands (M9)
+
+```
+get_debug_start_requests()                      → Vec<DebugStartRequest>
+debug_start(session_id, adapter_cmd, adapter_args) → ()
+debug_send(session_id, command, args)           → u64  (request seq)
+debug_poll_events(session_id)                   → Vec<DebugEvent>
+debug_stop(session_id)                          → ()
+debug_list_sessions()                           → Vec<String>
+```
+
+### New IPC Messages (M9)
+
+```
+debug/startSession  (Extension Host → Rust)  { session_id, adapter_cmd, adapter_args, launch_config }
+```
+
+### DAP Message Flow
+
+```
+Extension calls vscode.debug.startDebugging(folder, config)
+  → Shim calls DebugAdapterDescriptorFactory.createDebugAdapterDescriptor()
+  → Gets DebugAdapterExecutable { command, args }
+  → Sends debug/startSession IPC to Rust
+
+Rust IPC bridge queues DebugStartRequest
+  → Frontend polls get_debug_start_requests every 1s
+  → Frontend calls debug_start() → debug.rs spawns adapter process
+  → Frontend calls debug_send('initialize', {...})
+  → Frontend calls debug_send('launch', launchConfig)
+
+Adapter sends DAP frames (Content-Length: N\r\n\r\n{json})
+  → debug.rs reader thread parses frames → DebugEvent queue
+  → Frontend polls debug_poll_events every 200ms
+  → 'initialized' event → sendBreakpoints + configurationDone
+  → 'stopped' event    → fetch stackTrace, render call stack, paint gutter arrow
+  → 'output' event     → append to Debug Console
+  → 'terminated' event → clean up session, reset toolbar
+```
+
+### New Keyboard Shortcuts (M9)
+
+| Shortcut | Action |
+|:---------|:-------|
+| F5 | Start Debugging / Continue |
+| Shift+F5 | Stop Debugging |
+| F9 | Toggle Breakpoint |
+| F10 | Step Over |
+| F11 | Step Into |
+| Shift+F11 | Step Out |
+| Ctrl+Shift+D | Open Run & Debug panel |
+
+---
+
 ### Multi-workspace Architecture (from M5 IPC groundwork)
 
 ```
@@ -517,3 +592,210 @@ Memory: O(extensions + N × LSP-servers) instead of O(N × extensions).
 | HTML | `.html`, `.htm` | tree-sitter-html 0.23 | M5 |
 | CSS | `.css`, `.scss` | tree-sitter-css 0.25 | M5 |
 | Markdown | `.md` | tree-sitter-md 0.5 | M5 |
+
+---
+
+## M10: Extension Compatibility Expansion — COMPLETE
+
+**Goal:** Implement four high-value extension API items for greater VS Code extension compatibility.
+
+### Deliverables
+
+| Feature | Files Changed | Notes |
+|:--------|:-------------|:------|
+| A. `workspace.applyEdit` + `WorkspaceEdit` | `vscode-api-shim.ts`, `ipc_bridge.rs`, `lib.rs`, `editor.rs`, `editor.js` | Multi-file edits; open buffers updated in-memory, others on disk |
+| B. `window.createTerminal` from extensions | — | Already fully implemented in M8/M9 (no changes needed) |
+| C. Inlay hints rendering | `vscode-api-shim.ts`, `lib.rs`, `editor.js` | Canvas overlay at character positions, debounced 600ms on cursor/scroll |
+| D. `window.createTreeView` | `vscode-api-shim.ts`, `ipc_bridge.rs`, `lib.rs`, `editor.js`, `index.html`, `style.css` | Collapsible tree panel, `onDidChangeTreeData` push, command execution |
+
+### New Tauri Commands
+
+| Command | Purpose |
+|:--------|:--------|
+| `get_workspace_edit_requests` | Poll multi-file edit requests from Extension Host |
+| `apply_workspace_edit` | Apply edits to open buffers or disk files |
+| `lsp_inlay_hints` | Request inlay hints for visible range via Extension Host providers |
+| `get_tree_view_events` | Poll register/update/unregister events from Extension Host |
+| `tree_view_get_children` | Fetch tree children (sync IPC round-trip to Extension Host) |
+
+### New IPC Messages (Extension Host → Rust)
+
+| Method | Direction | Purpose |
+|:-------|:----------|:--------|
+| `workspace/applyEdit` | Ext Host → Rust queue | Multi-file workspace edits |
+| `treeView/register` | Ext Host → Rust queue | New tree view registered |
+| `treeView/update` | Ext Host → Rust queue | Tree data changed, re-fetch |
+| `treeView/unregister` | Ext Host → Rust queue | Tree view disposed |
+
+### Code Action `applyEdit` Fix
+
+The existing `executeCodeAction` in `editor.js` was applying all edits from any URI to the active buffer. It was updated to use `apply_workspace_edit` with proper per-file URI routing, supporting both `changes` (LSP 3.x map) and `documentChanges` (newer spec) formats.
+
+---
+
+## M11: Multi-cursor + Extension API Trio — COMPLETE
+
+**Goal:** Add multi-cursor editing and three high-value extension API features.
+
+### Multi-cursor Editing
+
+Full VS Code–compatible multi-cursor support:
+
+| Shortcut | Behaviour |
+|:---------|:----------|
+| Ctrl+Alt+Up / Down | Add cursor above / below |
+| Alt+Click | Add cursor at click position |
+| Ctrl+D | Select next occurrence of word/selection |
+| Escape | Collapse to primary cursor |
+
+All edit operations (type, backspace, delete, enter, tab, paste, Ctrl+X/V) apply to all cursors simultaneously. Cursors are processed bottom-to-top to avoid offset drift. Status bar shows `[N cursors]` count.
+
+### A. `registerRenameProvider` (F2)
+
+End-to-end rename:
+1. F2 → `lsp_prepare_rename` (checks availability)
+2. Palette-style input box pre-filled with current symbol name
+3. On confirm → `lsp_rename` → `apply_workspace_edit`
+
+### B. `window.showTextDocument`
+
+Extensions can programmatically open files in the editor. Supports optional `selection` range to position the cursor. Polled at 300ms via `get_show_text_document_requests`.
+
+### C. `registerDocumentHighlightProvider`
+
+Highlights all occurrences of the symbol under the cursor:
+- Kind 1 (text): grey tint
+- Kind 2 (read): blue tint
+- Kind 3 (write): orange tint
+
+Debounced 300ms on cursor move. Cleared on file switch and multi-cursor.
+
+### New Tauri Commands
+
+| Command | Purpose |
+|:--------|:--------|
+| `lsp_rename` | Request rename edits from extension providers |
+| `lsp_prepare_rename` | Check rename availability at position |
+| `lsp_document_highlights` | Request symbol highlights at position |
+| `get_show_text_document_requests` | Poll showTextDocument requests from Extension Host |
+
+### New IPC Message (Extension Host → Rust)
+
+| Method | Direction | Purpose |
+|:-------|:----------|:--------|
+| `showTextDocument` | Ext Host → Rust queue | Open a file in the editor |
+
+---
+
+## M12: Security Hardening + Tasks + SCM + Diff Viewer — COMPLETE
+
+**Goal:** Harden IPC security, implement `vscode.tasks`, add a git-native SCM panel with diff viewer, and wire `vscode.scm` to the Rust state model.
+
+### A. Security Hardening
+
+| Fix | Description | Files |
+|:----|:------------|:------|
+| **IPC auth token** | Each connection authenticates with a shared secret before processing messages | `ipc_bridge.rs`, `ext_host.rs`, `ipc-server.ts` |
+| **Path traversal prevention** | `validate_path` and `validate_dir_path` — canonicalize + home-dir confinement for all file I/O | `lib.rs` |
+| **`apply_workspace_edit` hardening** | `validate_path` called on every URI before any file read/write (VULN-02) | `lib.rs` |
+| **Shell path traversal** | Terminal `shell` parameter rejected if it contains `..` | `lib.rs` |
+| **Debug adapter path** | Full 4-step validation: absolute path, canonicalize, is-file, home-dir | `debug.rs` |
+| **Buffer overflow fix** | Accumulated buffer check fires **before** `extend_from_slice`, not after | `ipc_bridge.rs` |
+| **`iframe` sandbox** | Removed `allow-same-origin` from webview sandbox to prevent script+origin escape | `lib.rs` |
+| **Webview event queue cap** | `MAX_WEBVIEW_EVENTS = 100` with drop-and-warn | `ipc_bridge.rs` |
+| **Extension manifest validation** | Validate `version`, `activationEvents` (string[]), `contributes.commands` entries | `extension-loader.ts` |
+| **URI encoding** | `url::Url::from_file_path()` for correct percent-encoding in `path_to_uri` | `lib.rs` |
+
+### B. `vscode.tasks` Implementation
+
+Full `vscode.tasks` API wired to the integrated terminal:
+
+| Class / Member | Behaviour |
+|:---------------|:----------|
+| `TaskScope.Global / Workspace` | Enum constants |
+| `TaskRevealKind.Always / Silent / Never` | Controls terminal show-on-start |
+| `TaskPanelKind.Shared / Dedicated / New` | Panel reuse policy |
+| `TaskGroup.Build / Test / Clean / Rebuild` | Standard task groups |
+| `ShellExecution` | `commandLine` or `command + args` form |
+| `ProcessExecution` | `process + args` |
+| `Task` | Full constructor, `definition`, `scope`, `name`, `execution` |
+| `tasks.registerTaskProvider` | Registered by `provideTasks` / `resolveTask` |
+| `tasks.fetchTasks` | Calls all registered providers |
+| `tasks.executeTask` | Resolves execution, creates terminal, runs command |
+| `tasks.onDidStartTask / onDidEndTask` | Events fired around task lifecycle |
+
+### C. `vscode.scm` + Git SCM Panel
+
+#### Rust (`ipc_bridge.rs`)
+
+Three new structs buffered via `scm_states: Arc<Mutex<HashMap<String, ScmSourceControlState>>>`:
+
+```
+ScmResourceState  { uri, decoration_tooltip?, decoration_letter?, decoration_color? }
+ScmResourceGroup  { id, label, resources: Vec<ScmResourceState> }
+ScmSourceControlState { id, label, root_uri?, resource_groups, count?, status_bar_command? }
+```
+
+New IPC messages:
+
+| Method | Direction | Purpose |
+|:-------|:----------|:--------|
+| `scm/update` | Extension Host → Rust | Upsert SCM source control state |
+| `scm/remove` | Extension Host → Rust | Remove a source control by id |
+
+#### Extension Host (`vscode-api-shim.ts`)
+
+Real `vscode.scm.createSourceControl(id, label, rootUri?)`:
+- Returns a live `SourceControl` object with `createResourceGroup(id, label)`.
+- Resource groups are `Proxy` objects — assigning `.resourceStates = [...]` immediately sends `scm/update` IPC.
+- `dispose()` sends `scm/remove`.
+
+#### Git Commands (Rust `lib.rs`)
+
+New `validate_dir_path` helper (home-dir confined, allows directories).
+
+| Command | Purpose |
+|:--------|:--------|
+| `git_status(workspace_path)` | `git status --porcelain -u` → `Vec<GitStatusEntry>` |
+| `git_diff_file(workspace_path, file_path, staged)` | `git diff HEAD --` or `--cached`; untracked falls back to new-file format |
+| `git_stage(workspace_path, file_path)` | `git add -- <file>` |
+| `git_unstage(workspace_path, file_path)` | `git restore --staged -- <file>` |
+| `git_discard(workspace_path, file_path)` | `git restore -- <file>` |
+| `git_commit(workspace_path, message)` | `git commit -m <message>` |
+| `get_scm_state()` | Returns `HashMap<String, ScmSourceControlState>` from extension-pushed state |
+
+#### SCM Sidebar Panel (Frontend)
+
+- Activity bar button `✓` (Ctrl+Shift+G, data-panel `scm`)
+- Commit textarea + Ctrl+Enter shortcut + Commit button
+- Three collapsible resource groups: **Staged Changes**, **Changes**, **Untracked Files**
+- Per-entry status letter (M/A/D/R/U) with color coding
+- Inline action buttons (Stage/Unstage/Discard) on hover
+- Extension-provided SCM state from `get_scm_state` merged below git groups
+- 5-second background polling when panel is open
+
+#### Diff Viewer (Frontend)
+
+- Full-screen overlay triggered by clicking any SCM file entry
+- Line numbers + colored lines (green added, red removed, blue hunk headers, grey file headers)
+- Header action buttons: Stage / Unstage / Discard / Close (context-sensitive visibility)
+- Escape key closes the overlay
+
+### New Tauri Commands (M12)
+
+```
+git_status(workspace_path)                      → Vec<GitStatusEntry>
+git_diff_file(workspace_path, file_path, staged) → String  (unified diff)
+git_stage(workspace_path, file_path)             → ()
+git_unstage(workspace_path, file_path)           → ()
+git_discard(workspace_path, file_path)           → ()
+git_commit(workspace_path, message)              → ()
+get_scm_state()                                  → HashMap<String, ScmSourceControlState>
+```
+
+### New Keyboard Shortcuts (M12)
+
+| Shortcut | Action |
+|:---------|:-------|
+| Ctrl+Shift+G | Open Source Control panel |
+

@@ -73,6 +73,37 @@ let cachedLines = [];      // HighlightedLine[] for cached range
 let cachedFirstLine = 0;   // first line index in cache
 let cachedLanguage = null;
 
+// Extension decoration state { uri, decoration_type, ranges[], background_color, color, border, border_color, after_text }
+let activeDecorations = [];
+
+// Comment thread state — threads for the currently open file.
+let commentThreads = [];
+
+// Ghost-text (inline completion) state
+let ghostText = null;        // string | null — text to render after cursor
+let ghostTextTimer = null;   // debounce timer handle
+const GHOST_TEXT_COLOR = 'rgba(205,214,244,0.35)';  // dimmed Catppuccin fg
+
+// Inlay hints state
+let inlayHints = new Map();  // lineIdx -> Array<{character, label, kind}>
+let inlayHintsUri = null;
+let inlayHintsTimer = null;
+const INLAY_HINT_COLOR = 'rgba(166,173,200,0.55)';  // dimmed, semi-transparent
+
+// Document highlights state (registerDocumentHighlightProvider)
+let documentHighlights = [];  // Array<{start_line, start_col, end_line, end_col, kind}>
+let documentHighlightsUri = null;
+let documentHighlightsTimer = null;
+const DOC_HIGHLIGHT_READ_BG  = 'rgba(137,220,235,0.15)';  // blue tint (kind=2 read)
+const DOC_HIGHLIGHT_WRITE_BG = 'rgba(250,179,135,0.18)';  // orange tint (kind=3 write)
+const DOC_HIGHLIGHT_TEXT_BG  = 'rgba(166,173,200,0.12)';  // grey tint (kind=1 text)
+
+function filePathToUri(p) {
+  if (!p) return '';
+  if (p.match(/^[a-zA-Z]:\\/)) return 'file:///' + p.replace(/\\/g, '/');
+  return 'file://' + p;
+}
+
 // Rendering state
 let cellWidth = 0;     // monospace character width (px)
 let lineHeight = 0;    // line height (px)
@@ -117,6 +148,13 @@ let paletteFiltered = [];
 let selAnchorLine = null;
 let selAnchorCol = null;
 let isDragging = false;
+
+// Multi-cursor state
+let extraCursors = []; // Array<{ line, col, anchorLine, anchorCol }>
+// Ctrl+D state
+let ctrlDWord = null;
+let ctrlDLastLine = -1;
+let ctrlDLastCol = -1;
 
 // Find / Replace
 let findOpen = false;
@@ -318,11 +356,17 @@ function paintEditorCanvas() {
   const scrollTop = editorEl.scrollTop;
   const subPixelOffset = -(scrollTop % lineHeight);
 
+  // Draw extension decorations (backgrounds behind everything)
+  paintDecorations(ctx, first, subPixelOffset);
+
   // Draw selection
   paintSelection(ctx, first, subPixelOffset);
 
   // Draw find highlights
   paintFindHighlights(ctx, first, subPixelOffset);
+
+  // Draw document highlights (symbol occurrences under cursor)
+  paintDocumentHighlights(ctx, first, subPixelOffset);
 
   // Build diagnostic lookup map (O(1) per line instead of O(n))
   const diagMap = new Map();
@@ -364,10 +408,30 @@ function paintEditorCanvas() {
         );
       }
     }
+
+    // Draw inlay hints (overlaid at character position)
+    const lineHints = inlayHints.get(lineIdx);
+    if (lineHints && lineHints.length > 0) {
+      ctx.fillStyle = INLAY_HINT_COLOR;
+      const hintFontSize = Math.max(10, fontSize - 2);
+      // cachedFont = "14px fontFamily" — strip the size prefix to get just the family
+      const fontFamily = cachedFont.replace(/^\d+(\.\d+)?px\s*/, '') || 'monospace';
+      ctx.font = `italic ${hintFontSize}px ${fontFamily}`;
+      for (const hint of lineHints) {
+        const hx = EDITOR_PADDING_LEFT + hint.character * cellWidth;
+        const hy = y + (lineHeight - hintFontSize) / 2;
+        const pad = hint.paddingLeft ? ' ' : '';
+        const padR = hint.paddingRight ? ' ' : '';
+        ctx.fillText(`${pad}${hint.label}${padR}:`, hx, hy);
+      }
+      // Restore main font
+      ctx.font = cachedFont;
+    }
   }
 
   // Draw cursor
   paintCursor(ctx, first, subPixelOffset);
+  paintExtraCursors(ctx, first, subPixelOffset);
 }
 
 function drawTokenizedLine(ctx, text, tokens, x, y) {
@@ -418,6 +482,61 @@ function paintSelection(ctx, firstVisibleLine, subPixelOffset) {
   }
 }
 
+function paintDecorations(ctx, firstVisibleLine, subPixelOffset) {
+  if (!activeDecorations || activeDecorations.length === 0) return;
+  const currentUri = filePath ? filePathToUri(filePath) : null;
+  const visibleCount = Math.ceil(editorCanvas.height / (window.devicePixelRatio || 1) / lineHeight) + 2;
+
+  for (const dec of activeDecorations) {
+    if (dec.uri !== currentUri) continue;
+    const bgColor = dec.background_color;
+    const fgColor = dec.color;
+    const borderColor = dec.border_color;
+    const afterText = dec.after_text;
+
+    for (const r of dec.ranges) {
+      for (let lineIdx = r.start_line; lineIdx <= r.end_line; lineIdx++) {
+        const vi = lineIdx - firstVisibleLine;
+        if (vi < -1 || vi >= visibleCount) continue;
+        const y = vi * lineHeight + subPixelOffset;
+
+        const colStart = (lineIdx === r.start_line) ? r.start_col : 0;
+        const colEnd   = (lineIdx === r.end_line)   ? r.end_col   : 999;
+
+        if (bgColor) {
+          ctx.fillStyle = bgColor;
+          if (colStart === 0 && colEnd === 999) {
+            // Full-line decoration
+            ctx.fillRect(EDITOR_PADDING_LEFT, y, editorCanvas.width / (window.devicePixelRatio || 1) - EDITOR_PADDING_LEFT, lineHeight);
+          } else {
+            ctx.fillRect(
+              EDITOR_PADDING_LEFT + colStart * cellWidth,
+              y,
+              Math.max((colEnd - colStart) * cellWidth, cellWidth),
+              lineHeight
+            );
+          }
+        }
+
+        if (borderColor) {
+          ctx.strokeStyle = borderColor;
+          ctx.lineWidth = 1;
+          const bx = EDITOR_PADDING_LEFT + colStart * cellWidth;
+          const bw = colEnd === 999
+            ? (editorCanvas.width / (window.devicePixelRatio || 1) - bx)
+            : Math.max((colEnd - colStart) * cellWidth, cellWidth);
+          ctx.strokeRect(bx + 0.5, y + 0.5, bw - 1, lineHeight - 1);
+        }
+
+        if (afterText && lineIdx === r.end_line) {
+          ctx.fillStyle = fgColor ?? 'rgba(150,150,150,0.7)';
+          ctx.fillText(afterText, EDITOR_PADDING_LEFT + colEnd * cellWidth + 4, y + (lineHeight - (window.__cachedFontSize ?? lineHeight * 0.65)) / 2);
+        }
+      }
+    }
+  }
+}
+
 function paintFindHighlights(ctx, firstVisibleLine, subPixelOffset) {
   if (!findOpen || findMatches.length === 0) return;
 
@@ -446,6 +565,28 @@ function paintFindHighlights(ctx, firstVisibleLine, subPixelOffset) {
   }
 }
 
+function paintDocumentHighlights(ctx, firstVisibleLine, subPixelOffset) {
+  if (!documentHighlights.length) return;
+  const visH = editorCanvas.height / (window.devicePixelRatio || 1);
+  const visibleCount = Math.ceil(visH / lineHeight) + 2;
+  for (const h of documentHighlights) {
+    for (let li = h.start_line; li <= h.end_line; li++) {
+      const vi = li - firstVisibleLine;
+      if (vi < 0 || vi >= visibleCount) continue;
+      const y = vi * lineHeight + subPixelOffset;
+      const colStart = (li === h.start_line) ? h.start_col : 0;
+      const lineText = getLineText(li);
+      const colEnd   = (li === h.end_line) ? h.end_col : lineText.length;
+      const x = EDITOR_PADDING_LEFT + colStart * cellWidth;
+      const w = Math.max(1, (colEnd - colStart)) * cellWidth;
+      ctx.fillStyle = h.kind === 3 ? DOC_HIGHLIGHT_WRITE_BG
+                    : h.kind === 2 ? DOC_HIGHLIGHT_READ_BG
+                    : DOC_HIGHLIGHT_TEXT_BG;
+      ctx.fillRect(x, y, w, lineHeight);
+    }
+  }
+}
+
 function paintCursor(ctx, firstVisibleLine, subPixelOffset) {
   if (!cursorVisible) return;
   const vi = cursorLine - firstVisibleLine;
@@ -455,8 +596,57 @@ function paintCursor(ctx, firstVisibleLine, subPixelOffset) {
   const y = vi * lineHeight + subPixelOffset;
   const x = EDITOR_PADDING_LEFT + cursorCol * cellWidth;
 
+  // Draw ghost text before cursor bar so bar renders on top
+  if (ghostText) {
+    const fontSize = cachedFontSize;
+    const textY = y + (lineHeight - fontSize) / 2;
+    ctx.fillStyle = GHOST_TEXT_COLOR;
+    ctx.fillText(ghostText, x + 2, textY);
+  }
+
   ctx.fillStyle = CURSOR_COLOR;
   ctx.fillRect(x, y, 2, lineHeight);
+}
+
+/**
+ * Paint selections and carets for all extra cursors.
+ * Called from paintEditorCanvas after the primary cursor is painted.
+ */
+function paintExtraCursors(ctx, firstVisibleLine, subPixelOffset) {
+  if (!isMultiCursor()) return;
+  const visH = editorCanvas.height / (window.devicePixelRatio || 1);
+  const visibleCount = Math.ceil(visH / lineHeight) + 2;
+
+  // Paint extra selections first (so carets render on top)
+  ctx.fillStyle = SELECTION_BG;
+  for (const c of extraCursors) {
+    if (!cursorHasSelection(c)) continue;
+    const sel = normalizeCursorSel(c);
+    for (let vi = 0; vi < visibleCount; vi++) {
+      const lineIdx = firstVisibleLine + vi;
+      if (lineIdx < sel.startLine || lineIdx > sel.endLine) continue;
+      if (lineIdx >= totalLines) break;
+      const lineText = getLineText(lineIdx);
+      const lineLen = lineText.length;
+      const colStart = lineIdx === sel.startLine ? sel.startCol : 0;
+      let colEnd = lineIdx === sel.endLine ? sel.endCol : lineLen;
+      if (lineIdx !== sel.endLine) colEnd = Math.max(colEnd, lineLen) + 1;
+      if (colStart >= colEnd) continue;
+      const y = vi * lineHeight + subPixelOffset;
+      ctx.fillRect(EDITOR_PADDING_LEFT + colStart * cellWidth, y,
+        Math.max((colEnd - colStart) * cellWidth, cellWidth * 0.5), lineHeight);
+    }
+  }
+
+  // Paint extra carets
+  for (const c of extraCursors) {
+    if (!cursorVisible) continue;
+    const vi = c.line - firstVisibleLine;
+    if (vi < 0 || vi * lineHeight + subPixelOffset > visH) continue;
+    const y = vi * lineHeight + subPixelOffset;
+    ctx.fillStyle = CURSOR_COLOR;
+    ctx.fillRect(EDITOR_PADDING_LEFT + c.col * cellWidth, y, 2, lineHeight);
+  }
 }
 
 function drawWavyUnderline(ctx, x, y, width, color) {
@@ -504,6 +694,12 @@ function paintGutterCanvas() {
   const visibleCount = Math.ceil(h / lineHeight) + 2;
   const gutterTextX = w - GUTTER_PADDING_RIGHT;
 
+  // Build comment thread line map for O(1) lookup
+  const commentLineMap = new Map();
+  for (const t of commentThreads) {
+    if (!commentLineMap.has(t.start_line)) commentLineMap.set(t.start_line, t);
+  }
+
   for (let vi = 0; vi < visibleCount; vi++) {
     const lineIdx = first + vi;
     if (lineIdx >= totalLines) break;
@@ -520,6 +716,35 @@ function paintGutterCanvas() {
     }
 
     ctx.fillText(String(lineIdx + 1), gutterTextX, textY);
+
+    // Breakpoint marker (red dot) — drawn on the left side of the gutter
+    const bpSet = filePath ? breakpoints.get(filePath) : null;
+    if (bpSet && bpSet.has(lineIdx)) {
+      ctx.fillStyle = '#f38ba8';
+      ctx.beginPath();
+      const r = Math.min(5, lineHeight / 2 - 2);
+      ctx.arc(r + 2, y + lineHeight / 2, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Current stopped frame indicator (yellow arrow)
+    if (debugStopped && debugCallStack.length > 0) {
+      const top = debugCallStack[0];
+      if (top && filePath && top.source?.path === filePath && (top.line - 1) === lineIdx) {
+        ctx.fillStyle = '#f9e2af';
+        ctx.font = `${cachedFontSize}px ${cachedFont.split('px ').slice(1).join('px ')}`;
+        ctx.textAlign = 'left';
+        ctx.fillText('▶', 2, textY);
+        ctx.textAlign = 'right';
+        ctx.font = cachedFont;
+      }
+    }
+
+    // Comment thread indicator — blue bar on right edge of gutter
+    if (commentLineMap.has(lineIdx)) {
+      ctx.fillStyle = '#89b4fa';
+      ctx.fillRect(w - 2, y, 2, lineHeight);
+    }
   }
 }
 
@@ -568,6 +793,15 @@ async function updateFromEditorContent(content) {
   totalLines = content.line_count;
   diagnostics = content.diagnostics || [];
   cachedLanguage = content.language;
+  // Reset inlay hints, document highlights, multi-cursor, and comment threads when file changes
+  inlayHints = new Map();
+  inlayHintsUri = null;
+  documentHighlights = [];
+  documentHighlightsUri = null;
+  extraCursors = [];
+  ctrlDWord = null;
+  commentThreads = [];
+  closeCommentPopup();
 
   // Populate cache from full content (for the visible range)
   cachedLines = content.lines || [];
@@ -642,12 +876,88 @@ function ensureCursorVisible() {
 
 function updateStatusBar() {
   let pos = `Ln ${cursorLine + 1}, Col ${cursorCol + 1}`;
-  if (hasSelection()) {
+  if (isMultiCursor()) {
+    pos += ` [${extraCursors.length + 1} cursors]`;
+  } else if (hasSelection()) {
     const sel = getSelectionRange();
     const selLines = sel.endLine - sel.startLine + 1;
     pos += ` (${selLines} line${selLines > 1 ? 's' : ''} selected)`;
   }
   cursorPosEl.textContent = pos;
+  a11yAnnounceCursor();
+  scheduleGhostText();
+  scheduleInlayHints();
+  scheduleDocumentHighlights();
+}
+
+function scheduleGhostText() {
+  if (ghostTextTimer) clearTimeout(ghostTextTimer);
+  ghostText = null;
+  ghostTextTimer = setTimeout(async () => {
+    if (!filePath) return;
+    try {
+      const uri = filePathToUri(filePath);
+      const result = await invoke('lsp_inline_completion', { uri, line: cursorLine, character: cursorCol });
+      const items = result?.items ?? [];
+      if (items.length > 0) {
+        const candidate = items[0].insertText ?? '';
+        // Only show the portion after the current cursor position on this line
+        const lineText = getLineText(cursorLine);
+        const cursorRest = lineText.slice(cursorCol);
+        ghostText = candidate.startsWith(cursorRest) ? candidate.slice(cursorRest.length) : candidate;
+        requestRender();
+      }
+    } catch { /* no inline completion provider */ }
+  }, 300);
+}
+
+function scheduleInlayHints() {
+  if (inlayHintsTimer) clearTimeout(inlayHintsTimer);
+  inlayHintsTimer = setTimeout(async () => {
+    if (!filePath) return;
+    const uri = filePathToUri(filePath);
+    const dpr = window.devicePixelRatio || 1;
+    const visH = editorCanvas.height / dpr;
+    const firstLine = Math.max(0, Math.floor(editorEl.scrollTop / lineHeight));
+    const endLine = Math.min(totalLines - 1, firstLine + Math.ceil(visH / lineHeight) + 5);
+    if (uri === inlayHintsUri && inlayHints.size > 0) {
+      // Already have hints for this file, only re-fetch if we scrolled far
+      const firstCached = Math.min(...inlayHints.keys());
+      const lastCached = Math.max(...inlayHints.keys());
+      if (firstLine >= firstCached && endLine <= lastCached + 5) return;
+    }
+    try {
+      const result = await invoke('lsp_inlay_hints', { uri, startLine: firstLine, endLine });
+      if (!Array.isArray(result) || result.length === 0) { inlayHints = new Map(); requestRender(); return; }
+      const newHints = new Map();
+      for (const h of result) {
+        const ln = h.line;
+        if (!newHints.has(ln)) newHints.set(ln, []);
+        newHints.get(ln).push({ character: h.character, label: h.label, kind: h.kind ?? 1, paddingLeft: h.paddingLeft ?? false, paddingRight: h.paddingRight ?? false });
+      }
+      inlayHints = newHints;
+      inlayHintsUri = uri;
+      requestRender();
+    } catch { /* no inlay hints provider */ }
+  }, 600);
+}
+
+function scheduleDocumentHighlights() {
+  if (documentHighlightsTimer) clearTimeout(documentHighlightsTimer);
+  documentHighlightsTimer = setTimeout(async () => {
+    if (!filePath || isMultiCursor()) return;
+    const uri = filePathToUri(filePath);
+    try {
+      const result = await invoke('lsp_document_highlights', { uri, line: cursorLine, character: cursorCol });
+      if (!Array.isArray(result) || result.length === 0) {
+        if (documentHighlights.length > 0) { documentHighlights = []; requestRender(); }
+        return;
+      }
+      documentHighlights = result;
+      documentHighlightsUri = uri;
+      requestRender();
+    } catch { /* no provider */ }
+  }, 300);
 }
 
 // ─── Buffer State Management ─────────────────────────────────
@@ -826,6 +1136,282 @@ function ensureAnchor() {
   }
 }
 
+// ─── Multi-Cursor Helpers ─────────────────────────────────────
+
+function isMultiCursor() { return extraCursors.length > 0; }
+
+/** Return all cursors (primary first). */
+function getAllCursors() {
+  return [
+    { line: cursorLine, col: cursorCol, anchorLine: selAnchorLine, anchorCol: selAnchorCol },
+    ...extraCursors,
+  ];
+}
+
+/** Write primary cursor from object. */
+function setPrimaryCursor(c) {
+  cursorLine = c.line;
+  cursorCol = c.col;
+  selAnchorLine = c.anchorLine ?? null;
+  selAnchorCol = c.anchorCol ?? null;
+}
+
+/** Deduplicate a cursor array by (line, col). */
+function deduplicateCursors(cursors) {
+  const seen = new Set();
+  return cursors.filter(c => {
+    const key = `${c.line}:${c.col}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/** Add cursor at position if not already there. */
+function addCursorAt(line, col) {
+  if (line === cursorLine && col === cursorCol) return;
+  if (extraCursors.some(c => c.line === line && c.col === col)) return;
+  extraCursors.push({ line, col, anchorLine: null, anchorCol: null });
+  resetCursorBlink();
+  requestRender();
+  updateStatusBar();
+}
+
+/** Collapse all extra cursors — back to single-cursor mode. */
+function clearExtraCursors() {
+  extraCursors = [];
+  ctrlDWord = null;
+  ctrlDLastLine = -1;
+  ctrlDLastCol = -1;
+}
+
+/** Normalize a cursor's selection to {startLine, startCol, endLine, endCol}. */
+function normalizeCursorSel(cursor) {
+  const { line, col, anchorLine, anchorCol } = cursor;
+  if (anchorLine === null) return null;
+  if (anchorLine < line || (anchorLine === line && anchorCol <= col))
+    return { startLine: anchorLine, startCol: anchorCol, endLine: line, endCol: col };
+  return { startLine: line, startCol: col, endLine: anchorLine, endCol: anchorCol };
+}
+
+/** True if the cursor has a non-empty selection. */
+function cursorHasSelection(cursor) {
+  return cursor.anchorLine !== null && cursor.anchorCol !== null &&
+    (cursor.anchorLine !== cursor.line || cursor.anchorCol !== cursor.col);
+}
+
+/**
+ * Compute the cursor position after inserting `text` at (startLine, startCol).
+ * Used by paste and block-insert edit descriptors.
+ */
+function insertEndPos(startLine, startCol, text) {
+  const lines = text.split('\n');
+  if (lines.length === 1) return { line: startLine, col: startCol + text.length };
+  return { line: startLine + lines.length - 1, col: lines[lines.length - 1].length };
+}
+
+// ─── Edit Descriptor Functions ───────────────────────────────
+// Each takes a cursor snapshot and returns { sl, sc, el, ec, text, newLine, newCol }
+// or null (no-op). Used by multiCursorEdit().
+
+function typeCharDesc(cursor, ch) {
+  if (cursorHasSelection(cursor)) {
+    const s = normalizeCursorSel(cursor);
+    return { sl: s.startLine, sc: s.startCol, el: s.endLine, ec: s.endCol,
+             text: ch, newLine: s.startLine, newCol: s.startCol + 1 };
+  }
+  return { sl: cursor.line, sc: cursor.col, el: cursor.line, ec: cursor.col,
+           text: ch, newLine: cursor.line, newCol: cursor.col + 1 };
+}
+
+function backspaceDesc(cursor) {
+  if (cursorHasSelection(cursor)) {
+    const s = normalizeCursorSel(cursor);
+    return { sl: s.startLine, sc: s.startCol, el: s.endLine, ec: s.endCol,
+             text: '', newLine: s.startLine, newCol: s.startCol };
+  }
+  if (cursor.line === 0 && cursor.col === 0) return null;
+  if (cursor.col > 0)
+    return { sl: cursor.line, sc: cursor.col - 1, el: cursor.line, ec: cursor.col,
+             text: '', newLine: cursor.line, newCol: cursor.col - 1 };
+  const prevLen = getLineText(cursor.line - 1).length;
+  return { sl: cursor.line - 1, sc: prevLen, el: cursor.line, ec: 0,
+           text: '', newLine: cursor.line - 1, newCol: prevLen };
+}
+
+function deleteDesc(cursor) {
+  if (cursorHasSelection(cursor)) {
+    const s = normalizeCursorSel(cursor);
+    return { sl: s.startLine, sc: s.startCol, el: s.endLine, ec: s.endCol,
+             text: '', newLine: s.startLine, newCol: s.startCol };
+  }
+  const lineLen = getLineText(cursor.line).length;
+  if (cursor.col >= lineLen) {
+    if (cursor.line >= totalLines - 1) return null;
+    return { sl: cursor.line, sc: cursor.col, el: cursor.line + 1, ec: 0,
+             text: '', newLine: cursor.line, newCol: cursor.col };
+  }
+  return { sl: cursor.line, sc: cursor.col, el: cursor.line, ec: cursor.col + 1,
+           text: '', newLine: cursor.line, newCol: cursor.col };
+}
+
+function enterDesc(cursor) {
+  if (cursorHasSelection(cursor)) {
+    const s = normalizeCursorSel(cursor);
+    return { sl: s.startLine, sc: s.startCol, el: s.endLine, ec: s.endCol,
+             text: '\n', newLine: s.startLine + 1, newCol: 0 };
+  }
+  return { sl: cursor.line, sc: cursor.col, el: cursor.line, ec: cursor.col,
+           text: '\n', newLine: cursor.line + 1, newCol: 0 };
+}
+
+function tabDesc(cursor) {
+  const spaces = '    ';
+  if (cursorHasSelection(cursor)) {
+    const s = normalizeCursorSel(cursor);
+    return { sl: s.startLine, sc: s.startCol, el: s.endLine, ec: s.endCol,
+             text: spaces, newLine: s.startLine, newCol: s.startCol + 4 };
+  }
+  return { sl: cursor.line, sc: cursor.col, el: cursor.line, ec: cursor.col,
+           text: spaces, newLine: cursor.line, newCol: cursor.col + 4 };
+}
+
+function pasteDesc(cursor, clipText) {
+  if (cursorHasSelection(cursor)) {
+    const s = normalizeCursorSel(cursor);
+    const end = insertEndPos(s.startLine, s.startCol, clipText);
+    return { sl: s.startLine, sc: s.startCol, el: s.endLine, ec: s.endCol,
+             text: clipText, newLine: end.line, newCol: end.col };
+  }
+  const end = insertEndPos(cursor.line, cursor.col, clipText);
+  return { sl: cursor.line, sc: cursor.col, el: cursor.line, ec: cursor.col,
+           text: clipText, newLine: end.line, newCol: end.col };
+}
+
+// ─── Core Multi-Cursor Edit Executor ─────────────────────────
+/**
+ * Apply editFn to every cursor (primary + extras) bottom-to-top.
+ * editFn(cursor) → { sl, sc, el, ec, text, newLine, newCol } | null
+ * After all edits, adjusts newLine for net line-count changes, then
+ * updates cursor positions and calls updateFromEditResult once.
+ */
+function multiCursorEdit(editFn) {
+  ghostText = null;
+  queueEdit(async () => {
+    const allC = getAllCursors();
+    const n = allC.length;
+
+    // Sort bottom-to-top (highest line first), right-to-left within same line
+    const order = allC.map((_, i) => i);
+    order.sort((a, b) => allC[b].line !== allC[a].line
+      ? allC[b].line - allC[a].line
+      : allC[b].col - allC[a].col);
+
+    // Compute edit descriptors (sync, uses only pre-edit cursor positions)
+    const descs = allC.map(c => editFn(c));
+
+    // Apply edits bottom-to-top, record results and line deltas
+    const lineDelta = new Array(n).fill(0);
+    let lastResult = null;
+
+    for (const idx of order) {
+      const d = descs[idx];
+      if (!d) continue;
+      const result = await invoke('edit_replace_range', {
+        startLine: d.sl, startCol: d.sc,
+        endLine: d.el, endCol: d.ec,
+        text: d.text,
+      });
+      lastResult = result;
+      lineDelta[idx] = (d.text.split('\n').length - 1) - (d.el - d.sl);
+    }
+
+    // Adjust each cursor's newLine for line-count changes from edits at lower lines
+    const finalCursors = allC.map((_, i) => {
+      const d = descs[i];
+      const base = d ? { line: d.newLine, col: d.newCol } : { line: allC[i].line, col: allC[i].col };
+      let adj = 0;
+      for (let j = 0; j < n; j++) {
+        if (j === i || !descs[j]) continue;
+        if (descs[j].sl > (d ? d.sl : allC[i].line)) adj += lineDelta[j];
+      }
+      return { line: base.line + adj, col: base.col, anchorLine: null, anchorCol: null };
+    });
+
+    // Deduplicate and write back
+    const deduped = deduplicateCursors(finalCursors);
+    setPrimaryCursor(deduped[0]);
+    extraCursors = deduped.slice(1);
+
+    if (lastResult) await updateFromEditResult(lastResult);
+  });
+}
+
+// ─── Word boundary helper for Ctrl+D ─────────────────────────
+function getWordAt(lineText, col) {
+  const isWord = c => /\w/.test(c);
+  if (!isWord(lineText[col] ?? '')) return null;
+  let start = col, end = col;
+  while (start > 0 && isWord(lineText[start - 1])) start--;
+  while (end < lineText.length && isWord(lineText[end])) end++;
+  return { word: lineText.slice(start, end), start, end };
+}
+
+async function selectNextOccurrence() {
+  if (!ctrlDWord) {
+    // First press: select word under cursor (or use existing selection)
+    if (hasSelection()) {
+      const sel = getSelectionRange();
+      if (sel.startLine !== sel.endLine) return;
+      ctrlDWord = getLineText(sel.startLine).slice(sel.startCol, sel.endCol);
+      ctrlDLastLine = sel.startLine;
+      ctrlDLastCol = sel.startCol;
+      // Fall through to find next occurrence
+    } else {
+      const info = getWordAt(getLineText(cursorLine), cursorCol);
+      if (!info) return;
+      ctrlDWord = info.word;
+      ctrlDLastLine = cursorLine;
+      ctrlDLastCol = info.start;
+      selAnchorLine = cursorLine;
+      selAnchorCol = info.start;
+      cursorCol = info.end;
+      requestRender();
+      updateStatusBar();
+      return; // First press just selects
+    }
+  }
+
+  // Find next occurrence after (ctrlDLastLine, ctrlDLastCol)
+  let matches;
+  try { matches = await invoke('find_in_file', { query: ctrlDWord, caseSensitive: true }); }
+  catch { return; }
+  if (!matches || matches.length === 0) return;
+
+  // Filter to exact-length matches (avoid substring matches)
+  const exact = matches.filter(m => m.length === ctrlDWord.length);
+  if (exact.length === 0) return;
+
+  let next = exact.find(m => m.line > ctrlDLastLine ||
+    (m.line === ctrlDLastLine && m.col > ctrlDLastCol));
+  if (!next) next = exact[0]; // wrap around
+  if (next.line === ctrlDLastLine && next.col === ctrlDLastCol) return; // only one match
+
+  ctrlDLastLine = next.line;
+  ctrlDLastCol = next.col;
+
+  // Demote current primary to extras, promote new match to primary
+  extraCursors.push({ line: cursorLine, col: cursorCol, anchorLine: selAnchorLine, anchorCol: selAnchorCol });
+  cursorLine = next.line;
+  cursorCol = next.col + next.length;
+  selAnchorLine = next.line;
+  selAnchorCol = next.col;
+
+  ensureCursorVisible();
+  requestRender();
+  updateStatusBar();
+}
+
 // ─── Mouse Helpers (O(1) arithmetic) ─────────────────────────
 
 function posFromMouse(e) {
@@ -909,6 +1495,7 @@ function renderMinimap() {
 let scrollFetchPending = false;
 
 editorEl.addEventListener('scroll', () => {
+  scheduleInlayHints();
   // Immediate repaint from cache
   requestRender();
 
@@ -959,6 +1546,8 @@ async function openFolderDialog() {
       expandedDirs.clear();
       expandedDirs.add(result);
       await renderFileTree();
+      // Notify Tauri and Extension Host of the new workspace root
+      try { await invoke('register_workspace', { rootPath: result }); } catch { /* non-critical */ }
     }
   } catch (err) {
     console.error('Open folder error:', err);
@@ -1100,6 +1689,7 @@ function filterPalette(query) {
   const builtins = [
     { label: 'Open File', command: '__builtin:open' },
     { label: 'Open Folder', command: '__builtin:openFolder' },
+    { label: 'New Window', command: '__builtin:newWindow' },
     { label: 'Save File', command: '__builtin:save' },
     { label: 'Toggle Sidebar', command: '__builtin:toggleSidebar' },
     { label: 'Close Tab', command: '__builtin:closeTab' },
@@ -1152,6 +1742,8 @@ async function executePaletteCommand(command) {
   } else if (command === '__builtin:openFolder') {
     if (!sidebarOpen) toggleSidebar();
     else await openFolderDialog();
+  } else if (command === '__builtin:newWindow') {
+    try { await invoke('new_window'); } catch (err) { showToast('error', `Failed to open window: ${err}`); }
   } else if (command === '__builtin:save') {
     await saveFile();
   } else if (command === '__builtin:toggleSidebar') {
@@ -1216,6 +1808,11 @@ function updatePaletteSelection() {
 
 document.addEventListener('keydown', (e) => {
   resetCursorBlink();
+
+  // Reset Ctrl+D chain on any key except Ctrl+D itself
+  if (!(e.ctrlKey && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'd')) {
+    ctrlDWord = null; ctrlDLastLine = -1; ctrlDLastCol = -1;
+  }
 
   if (e.ctrlKey && e.shiftKey && e.key === 'P') {
     e.preventDefault();
@@ -1311,12 +1908,32 @@ document.addEventListener('keydown', (e) => {
   if (e.ctrlKey && e.key.toLowerCase() === 'h') { e.preventDefault(); openFindBar(true); return; }
   if (e.ctrlKey && e.key === '`') { e.preventDefault(); toggleBottomPanel(); return; }
   if (e.key === 'Escape') {
+    if (isMultiCursor()) { e.preventDefault(); clearExtraCursors(); clearSelection(); requestRender(); updateStatusBar(); return; }
+    if (ghostText) { ghostText = null; requestRender(); return; }
     if (findOpen) { closeFindBar(); return; }
     if (bottomPanelOpen) { closeBottomPanel(); return; }
   }
 
   // Only handle editor keys when editor is focused
   if (document.activeElement !== editorEl) return;
+
+  // ─── Multi-cursor shortcuts ───────────────────────────────
+  // Ctrl+D — select next occurrence
+  if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'd') {
+    e.preventDefault();
+    selectNextOccurrence();
+    return;
+  }
+  // Ctrl+Alt+Up/Down — add cursor above/below
+  if (e.ctrlKey && e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+    e.preventDefault();
+    const dir = e.key === 'ArrowUp' ? -1 : 1;
+    const targetLine = Math.max(0, Math.min(totalLines - 1, cursorLine + dir));
+    if (targetLine !== cursorLine) {
+      addCursorAt(targetLine, Math.min(cursorCol, getLineText(targetLine).length));
+    }
+    return;
+  }
 
   // Undo / Redo
   if (e.ctrlKey && ((e.shiftKey && e.key.toLowerCase() === 'z') || (!e.shiftKey && e.key.toLowerCase() === 'y'))) {
@@ -1392,6 +2009,42 @@ document.addEventListener('keydown', (e) => {
 
   if (e.ctrlKey && e.key.toLowerCase() === 'v') {
     e.preventDefault();
+    if (isMultiCursor()) {
+      queueEdit(async () => {
+        try {
+          const clipText = await navigator.clipboard.readText();
+          if (!clipText) return;
+          if (clipText.length > 1024 * 1024) {
+            statusEl.textContent = `Paste too large (${(clipText.length / 1024 / 1024).toFixed(1)} MB, max 1 MB)`;
+            return;
+          }
+          const allC = getAllCursors();
+          const order = allC.map((_,i)=>i).sort((a,b)=>allC[b].line!==allC[a].line?allC[b].line-allC[a].line:allC[b].col-allC[a].col);
+          const descs = allC.map(c => pasteDesc(c, clipText));
+          const pastedLineCount = clipText.split('\n').length - 1;
+          const lineDelta = descs.map(d => d ? (d.text.split('\n').length-1)-(d.el-d.sl) : 0);
+          let lastResult = null;
+          for (const idx of order) {
+            const d = descs[idx]; if (!d) continue;
+            const result = await invoke('edit_replace_range', { startLine:d.sl, startCol:d.sc, endLine:d.el, endCol:d.ec, text:d.text });
+            lastResult = result;
+          }
+          const finalCursors = allC.map((_,i) => {
+            const d = descs[i];
+            const base = d ? {line:d.newLine,col:d.newCol} : {line:allC[i].line,col:allC[i].col};
+            let adj = 0;
+            for (let j = 0; j < allC.length; j++) { if (j===i||!descs[j]) continue; if (descs[j].sl > (d?d.sl:allC[i].line)) adj += lineDelta[j]; }
+            return {line:base.line+adj, col:base.col, anchorLine:null, anchorCol:null};
+          });
+          const deduped = deduplicateCursors(finalCursors);
+          setPrimaryCursor(deduped[0]); extraCursors = deduped.slice(1);
+          if (lastResult) await updateFromEditResult(lastResult);
+        } catch (err) {
+          console.error('Paste error:', err);
+        }
+      });
+      return;
+    }
     const snapLine = cursorLine, snapCol = cursorCol;
     const sel = hasSelection() ? getSelectionRange() : null;
     if (sel) clearSelection();
@@ -1430,11 +2083,16 @@ document.addEventListener('keydown', (e) => {
   // Navigation
   if (e.key === 'ArrowUp') {
     e.preventDefault();
-    if (e.shiftKey) ensureAnchor(); else if (hasSelection()) clearSelection();
-    if (cursorLine > 0) {
-      cursorLine--;
-      cursorCol = Math.min(cursorCol, getLineText(cursorLine).length);
+    if (isMultiCursor() && !e.shiftKey) {
+      const moved = getAllCursors().map(c => {
+        const l = Math.max(0, c.line - 1);
+        return { line: l, col: Math.min(c.col, getLineText(l).length), anchorLine: null, anchorCol: null };
+      });
+      const d = deduplicateCursors(moved); setPrimaryCursor(d[0]); extraCursors = d.slice(1);
+      ensureCursorVisible(); requestRender(); updateStatusBar(); return;
     }
+    if (e.shiftKey) ensureAnchor(); else if (hasSelection()) clearSelection();
+    if (cursorLine > 0) { cursorLine--; cursorCol = Math.min(cursorCol, getLineText(cursorLine).length); }
     if (!e.shiftKey) clearSelection();
     ensureCursorVisible(); requestRender(); updateStatusBar();
     return;
@@ -1442,11 +2100,16 @@ document.addEventListener('keydown', (e) => {
 
   if (e.key === 'ArrowDown') {
     e.preventDefault();
-    if (e.shiftKey) ensureAnchor(); else if (hasSelection()) clearSelection();
-    if (cursorLine < totalLines - 1) {
-      cursorLine++;
-      cursorCol = Math.min(cursorCol, getLineText(cursorLine).length);
+    if (isMultiCursor() && !e.shiftKey) {
+      const moved = getAllCursors().map(c => {
+        const l = Math.min(totalLines - 1, c.line + 1);
+        return { line: l, col: Math.min(c.col, getLineText(l).length), anchorLine: null, anchorCol: null };
+      });
+      const d = deduplicateCursors(moved); setPrimaryCursor(d[0]); extraCursors = d.slice(1);
+      ensureCursorVisible(); requestRender(); updateStatusBar(); return;
     }
+    if (e.shiftKey) ensureAnchor(); else if (hasSelection()) clearSelection();
+    if (cursorLine < totalLines - 1) { cursorLine++; cursorCol = Math.min(cursorCol, getLineText(cursorLine).length); }
     if (!e.shiftKey) clearSelection();
     ensureCursorVisible(); requestRender(); updateStatusBar();
     return;
@@ -1454,14 +2117,22 @@ document.addEventListener('keydown', (e) => {
 
   if (e.key === 'ArrowLeft') {
     e.preventDefault();
+    if (isMultiCursor() && !e.shiftKey) {
+      const moved = getAllCursors().map(c => {
+        if (cursorHasSelection(c)) { const s = normalizeCursorSel(c); return { line: s.startLine, col: s.startCol, anchorLine: null, anchorCol: null }; }
+        const col = c.col > 0 ? c.col - 1 : c.line > 0 ? getLineText(c.line - 1).length : 0;
+        const line = c.col > 0 ? c.line : Math.max(0, c.line - 1);
+        return { line, col, anchorLine: null, anchorCol: null };
+      });
+      const d = deduplicateCursors(moved); setPrimaryCursor(d[0]); extraCursors = d.slice(1);
+      ensureCursorVisible(); requestRender(); updateStatusBar(); return;
+    }
     if (e.shiftKey) {
       ensureAnchor();
       if (cursorCol > 0) cursorCol--;
       else if (cursorLine > 0) { cursorLine--; cursorCol = getLineText(cursorLine).length; }
     } else if (hasSelection()) {
-      const sel = getSelectionRange();
-      cursorLine = sel.startLine; cursorCol = sel.startCol;
-      clearSelection();
+      const sel = getSelectionRange(); cursorLine = sel.startLine; cursorCol = sel.startCol; clearSelection();
     } else {
       if (cursorCol > 0) cursorCol--;
       else if (cursorLine > 0) { cursorLine--; cursorCol = getLineText(cursorLine).length; }
@@ -1472,15 +2143,24 @@ document.addEventListener('keydown', (e) => {
 
   if (e.key === 'ArrowRight') {
     e.preventDefault();
+    if (isMultiCursor() && !e.shiftKey) {
+      const moved = getAllCursors().map(c => {
+        if (cursorHasSelection(c)) { const s = normalizeCursorSel(c); return { line: s.endLine, col: s.endCol, anchorLine: null, anchorCol: null }; }
+        const len = getLineText(c.line).length;
+        const col = c.col < len ? c.col + 1 : c.line < totalLines - 1 ? 0 : c.col;
+        const line = c.col < len ? c.line : c.line < totalLines - 1 ? c.line + 1 : c.line;
+        return { line, col, anchorLine: null, anchorCol: null };
+      });
+      const d = deduplicateCursors(moved); setPrimaryCursor(d[0]); extraCursors = d.slice(1);
+      ensureCursorVisible(); requestRender(); updateStatusBar(); return;
+    }
     if (e.shiftKey) {
       ensureAnchor();
       const lineLen = getLineText(cursorLine).length;
       if (cursorCol < lineLen) cursorCol++;
       else if (cursorLine < totalLines - 1) { cursorLine++; cursorCol = 0; }
     } else if (hasSelection()) {
-      const sel = getSelectionRange();
-      cursorLine = sel.endLine; cursorCol = sel.endCol;
-      clearSelection();
+      const sel = getSelectionRange(); cursorLine = sel.endLine; cursorCol = sel.endCol; clearSelection();
     } else {
       const lineLen = getLineText(cursorLine).length;
       if (cursorCol < lineLen) cursorCol++;
@@ -1492,6 +2172,11 @@ document.addEventListener('keydown', (e) => {
 
   if (e.key === 'Home') {
     e.preventDefault();
+    if (isMultiCursor() && !e.shiftKey) {
+      const moved = getAllCursors().map(c => ({ line: c.line, col: 0, anchorLine: null, anchorCol: null }));
+      const d = deduplicateCursors(moved); setPrimaryCursor(d[0]); extraCursors = d.slice(1);
+      ensureCursorVisible(); requestRender(); updateStatusBar(); return;
+    }
     if (e.shiftKey) ensureAnchor();
     cursorCol = 0;
     if (!e.shiftKey) clearSelection();
@@ -1501,6 +2186,11 @@ document.addEventListener('keydown', (e) => {
 
   if (e.key === 'End') {
     e.preventDefault();
+    if (isMultiCursor() && !e.shiftKey) {
+      const moved = getAllCursors().map(c => ({ line: c.line, col: getLineText(c.line).length, anchorLine: null, anchorCol: null }));
+      const d = deduplicateCursors(moved); setPrimaryCursor(d[0]); extraCursors = d.slice(1);
+      ensureCursorVisible(); requestRender(); updateStatusBar(); return;
+    }
     if (e.shiftKey) ensureAnchor();
     cursorCol = getLineText(cursorLine).length;
     if (!e.shiftKey) clearSelection();
@@ -1511,6 +2201,7 @@ document.addEventListener('keydown', (e) => {
   // Editing keys
   if (e.key === 'Enter') {
     e.preventDefault();
+    if (isMultiCursor()) { multiCursorEdit(c => enterDesc(c)); return; }
     if (hasSelection()) {
       const sel = getSelectionRange();
       cursorLine = sel.startLine + 1;
@@ -1537,6 +2228,7 @@ document.addEventListener('keydown', (e) => {
 
   if (e.key === 'Backspace') {
     e.preventDefault();
+    if (isMultiCursor()) { multiCursorEdit(c => backspaceDesc(c)); return; }
     if (hasSelection()) {
       const sel = getSelectionRange();
       cursorLine = sel.startLine;
@@ -1573,6 +2265,7 @@ document.addEventListener('keydown', (e) => {
 
   if (e.key === 'Delete') {
     e.preventDefault();
+    if (isMultiCursor()) { multiCursorEdit(c => deleteDesc(c)); return; }
     if (hasSelection()) {
       const sel = getSelectionRange();
       cursorLine = sel.startLine;
@@ -1595,8 +2288,84 @@ document.addEventListener('keydown', (e) => {
     return;
   }
 
+  if (e.key === 'F2' && !e.ctrlKey && !e.shiftKey) {
+    e.preventDefault();
+    if (!filePath) return;
+    const renameUri = filePathToUri(filePath);
+    const renameLine = cursorLine, renameChar = cursorCol;
+    invoke('lsp_prepare_rename', { uri: renameUri, line: renameLine, character: renameChar })
+      .then(prepared => {
+        if (!prepared) { showToast('info', 'Nothing to rename here'); return; }
+        const lineText = getLineText(renameLine);
+        const wordInfo = getWordAt(lineText, renameChar);
+        const currentName = wordInfo ? lineText.substring(wordInfo.start, wordInfo.end) : '';
+        // Reuse the palette-style input box for the rename prompt
+        paletteOpen = true;
+        paletteEl.classList.remove('palette-hidden');
+        paletteInputEl.value = currentName;
+        paletteInputEl.placeholder = 'New name...';
+        paletteListEl.innerHTML = '';
+        const hint = document.createElement('div');
+        hint.className = 'palette-item';
+        hint.style.color = 'var(--fg-dim)';
+        hint.textContent = `Rename symbol "${currentName}" (Enter to confirm, Escape to cancel)`;
+        paletteListEl.appendChild(hint);
+
+        const renAbort = new AbortController();
+        paletteInputEl.removeEventListener('input', paletteInputHandler);
+        paletteInputEl.removeEventListener('keydown', paletteKeydownHandler);
+        paletteBackdropEl.removeEventListener('click', closePalette);
+
+        function closeRenameAndApply(newName) {
+          paletteOpen = false;
+          paletteEl.classList.add('palette-hidden');
+          paletteInputEl.placeholder = 'Type a command...';
+          renAbort.abort();
+          paletteInputEl.addEventListener('input', paletteInputHandler);
+          paletteInputEl.addEventListener('keydown', paletteKeydownHandler);
+          paletteBackdropEl.addEventListener('click', closePalette);
+          editorEl.focus();
+          if (!newName || newName === currentName) return;
+          invoke('lsp_rename', { uri: renameUri, line: renameLine, character: renameChar, newName })
+            .then(async result => {
+              if (!result || !result.changes || result.changes.length === 0) { showToast('error', 'Rename returned no edits'); return; }
+              try {
+                await invoke('apply_workspace_edit', { changes: result.changes });
+                await fetchVisibleContent();
+                requestRender();
+              } catch (err) { showToast('error', String(err)); }
+            })
+            .catch(err => showToast('error', String(err)));
+        }
+
+        paletteInputEl.addEventListener('keydown', e2 => {
+          if (e2.key === 'Enter') { e2.preventDefault(); closeRenameAndApply(paletteInputEl.value.trim()); }
+          else if (e2.key === 'Escape') closeRenameAndApply(null);
+        }, { signal: renAbort.signal });
+        paletteBackdropEl.addEventListener('click', () => closeRenameAndApply(null), { signal: renAbort.signal });
+        paletteInputEl.focus();
+        paletteInputEl.select();
+      })
+      .catch(() => { /* no rename provider */ });
+    return;
+  }
+
   if (e.key === 'Tab') {
     e.preventDefault();
+    if (isMultiCursor()) { multiCursorEdit(c => tabDesc(c)); return; }
+    // Accept ghost text if present
+    if (ghostText && !hasSelection()) {
+      const text = ghostText;
+      ghostText = null;
+      if (ghostTextTimer) { clearTimeout(ghostTextTimer); ghostTextTimer = null; }
+      const snapLine = cursorLine, snapCol = cursorCol;
+      cursorCol += text.length;
+      queueEdit(async () => {
+        const result = await invoke('edit_insert', { line: snapLine, col: snapCol, text });
+        await updateFromEditResult(result);
+      });
+      return;
+    }
     if (hasSelection()) {
       // Indent all lines in selection
       const sel = getSelectionRange();
@@ -1624,6 +2393,12 @@ document.addEventListener('keydown', (e) => {
   if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
     e.preventDefault();
     const ch = e.key;
+    if (isMultiCursor()) {
+      multiCursorEdit(c => typeCharDesc(c, ch));
+      if (ch === '(' || ch === ',') requestSignatureHelp(ch);
+      else if (ch === ')') closeSignatureHelp();
+      return;
+    }
     if (hasSelection()) {
       const sel = getSelectionRange();
       cursorLine = sel.startLine;
@@ -1645,7 +2420,7 @@ document.addEventListener('keydown', (e) => {
       });
     }
 
-    // M6: LSP triggers
+    // M6: LSP triggers (single cursor only)
     if (ch === '(' || ch === ',') requestSignatureHelp(ch);
     else if (ch === ')') closeSignatureHelp();
     if (ch === '.') triggerAutocomplete('.');
@@ -1688,11 +2463,21 @@ editorEl.addEventListener('mousedown', (e) => {
   resetCursorBlink();
   const pos = posFromMouse(e);
 
+  if (e.altKey) {
+    e.preventDefault();
+    addCursorAt(pos.line, pos.col);
+    requestRender();
+    updateStatusBar();
+    editorEl.focus();
+    return;
+  }
+
   if (e.shiftKey) {
     ensureAnchor();
     cursorLine = pos.line;
     cursorCol = pos.col;
   } else {
+    clearExtraCursors();
     selAnchorLine = pos.line;
     selAnchorCol = pos.col;
     cursorLine = pos.line;
@@ -2033,6 +2818,139 @@ window.addEventListener('message', (event) => {
 
 const webviewInterval = setInterval(pollWebviewEvents, 100);
 
+// ─── Accessibility: screen-reader proxy ──────────────────────
+
+const a11yProxy = document.getElementById('a11y-editor-proxy');
+const a11yAnnouncer = document.getElementById('a11y-announcer');
+let _a11yTimer = null;
+let _a11yLastLine = -1;
+let _a11yLastCol = -1;
+
+function a11yUpdateProxy() {
+  if (!a11yProxy) return;
+  const text = (visibleLines && visibleLines[cursorLine - firstVisibleLine])
+    ? (visibleLines[cursorLine - firstVisibleLine].text ?? '')
+    : '';
+  a11yProxy.value = text;
+  try { a11yProxy.setSelectionRange(cursorCol, cursorCol); } catch (_) {}
+}
+
+function a11yAnnounce(msg) {
+  if (!a11yAnnouncer) return;
+  // Toggle text so aria-live always fires even for repeated content
+  a11yAnnouncer.textContent = '';
+  requestAnimationFrame(() => { a11yAnnouncer.textContent = msg; });
+}
+
+function a11yAnnounceCursor() {
+  if (_a11yLastLine === cursorLine && _a11yLastCol === cursorCol) return;
+  _a11yLastLine = cursorLine;
+  _a11yLastCol = cursorCol;
+  clearTimeout(_a11yTimer);
+  _a11yTimer = setTimeout(() => {
+    a11yUpdateProxy();
+    const lineText = a11yProxy ? a11yProxy.value : '';
+    a11yAnnounce(`Line ${cursorLine + 1}, Column ${cursorCol + 1}: ${lineText || 'empty line'}`);
+  }, 150);
+}
+
+// ─── Terminal: Extension Host API polling ────────────────────
+
+async function pollTerminalEvents() {
+  if (!isPageVisible()) return;
+  try {
+    const events = await invoke('get_terminal_events');
+    for (const evt of events) {
+      if (evt.kind === 'create') await handleExtTerminalCreate(evt);
+      else if (evt.kind === 'write') handleExtTerminalWrite(evt);
+      else if (evt.kind === 'show') handleExtTerminalShow(evt);
+      else if (evt.kind === 'close') handleExtTerminalClose(evt);
+    }
+  } catch (_) { /* ignore */ }
+}
+
+async function handleExtTerminalCreate(evt) {
+  // evt: { request_id, name, cwd, shell }
+  try {
+    const terminalId = await invoke('terminal_create', {
+      cwd: evt.cwd ?? null,
+      shell: evt.shell ?? null,
+      cols: 80,
+      rows: 24,
+    });
+
+    const container = document.createElement('div');
+    container.className = 'xterm-instance';
+    container.style.width = '100%';
+    container.style.height = '100%';
+    container.style.display = 'none';
+    terminalContainerEl.appendChild(container);
+
+    const xterm = new Terminal({
+      fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace",
+      fontSize: 13,
+      cursorBlink: true,
+      scrollback: 5000,
+    });
+    const fitAddon = new FitAddon.FitAddon();
+    xterm.loadAddon(fitAddon);
+    xterm.open(container);
+    xterm.onData((data) => {
+      invoke('terminal_write', { terminalId, data }).catch(() => {});
+    });
+    terminals.set(terminalId, { xterm, fitAddon, container });
+
+    openBottomPanel();
+    switchBottomTab('terminal');
+    switchTerminal(terminalId);
+    renderTerminalTabs();
+    requestAnimationFrame(() => {
+      fitAddon.fit();
+      const dims = fitAddon.proposeDimensions();
+      if (dims) invoke('terminal_resize', { terminalId, cols: dims.cols, rows: dims.rows }).catch(() => {});
+    });
+
+    await invoke('respond_terminal_created', { requestId: evt.request_id, terminalId });
+  } catch (err) {
+    console.error('[ExtTerminal] Failed to create terminal:', err);
+  }
+}
+
+function handleExtTerminalWrite(evt) {
+  // evt: { terminal_id, data }
+  if (!evt.terminal_id || !evt.data) return;
+  invoke('terminal_write', { terminalId: evt.terminal_id, data: evt.data }).catch(() => {});
+}
+
+function handleExtTerminalShow(evt) {
+  openBottomPanel();
+  switchBottomTab('terminal');
+  if (evt.terminal_id) switchTerminal(evt.terminal_id);
+}
+
+function handleExtTerminalClose(evt) {
+  if (evt.terminal_id) invoke('terminal_close', { terminalId: evt.terminal_id }).catch(() => {});
+}
+
+const terminalEventsInterval = setInterval(pollTerminalEvents, 300);
+
+// ─── Decoration polling ───────────────────────────────────────
+
+async function pollDecorations() {
+  if (!isPageVisible() || !filePath) return;
+  try {
+    const uri = filePathToUri(filePath);
+    const decs = await invoke('get_decorations', { uri });
+    if (decs && decs.length !== activeDecorations.length ||
+        JSON.stringify(decs) !== JSON.stringify(activeDecorations)) {
+      activeDecorations = decs || [];
+      requestRender();
+    }
+  } catch { /* ignore */ }
+}
+
+const decorationsInterval = setInterval(pollDecorations, 500);
+
 // ─── Visibility-gated polling ────────────────────────────────
 // Skip IPC calls when window is hidden/minimized to save CPU
 function isPageVisible() { return document.visibilityState === 'visible'; }
@@ -2089,6 +3007,9 @@ function switchBottomTab(tab) {
   });
   outputPanelEl.style.display = tab === 'output' ? '' : 'none';
   terminalPanelEl.style.display = tab === 'terminal' ? '' : 'none';
+  const dbgConsoleEl = document.getElementById('debug-console-panel');
+  if (dbgConsoleEl) dbgConsoleEl.style.display = tab === 'debug-console' ? 'flex' : 'none';
+  if (tab === 'debug-console' && dbgConsoleEl) dbgConsoleEl.style.flexDirection = 'column';
   if (tab === 'terminal' && activeTerminalId) {
     const term = terminals.get(activeTerminalId);
     if (term) {
@@ -2847,35 +3768,41 @@ async function executeCodeAction(action) {
     setTimeout(refreshDiagnostics, 500);
   }
   if (action.edit) {
-    // Support both `changes` and `documentChanges` (LSP 3.x)
-    let allEdits = [];
+    // Build per-file changes map from both `changes` and `documentChanges` (LSP 3.x)
+    const fileMap = new Map(); // uri -> TextEdit[]
     if (action.edit.changes) {
       for (const [uri, edits] of Object.entries(action.edit.changes)) {
-        for (const edit of edits) allEdits.push(edit);
+        if (!fileMap.has(uri)) fileMap.set(uri, []);
+        for (const e of edits) fileMap.get(uri).push(e);
       }
     }
     if (action.edit.documentChanges) {
       for (const dc of action.edit.documentChanges) {
-        if (dc.edits) {
-          for (const edit of dc.edits) allEdits.push(edit);
-        }
+        const uri = dc.textDocument?.uri || dc.uri;
+        if (!uri) continue;
+        if (!fileMap.has(uri)) fileMap.set(uri, []);
+        for (const e of (dc.edits || [])) fileMap.get(uri).push(e);
       }
     }
-    // Apply in reverse order to preserve positions
-    allEdits.sort((a, b) => {
-      if (b.range.start.line !== a.range.start.line) return b.range.start.line - a.range.start.line;
-      return b.range.start.character - a.range.start.character;
-    });
-    for (const edit of allEdits) {
-      const r = edit.range;
-      await invoke('edit_replace_range', {
-        startLine: r.start.line, startCol: r.start.character,
-        endLine: r.end.line, endCol: r.end.character, text: edit.newText,
-      });
+    if (fileMap.size > 0) {
+      const changes = [];
+      for (const [uri, edits] of fileMap) {
+        changes.push({
+          uri,
+          edits: edits.map(e => ({
+            start_line: e.range.start.line,
+            start_col: e.range.start.character,
+            end_line: e.range.end.line,
+            end_col: e.range.end.character,
+            new_text: e.newText,
+          })),
+        });
+      }
+      await invoke('apply_workspace_edit', { changes });
+      await fetchVisibleContent();
+      updateMetadataUI();
+      requestRender();
     }
-    await fetchVisibleContent();
-    updateMetadataUI();
-    requestRender();
   }
 }
 
@@ -3065,10 +3992,15 @@ document.addEventListener('click', (e) => {
 
 // ─── M8: Activity Bar & Panel Switching ───────────────────────
 
-let activePanel = 'none'; // 'explorer' | 'extensions' | 'settings' | 'none'
+let activePanel = 'none'; // 'explorer' | 'scm' | 'extensions' | 'settings' | 'debug' | 'none'
 const activityBar = document.getElementById('activity-bar');
 const extensionsPanel = document.getElementById('extensions-panel');
 const settingsPanel = document.getElementById('settings-panel');
+const debugPanel = document.getElementById('debug-panel');
+const treeviewsPanel = document.getElementById('treeviews-panel');
+const scmPanelEl = document.getElementById('scm-panel');
+const treeviewsContainer = document.getElementById('treeviews-container');
+const treeviewsEmpty = document.getElementById('treeviews-empty');
 const extSearchInput = document.getElementById('ext-search-input');
 const extListEl = document.getElementById('ext-list');
 const settingsSearchInput = document.getElementById('settings-search-input');
@@ -3078,8 +4010,11 @@ const settingsListEl = document.getElementById('settings-list');
 function switchPanel(panel) {
   // Hide all panels
   sidebarEl.classList.add('sidebar-hidden');
+  scmPanelEl?.classList.add('sidebar-hidden');
   extensionsPanel.classList.add('sidebar-hidden');
   settingsPanel.classList.add('sidebar-hidden');
+  debugPanel?.classList.add('sidebar-hidden');
+  treeviewsPanel?.classList.add('sidebar-hidden');
 
   // Update active button
   activityBar.querySelectorAll('.activity-btn').forEach(btn => {
@@ -3096,6 +4031,9 @@ function switchPanel(panel) {
     if (panel === 'explorer') {
       sidebarEl.classList.remove('sidebar-hidden');
       if (!explorerRoot) openFolderDialog();
+    } else if (panel === 'scm') {
+      scmPanelEl?.classList.remove('sidebar-hidden');
+      renderScmPanel();
     } else if (panel === 'extensions') {
       extensionsPanel.classList.remove('sidebar-hidden');
       extSearchInput.focus();
@@ -3104,6 +4042,11 @@ function switchPanel(panel) {
       settingsPanel.classList.remove('sidebar-hidden');
       settingsSearchInput.focus();
       loadSettings();
+    } else if (panel === 'debug') {
+      debugPanel?.classList.remove('sidebar-hidden');
+      renderBreakpointsList();
+    } else if (panel === 'treeviews') {
+      treeviewsPanel?.classList.remove('sidebar-hidden');
     }
   }
 
@@ -3119,9 +4062,12 @@ activityBar.addEventListener('click', (e) => {
   if (btn) switchPanel(btn.dataset.panel);
 });
 
-// Close buttons for extension and settings panels
+// Close buttons for all panels
+document.getElementById('scm-panel-close')?.addEventListener('click', () => switchPanel('scm'));
 document.getElementById('ext-panel-close')?.addEventListener('click', () => switchPanel('extensions'));
 document.getElementById('settings-panel-close')?.addEventListener('click', () => switchPanel('settings'));
+document.getElementById('debug-panel-close')?.addEventListener('click', () => switchPanel('debug'));
+document.getElementById('treeviews-panel-close')?.addEventListener('click', () => switchPanel('treeviews'));
 
 // Extension tabs (Marketplace / Installed)
 let extActiveTab = 'marketplace';
@@ -3455,11 +4401,558 @@ toggleSidebar = function() {
   }
 };
 
+// ─── DAP Debug UI ────────────────────────────────────────────
+
+// Breakpoints: Map<filePath, Set<lineNumber (0-based)>>
+const breakpoints = new Map();
+
+// Current debug session state
+let debugSessionId = null;
+let debugStopped = false;
+let debugCallStack = [];
+let debugConsoleLines = [];
+
+const debugCallStackEl = document.getElementById('debug-callstack');
+const debugVariablesEl = document.getElementById('debug-variables');
+const debugBpListEl = document.getElementById('debug-breakpoints-list');
+const debugConsoleContentEl = document.getElementById('debug-console-content');
+
+// Toggle a breakpoint on a given file + line (0-based)
+function toggleBreakpoint(fp, line) {
+  if (!fp) return;
+  if (!breakpoints.has(fp)) breakpoints.set(fp, new Set());
+  const set = breakpoints.get(fp);
+  if (set.has(line)) {
+    set.delete(line);
+  } else {
+    set.add(line);
+  }
+  requestRender(); // repaint gutter markers
+  renderBreakpointsList();
+}
+
+function renderBreakpointsList() {
+  if (!debugBpListEl) return;
+  const items = [];
+  for (const [fp, lines] of breakpoints) {
+    for (const ln of lines) {
+      items.push({ fp, ln });
+    }
+  }
+  if (items.length === 0) {
+    debugBpListEl.textContent = '';
+    return;
+  }
+  debugBpListEl.innerHTML = items.map(({ fp, ln }) => {
+    const short = fp.split(/[\\/]/).pop();
+    return `<div class="debug-bp-entry" data-file="${encodeURIComponent(fp)}" data-line="${ln}">
+      <span style="color:#f38ba8">●</span> ${escapeHtml(short)}:${ln + 1}
+    </div>`;
+  }).join('');
+  debugBpListEl.querySelectorAll('.debug-bp-entry').forEach(el => {
+    el.addEventListener('click', () => {
+      const fp = decodeURIComponent(el.dataset.file);
+      const ln = parseInt(el.dataset.line, 10);
+      toggleBreakpoint(fp, ln);
+    });
+  });
+}
+
+function appendDebugConsole(text, category) {
+  debugConsoleLines.push({ text, category });
+  if (!debugConsoleContentEl) return;
+  const line = document.createElement('div');
+  line.className = `debug-console-line ${category || 'info'}`;
+  line.textContent = text;
+  debugConsoleContentEl.appendChild(line);
+  // Auto-scroll
+  debugConsoleContentEl.scrollTop = debugConsoleContentEl.scrollHeight;
+}
+
+function renderCallStack(frames) {
+  if (!debugCallStackEl) return;
+  if (!frames || frames.length === 0) {
+    debugCallStackEl.textContent = '';
+    return;
+  }
+  debugCallStackEl.innerHTML = frames.map((f, i) => `
+    <div class="debug-frame ${i === 0 ? 'active-frame' : ''}" data-idx="${i}">
+      ${escapeHtml(f.name || '(anonymous)')}
+      <div class="frame-file">${escapeHtml((f.source?.path || f.source?.name || '').split(/[\\/]/).pop())}:${f.line ?? ''}</div>
+    </div>
+  `).join('');
+}
+
+function updateDebugToolbar(running) {
+  const btnStart = document.getElementById('debug-btn-start');
+  const btnContinue = document.getElementById('debug-btn-continue');
+  const btnPause = document.getElementById('debug-btn-pause');
+  const btnStepOver = document.getElementById('debug-btn-stepover');
+  const btnStepIn = document.getElementById('debug-btn-stepin');
+  const btnStepOut = document.getElementById('debug-btn-stepout');
+  const btnRestart = document.getElementById('debug-btn-restart');
+  const btnStop = document.getElementById('debug-btn-stop');
+
+  if (running) {
+    btnStart && (btnStart.style.display = 'none');
+    btnStop && (btnStop.style.display = '');
+    btnRestart && (btnRestart.style.display = '');
+    if (debugStopped) {
+      btnContinue && (btnContinue.style.display = '');
+      btnPause && (btnPause.style.display = 'none');
+      btnStepOver && (btnStepOver.style.display = '');
+      btnStepIn && (btnStepIn.style.display = '');
+      btnStepOut && (btnStepOut.style.display = '');
+    } else {
+      btnContinue && (btnContinue.style.display = 'none');
+      btnPause && (btnPause.style.display = '');
+      btnStepOver && (btnStepOver.style.display = 'none');
+      btnStepIn && (btnStepIn.style.display = 'none');
+      btnStepOut && (btnStepOut.style.display = 'none');
+    }
+  } else {
+    btnStart && (btnStart.style.display = '');
+    btnContinue && (btnContinue.style.display = 'none');
+    btnPause && (btnPause.style.display = 'none');
+    btnStepOver && (btnStepOver.style.display = 'none');
+    btnStepIn && (btnStepIn.style.display = 'none');
+    btnStepOut && (btnStepOut.style.display = 'none');
+    btnRestart && (btnRestart.style.display = 'none');
+    btnStop && (btnStop.style.display = 'none');
+  }
+}
+
+// Process a batch of DAP events from the adapter
+async function processDebugEvents(events) {
+  for (const evt of events) {
+    if (evt.type === 'event') {
+      switch (evt.event) {
+        case 'initialized':
+          // Adapter is ready — send all breakpoints then configurationDone
+          appendDebugConsole('[Debug] Adapter initialized', 'info');
+          await sendBreakpointsToAdapter();
+          await invoke('debug_send', { sessionId: debugSessionId, command: 'configurationDone', args: {} }).catch(() => {});
+          break;
+        case 'stopped': {
+          debugStopped = true;
+          updateDebugToolbar(true);
+          appendDebugConsole(`[Debug] Stopped: ${evt.body?.reason || ''}`, 'info');
+          // Fetch call stack
+          try {
+            const threadId = evt.body?.threadId ?? 1;
+            await invoke('debug_send', { sessionId: debugSessionId, command: 'stackTrace', args: { threadId, startFrame: 0, levels: 20 } });
+          } catch {}
+          break;
+        }
+        case 'continued':
+          debugStopped = false;
+          debugCallStack = [];
+          renderCallStack([]);
+          updateDebugToolbar(true);
+          break;
+        case 'terminated':
+        case 'exited':
+          appendDebugConsole('[Debug] Session terminated', 'info');
+          await invoke('debug_stop', { sessionId: debugSessionId }).catch(() => {});
+          debugSessionId = null;
+          debugStopped = false;
+          debugCallStack = [];
+          renderCallStack([]);
+          if (debugVariablesEl) debugVariablesEl.textContent = '';
+          updateDebugToolbar(false);
+          requestRender();
+          break;
+        case 'output':
+          if (evt.body?.output) {
+            const category = evt.body.category === 'stderr' ? 'stderr' : (evt.body.category === 'stdout' ? 'stdout' : 'info');
+            appendDebugConsole(evt.body.output.replace(/\n$/, ''), category);
+          }
+          break;
+        default:
+          break;
+      }
+    } else if (evt.type === 'response') {
+      if (evt.command === 'stackTrace' && evt.success && evt.body?.stackFrames) {
+        debugCallStack = evt.body.stackFrames;
+        renderCallStack(debugCallStack);
+        requestRender(); // repaint to show current line marker
+        // Fetch scopes for first frame
+        if (debugCallStack.length > 0) {
+          await invoke('debug_send', { sessionId: debugSessionId, command: 'scopes', args: { frameId: debugCallStack[0].id } }).catch(() => {});
+        }
+      } else if (evt.command === 'scopes' && evt.success && evt.body?.scopes) {
+        if (!debugVariablesEl) continue;
+        // Fetch variables for first scope
+        const firstScope = evt.body.scopes[0];
+        if (firstScope) {
+          await invoke('debug_send', { sessionId: debugSessionId, command: 'variables', args: { variablesReference: firstScope.variablesReference } }).catch(() => {});
+        }
+      } else if (evt.command === 'variables' && evt.success && evt.body?.variables) {
+        if (!debugVariablesEl) continue;
+        const vars = evt.body.variables.slice(0, 50);
+        debugVariablesEl.innerHTML = vars.map(v =>
+          `<div class="debug-var-entry"><span style="color:var(--accent)">${escapeHtml(v.name)}</span>: ${escapeHtml(String(v.value ?? ''))}</div>`
+        ).join('');
+      }
+    }
+  }
+}
+
+async function sendBreakpointsToAdapter() {
+  if (!debugSessionId) return;
+  // Group breakpoints by source file
+  const fileGroups = new Map();
+  for (const [fp, lines] of breakpoints) {
+    fileGroups.set(fp, [...lines].map(ln => ({ line: ln + 1 })));
+  }
+  for (const [fp, bpLines] of fileGroups) {
+    await invoke('debug_send', {
+      sessionId: debugSessionId,
+      command: 'setBreakpoints',
+      args: { source: { path: fp }, breakpoints: bpLines },
+    }).catch(() => {});
+  }
+}
+
+// Start a new debug session (called when a debug/startSession request is received)
+async function startDebugSession(req) {
+  if (debugSessionId) {
+    await invoke('debug_stop', { sessionId: debugSessionId }).catch(() => {});
+  }
+  debugSessionId = req.session_id;
+  debugConsoleLines = [];
+  if (debugConsoleContentEl) debugConsoleContentEl.innerHTML = '';
+  debugStopped = false;
+  debugCallStack = [];
+  renderCallStack([]);
+  updateDebugToolbar(true);
+
+  try {
+    await invoke('debug_start', {
+      sessionId: req.session_id,
+      adapterCmd: req.adapter_cmd,
+      adapterArgs: req.adapter_args,
+    });
+  } catch (err) {
+    appendDebugConsole(`[Debug] Failed to start adapter: ${err}`, 'stderr');
+    debugSessionId = null;
+    updateDebugToolbar(false);
+    return;
+  }
+
+  appendDebugConsole(`[Debug] Adapter started: ${req.adapter_cmd}`, 'info');
+
+  // Send initialize request
+  await invoke('debug_send', {
+    sessionId: debugSessionId,
+    command: 'initialize',
+    args: {
+      clientID: 'corecode',
+      clientName: 'CoreCode',
+      adapterID: req.launch_config?.type ?? 'unknown',
+      pathFormat: 'path',
+      linesStartAt1: true,
+      columnsStartAt1: true,
+      supportsRunInTerminalRequest: false,
+    },
+  }).catch(err => appendDebugConsole(`[Debug] initialize error: ${err}`, 'stderr'));
+
+  // Send launch or attach
+  const request = String(req.launch_config?.request ?? 'launch');
+  await invoke('debug_send', {
+    sessionId: debugSessionId,
+    command: request,
+    args: req.launch_config ?? {},
+  }).catch(err => appendDebugConsole(`[Debug] ${request} error: ${err}`, 'stderr'));
+}
+
+// Poll debug start requests and events
+async function pollDebugStartRequests() {
+  try {
+    const requests = await invoke('get_debug_start_requests');
+    for (const req of requests) {
+      await startDebugSession(req);
+    }
+  } catch {}
+}
+
+async function pollDebugEvents() {
+  if (!debugSessionId) return;
+  try {
+    const events = await invoke('debug_poll_events', { sessionId: debugSessionId });
+    if (events && events.length > 0) {
+      await processDebugEvents(events);
+    }
+  } catch {}
+}
+
+const debugStartInterval = setInterval(pollDebugStartRequests, 1000);
+const debugEventsInterval = setInterval(pollDebugEvents, 200);
+
+// ─── workspace.applyEdit polling ─────────────────────────────
+
+async function pollWorkspaceEdits() {
+  try {
+    const requests = await invoke('get_workspace_edit_requests');
+    for (const req of requests) {
+      try {
+        await invoke('apply_workspace_edit', { changes: req.changes });
+        // Refresh visible content in case the active file was edited
+        await fetchVisibleContent();
+        requestRender();
+      } catch (err) {
+        console.error('[applyEdit] Failed:', err);
+      }
+    }
+  } catch {}
+}
+
+const workspaceEditInterval = setInterval(pollWorkspaceEdits, 300);
+
+// ─── window.showTextDocument ──────────────────────────────────
+
+async function pollShowTextDocumentRequests() {
+  try {
+    const requests = await invoke('get_show_text_document_requests');
+    for (const req of requests) {
+      try {
+        const uri = req.uri;
+        // Convert URI to file path
+        let filePath2 = uri;
+        if (filePath2.startsWith('file:///')) filePath2 = filePath2.slice(8).replace(/\//g, '\\');
+        else if (filePath2.startsWith('file://')) filePath2 = filePath2.slice(7);
+        filePath2 = decodeURIComponent(filePath2);
+        // On Windows, lowercase the drive letter
+        if (filePath2.match(/^[a-zA-Z]:\\/)) filePath2 = filePath2[0].toUpperCase() + filePath2.slice(1);
+        saveBufferState();
+        const content = await invoke('open_file', { path: filePath2 });
+        activeBufferPath = content.file_path;
+        if (!bufferStates.has(activeBufferPath)) {
+          cursorLine = 0;
+          cursorCol = 0;
+          clearSelection();
+        } else {
+          restoreBufferState(activeBufferPath);
+        }
+        // Jump to selection if provided
+        if (req.selection) {
+          cursorLine = req.selection.start_line;
+          cursorCol = req.selection.start_character;
+          selAnchorLine = req.selection.start_line;
+          selAnchorCol = req.selection.start_character;
+          // Extend selection to end pos if not same point
+          if (req.selection.start_line !== req.selection.end_line || req.selection.start_character !== req.selection.end_character) {
+            cursorLine = req.selection.end_line;
+            cursorCol = req.selection.end_character;
+          }
+        }
+        await updateFromEditorContent(content);
+        renderTabs();
+        ensureCursorVisible();
+        requestRender();
+      } catch (err) {
+        console.error('[showTextDocument] Failed to open:', err);
+      }
+    }
+  } catch {}
+}
+
+const showTextDocumentInterval = setInterval(pollShowTextDocumentRequests, 300);
+
+// ─── Extension Tree Views ─────────────────────────────────────
+
+const registeredTreeViews = new Map(); // viewId -> { collapsed: bool }
+const treeViewExpandedItems = new Map(); // viewId -> Set<itemId>
+
+function renderTreeView(viewId, items, parentEl, depth = 0) {
+  for (const item of items) {
+    const row = document.createElement('div');
+    row.className = 'tv-item';
+    row.style.paddingLeft = `${6 + depth * 14}px`;
+
+    const toggleEl = document.createElement('span');
+    toggleEl.className = 'tv-toggle';
+    const canExpand = item.collapsible_state === 1 || item.collapsible_state === 2;
+    const expanded = treeViewExpandedItems.get(viewId)?.has(item.id);
+    toggleEl.textContent = canExpand ? (expanded ? '▾' : '▸') : ' ';
+    row.appendChild(toggleEl);
+
+    const labelEl = document.createElement('span');
+    labelEl.className = 'tv-label';
+    labelEl.textContent = item.label;
+    row.appendChild(labelEl);
+
+    if (item.description) {
+      const descEl = document.createElement('span');
+      descEl.className = 'tv-description';
+      descEl.textContent = item.description;
+      row.appendChild(descEl);
+    }
+
+    const childrenEl = document.createElement('div');
+    childrenEl.className = 'tv-children';
+
+    row.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (canExpand) {
+        const expSet = treeViewExpandedItems.get(viewId) ?? new Set();
+        treeViewExpandedItems.set(viewId, expSet);
+        if (expSet.has(item.id)) {
+          expSet.delete(item.id);
+          childrenEl.innerHTML = '';
+          toggleEl.textContent = '▸';
+        } else {
+          expSet.add(item.id);
+          toggleEl.textContent = '▾';
+          try {
+            const children = await invoke('tree_view_get_children', { viewId, itemId: item.id });
+            childrenEl.innerHTML = '';
+            if (Array.isArray(children) && children.length > 0) {
+              renderTreeView(viewId, children, childrenEl, depth + 1);
+            }
+          } catch (err) { console.error('[TreeView] getChildren error:', err); }
+        }
+      }
+      if (item.command) {
+        invoke('execute_command', { command: item.command.command, args: item.command.args ?? [] }).catch(() => {});
+      }
+    });
+
+    parentEl.appendChild(row);
+    if (canExpand && expanded) parentEl.appendChild(childrenEl);
+    else if (canExpand) parentEl.appendChild(childrenEl);
+  }
+}
+
+async function loadTreeView(viewId) {
+  const viewEl = document.getElementById(`tv-view-${CSS.escape(viewId)}`);
+  if (!viewEl) return;
+  const body = viewEl.querySelector('.tv-view-body');
+  if (!body) return;
+  try {
+    const items = await invoke('tree_view_get_children', { viewId, itemId: null });
+    body.innerHTML = '';
+    if (Array.isArray(items) && items.length > 0) {
+      renderTreeView(viewId, items, body, 0);
+    } else {
+      body.innerHTML = '<div style="padding:4px 8px;color:#888;font-size:12px;">No items.</div>';
+    }
+  } catch (err) { console.error('[TreeView] loadTreeView error:', err); }
+}
+
+function registerTreeViewUI(viewId) {
+  if (document.getElementById(`tv-view-${CSS.escape(viewId)}`)) return; // already exists
+  treeviewsEmpty.style.display = 'none';
+  const viewEl = document.createElement('div');
+  viewEl.className = 'tv-view';
+  viewEl.id = `tv-view-${CSS.escape(viewId)}`;
+  const headerEl = document.createElement('div');
+  headerEl.className = 'tv-view-header';
+  headerEl.innerHTML = `<span>▾</span><span>${viewId}</span>`;
+  const bodyEl = document.createElement('div');
+  bodyEl.className = 'tv-view-body';
+  bodyEl.innerHTML = '<div style="padding:4px 8px;color:#888;font-size:12px;">Loading...</div>';
+  headerEl.addEventListener('click', () => {
+    const collapsed = registeredTreeViews.get(viewId)?.collapsed ?? false;
+    registeredTreeViews.set(viewId, { collapsed: !collapsed });
+    bodyEl.style.display = collapsed ? '' : 'none';
+    headerEl.querySelector('span').textContent = collapsed ? '▾' : '▸';
+  });
+  viewEl.appendChild(headerEl);
+  viewEl.appendChild(bodyEl);
+  treeviewsContainer.appendChild(viewEl);
+  registeredTreeViews.set(viewId, { collapsed: false });
+  loadTreeView(viewId);
+}
+
+async function pollTreeViewEvents() {
+  try {
+    const events = await invoke('get_tree_view_events');
+    for (const evt of events) {
+      if (evt.event_type === 'register') {
+        registerTreeViewUI(evt.view_id);
+      } else if (evt.event_type === 'update') {
+        // Clear cached elements and reload
+        treeViewExpandedItems.delete(evt.view_id);
+        loadTreeView(evt.view_id);
+      } else if (evt.event_type === 'unregister') {
+        const viewEl = document.getElementById(`tv-view-${CSS.escape(evt.view_id)}`);
+        if (viewEl) viewEl.remove();
+        registeredTreeViews.delete(evt.view_id);
+        if (registeredTreeViews.size === 0) treeviewsEmpty.style.display = '';
+      }
+    }
+  } catch {}
+}
+
+const treeViewEventsInterval = setInterval(pollTreeViewEvents, 500);
+
+// Gutter click — toggle breakpoint, or show comment thread when clicking the indicator bar
+document.getElementById('gutter')?.addEventListener('click', (e) => {
+  if (!filePath) return;
+  const rect = gutterCanvas.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+  const { first } = getVisibleLineRange();
+  const scrollTop = editorEl.scrollTop;
+  const subPixelOffset = -(scrollTop % lineHeight);
+  const lineIdx = first + Math.floor((y - subPixelOffset) / lineHeight);
+  if (lineIdx >= 0 && lineIdx < totalLines) {
+    // Right 10px of gutter = comment indicator zone
+    if (x >= rect.width - 10) {
+      const thread = commentThreads.find(t => t.start_line === lineIdx);
+      if (thread) { showCommentPopup(thread, e.clientX, e.clientY); return; }
+    }
+    toggleBreakpoint(filePath, lineIdx);
+  }
+});
+
+// Debug toolbar button handlers
+document.getElementById('debug-btn-start')?.addEventListener('click', () => {
+  invoke('execute_command', { command: 'workbench.action.debug.start', args: [] }).catch(() => {});
+});
+document.getElementById('debug-btn-continue')?.addEventListener('click', async () => {
+  if (debugSessionId) await invoke('debug_send', { sessionId: debugSessionId, command: 'continue', args: { threadId: 1 } }).catch(() => {});
+});
+document.getElementById('debug-btn-pause')?.addEventListener('click', async () => {
+  if (debugSessionId) await invoke('debug_send', { sessionId: debugSessionId, command: 'pause', args: { threadId: 1 } }).catch(() => {});
+});
+document.getElementById('debug-btn-stepover')?.addEventListener('click', async () => {
+  if (debugSessionId) await invoke('debug_send', { sessionId: debugSessionId, command: 'next', args: { threadId: 1 } }).catch(() => {});
+});
+document.getElementById('debug-btn-stepin')?.addEventListener('click', async () => {
+  if (debugSessionId) await invoke('debug_send', { sessionId: debugSessionId, command: 'stepIn', args: { threadId: 1 } }).catch(() => {});
+});
+document.getElementById('debug-btn-stepout')?.addEventListener('click', async () => {
+  if (debugSessionId) await invoke('debug_send', { sessionId: debugSessionId, command: 'stepOut', args: { threadId: 1 } }).catch(() => {});
+});
+document.getElementById('debug-btn-stop')?.addEventListener('click', async () => {
+  if (debugSessionId) {
+    await invoke('debug_send', { sessionId: debugSessionId, command: 'terminate', args: {} }).catch(() => {});
+    setTimeout(async () => {
+      await invoke('debug_stop', { sessionId: debugSessionId }).catch(() => {});
+      debugSessionId = null;
+      updateDebugToolbar(false);
+      requestRender();
+    }, 500);
+  }
+});
+document.getElementById('debug-btn-restart')?.addEventListener('click', async () => {
+  if (debugSessionId) await invoke('debug_send', { sessionId: debugSessionId, command: 'restart', args: {} }).catch(() => {});
+});
+
+// Debug console bottom tab — handled by switchBottomTab via the bottomPanelTabs forEach listener.
+
 // ─── M8: Keyboard Shortcuts ───────────────────────────────────
 
-// Add Ctrl+Shift+X for extensions and Ctrl+, for settings
+// Add Ctrl+Shift+X for extensions, Ctrl+, for settings, debug shortcuts
 const _origKeydown = document.onkeydown;
 document.addEventListener('keydown', (e) => {
+  if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'g') {
+    e.preventDefault();
+    switchPanel('scm');
+    return;
+  }
   if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'x') {
     e.preventDefault();
     switchPanel('extensions');
@@ -3470,11 +4963,415 @@ document.addEventListener('keydown', (e) => {
     switchPanel('settings');
     return;
   }
+  if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'd') {
+    e.preventDefault();
+    switchPanel('debug');
+    return;
+  }
+  // F5 — Start or Continue
+  if (e.key === 'F5' && !e.ctrlKey && !e.shiftKey) {
+    e.preventDefault();
+    if (debugSessionId && debugStopped) {
+      invoke('debug_send', { sessionId: debugSessionId, command: 'continue', args: { threadId: 1 } }).catch(() => {});
+    } else if (!debugSessionId) {
+      invoke('execute_command', { command: 'workbench.action.debug.start', args: [] }).catch(() => {});
+    }
+    return;
+  }
+  // Shift+F5 — Stop
+  if (e.key === 'F5' && e.shiftKey) {
+    e.preventDefault();
+    if (debugSessionId) {
+      invoke('debug_send', { sessionId: debugSessionId, command: 'terminate', args: {} }).catch(() => {});
+    }
+    return;
+  }
+  // F9 — Toggle breakpoint on current line
+  if (e.key === 'F9') {
+    e.preventDefault();
+    if (filePath !== null) toggleBreakpoint(filePath, cursorLine);
+    return;
+  }
+  // F10 — Step over
+  if (e.key === 'F10') {
+    e.preventDefault();
+    if (debugSessionId && debugStopped) {
+      invoke('debug_send', { sessionId: debugSessionId, command: 'next', args: { threadId: 1 } }).catch(() => {});
+    }
+    return;
+  }
+  // F11 — Step into (Shift+F11 = step out)
+  if (e.key === 'F11') {
+    e.preventDefault();
+    if (debugSessionId && debugStopped) {
+      const cmd = e.shiftKey ? 'stepOut' : 'stepIn';
+      invoke('debug_send', { sessionId: debugSessionId, command: cmd, args: { threadId: 1 } }).catch(() => {});
+    }
+    return;
+  }
 }, true); // capture phase to intercept before other handlers
+
+// ─── SCM Panel & Diff Viewer ──────────────────────────────────
+
+const scmGroupsEl = document.getElementById('scm-groups');
+const scmCommitInput = document.getElementById('scm-commit-input');
+const scmCommitBtn = document.getElementById('scm-commit-btn');
+const diffViewerEl = document.getElementById('diff-viewer');
+const diffContentEl = document.getElementById('diff-content');
+const diffViewerTitle = document.getElementById('diff-viewer-title');
+const diffStageBtn = document.getElementById('diff-stage-btn');
+const diffUnstageBtn = document.getElementById('diff-unstage-btn');
+const diffDiscardBtn = document.getElementById('diff-discard-btn');
+const diffViewerClose = document.getElementById('diff-viewer-close');
+
+// ─── Comment Threads ──────────────────────────────────────────
+
+const commentPopupEl = document.getElementById('comment-thread-popup');
+const commentPopupLabelEl = document.getElementById('comment-thread-popup-label');
+const commentPopupBodyEl = document.getElementById('comment-thread-popup-body');
+
+function showCommentPopup(thread, clientX, clientY) {
+  if (!commentPopupEl) return;
+  commentPopupLabelEl.textContent = thread.label ?? `${thread.comments.length} comment${thread.comments.length !== 1 ? 's' : ''}`;
+  commentPopupBodyEl.innerHTML = '';
+  for (const c of thread.comments) {
+    const item = document.createElement('div');
+    item.className = 'comment-popup-item';
+    const author = document.createElement('div');
+    author.className = 'comment-popup-author';
+    author.textContent = c.author?.name ?? 'Unknown';
+    const body = document.createElement('div');
+    body.className = 'comment-popup-body';
+    body.textContent = c.body ?? '';
+    item.appendChild(author);
+    item.appendChild(body);
+    commentPopupBodyEl.appendChild(item);
+  }
+  // Position near click, keeping within viewport
+  const pw = 340, ph = 300;
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const left = Math.min(clientX + 8, vw - pw - 8);
+  const top = Math.min(clientY, vh - ph - 8);
+  commentPopupEl.style.left = left + 'px';
+  commentPopupEl.style.top = top + 'px';
+  commentPopupEl.classList.remove('comment-popup-hidden');
+}
+
+function closeCommentPopup() {
+  commentPopupEl?.classList.add('comment-popup-hidden');
+}
+
+document.getElementById('comment-thread-popup-close')?.addEventListener('click', closeCommentPopup);
+
+document.addEventListener('mousedown', (e) => {
+  if (!commentPopupEl?.classList.contains('comment-popup-hidden') &&
+      !commentPopupEl?.contains(e.target)) {
+    closeCommentPopup();
+  }
+});
+
+async function pollCommentThreads() {
+  if (!filePath) { commentThreads = []; return; }
+  try {
+    const uri = filePathToUri(filePath);
+    const threads = await invoke('get_comment_threads', { uri });
+    const changed = JSON.stringify(threads) !== JSON.stringify(commentThreads);
+    commentThreads = threads;
+    if (changed) requestRender();
+  } catch {}
+}
+
+const commentThreadsInterval = setInterval(pollCommentThreads, 3000);
+
+// Current diff context (for action buttons)
+let diffCurrentFile = null; // { path, staged }
+let scmStatus = []; // last git status result
+
+async function renderScmPanel() {
+  const root = explorerRoot;
+  if (!root) {
+    if (scmGroupsEl) scmGroupsEl.innerHTML = '<div style="padding:12px;color:#888;font-size:12px;">Open a folder to use Source Control.</div>';
+    return;
+  }
+  try {
+    scmStatus = await invoke('git_status', { workspacePath: root });
+  } catch (e) {
+    if (scmGroupsEl) scmGroupsEl.innerHTML = `<div style="padding:12px;color:#888;font-size:12px;">Not a git repository.</div>`;
+    return;
+  }
+  if (!scmGroupsEl) return;
+
+  const staged = scmStatus.filter(e => e.index_status !== ' ' && e.index_status !== '?');
+  const changed = scmStatus.filter(e => e.worktree_status !== ' ' && e.worktree_status !== '?' && (e.index_status === ' ' || e.index_status === '?'));
+  const untracked = scmStatus.filter(e => e.index_status === '?' && e.worktree_status === '?');
+
+  scmGroupsEl.innerHTML = '';
+  renderScmGroup('Staged Changes', staged, true);
+  renderScmGroup('Changes', changed, false);
+  renderScmGroup('Untracked Files', untracked, false, true);
+
+  // Also merge any extension-provided SCM state
+  try {
+    const extScm = await invoke('get_scm_state');
+    for (const sc of Object.values(extScm)) {
+      for (const group of sc.resource_groups) {
+        if (group.resources.length === 0) continue;
+        const groupEl = document.createElement('div');
+        groupEl.className = 'scm-group';
+        groupEl.innerHTML = `<div class="scm-group-header"><span><span class="scm-group-toggle">▾</span>${escapeHtml(sc.label)}: ${escapeHtml(group.label)}</span><span class="scm-group-count">${group.resources.length}</span></div><div class="scm-group-items"></div>`;
+        const itemsEl = groupEl.querySelector('.scm-group-items');
+        for (const res of group.resources) {
+          const item = document.createElement('div');
+          item.className = 'scm-item';
+          const letter = res.decoration_letter || 'M';
+          item.innerHTML = `<span class="scm-item-letter ${letter}" title="${escapeHtml(res.decoration_tooltip || '')}">${letter}</span><span class="scm-item-path">${escapeHtml(res.uri)}</span>`;
+          itemsEl.appendChild(item);
+        }
+        scmGroupsEl.appendChild(groupEl);
+      }
+    }
+  } catch { /* extensions may not be connected */ }
+}
+
+function renderScmGroup(label, entries, isStaged, isUntracked = false) {
+  if (!entries.length) return;
+  const groupEl = document.createElement('div');
+  groupEl.className = 'scm-group';
+
+  const header = document.createElement('div');
+  header.className = 'scm-group-header';
+  header.innerHTML = `<span><span class="scm-group-toggle">▾</span>${escapeHtml(label)}</span><span class="scm-group-count">${entries.length}</span>`;
+  groupEl.appendChild(header);
+
+  const itemsEl = document.createElement('div');
+  itemsEl.className = 'scm-group-items';
+
+  for (const entry of entries) {
+    const statusChar = isStaged ? entry.index_status : (isUntracked ? 'U' : entry.worktree_status);
+    const letterClass = statusChar === 'M' ? 'M' : statusChar === 'A' ? 'A' : statusChar === 'D' ? 'D' : statusChar === 'R' ? 'R' : 'U';
+    const item = document.createElement('div');
+    item.className = 'scm-item';
+    item.setAttribute('tabindex', '0');
+    item.setAttribute('role', 'button');
+    item.setAttribute('aria-label', `${label}: ${entry.path}`);
+
+    const actionsHtml = isStaged
+      ? `<span class="scm-item-actions"><button title="Unstage" aria-label="Unstage ${escapeHtml(entry.path)}">−</button></span>`
+      : isUntracked
+        ? `<span class="scm-item-actions"><button title="Stage" aria-label="Stage ${escapeHtml(entry.path)}">+</button></span>`
+        : `<span class="scm-item-actions"><button title="Stage" aria-label="Stage ${escapeHtml(entry.path)}">+</button><button title="Discard" aria-label="Discard ${escapeHtml(entry.path)}">↩</button></span>`;
+
+    item.innerHTML = `<span class="scm-item-letter ${letterClass}">${letterClass}</span><span class="scm-item-path" title="${escapeHtml(entry.path)}">${escapeHtml(entry.path.split('/').pop() || entry.path)}</span>${actionsHtml}`;
+
+    // Click on item → open diff viewer
+    item.addEventListener('click', (e) => {
+      const btn = e.target.closest('.scm-item-actions button');
+      if (btn) {
+        e.stopPropagation();
+        const title = btn.title;
+        if (title === 'Stage' || title === 'Unstage') {
+          scmActionStageToggle(entry.path, title === 'Unstage');
+        } else if (title === 'Discard') {
+          scmActionDiscard(entry.path);
+        }
+        return;
+      }
+      openDiffViewer(entry.path, isStaged, isUntracked);
+    });
+    item.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDiffViewer(entry.path, isStaged, isUntracked); }
+    });
+    itemsEl.appendChild(item);
+  }
+
+  // Collapse/expand group
+  header.addEventListener('click', () => {
+    const toggle = header.querySelector('.scm-group-toggle');
+    const collapsed = itemsEl.style.display === 'none';
+    itemsEl.style.display = collapsed ? '' : 'none';
+    toggle.textContent = collapsed ? '▾' : '▸';
+  });
+
+  groupEl.appendChild(itemsEl);
+  scmGroupsEl.appendChild(groupEl);
+}
+
+async function openDiffViewer(filePath, isStaged, isUntracked) {
+  if (!explorerRoot || !diffViewerEl) return;
+  diffCurrentFile = { path: filePath, staged: isStaged };
+  diffViewerTitle.textContent = filePath;
+  diffViewerEl.classList.remove('diff-viewer-hidden');
+
+  // Show/hide stage/unstage button
+  if (diffStageBtn) diffStageBtn.style.display = isStaged ? 'none' : '';
+  if (diffUnstageBtn) diffUnstageBtn.style.display = isStaged ? '' : 'none';
+  if (diffDiscardBtn) diffDiscardBtn.style.display = isUntracked ? 'none' : '';
+
+  diffContentEl.innerHTML = '<div style="padding:16px;color:#888;">Loading diff...</div>';
+  try {
+    const diff = await invoke('git_diff_file', {
+      workspacePath: explorerRoot,
+      filePath,
+      staged: isStaged,
+    });
+    renderDiff(diff);
+  } catch (e) {
+    diffContentEl.innerHTML = `<div style="padding:16px;color:#f14c4c;">Error loading diff: ${escapeHtml(String(e))}</div>`;
+  }
+}
+
+function renderDiff(diffText) {
+  if (!diffContentEl) return;
+  if (!diffText.trim()) {
+    diffContentEl.innerHTML = '<div style="padding:16px;color:#888;">No changes.</div>';
+    return;
+  }
+  const lines = diffText.split('\n');
+  const frag = document.createDocumentFragment();
+  let lineNum = 0;
+  for (const raw of lines) {
+    const row = document.createElement('div');
+    row.className = 'diff-line';
+    const numEl = document.createElement('span');
+    numEl.className = 'diff-line-num';
+    const contentEl = document.createElement('span');
+    contentEl.className = 'diff-line-content';
+
+    if (raw.startsWith('+++') || raw.startsWith('---')) {
+      row.classList.add('file-header');
+      numEl.textContent = '';
+      contentEl.textContent = raw;
+    } else if (raw.startsWith('@@')) {
+      row.classList.add('meta');
+      numEl.textContent = '';
+      contentEl.textContent = raw;
+      // Parse new start line from @@ -a,b +c,d @@
+      const m = raw.match(/@@ [^+]*\+(\d+)/);
+      lineNum = m ? parseInt(m[1], 10) - 1 : 0;
+    } else if (raw.startsWith('+')) {
+      row.classList.add('added');
+      lineNum++;
+      numEl.textContent = lineNum;
+      contentEl.textContent = raw;
+    } else if (raw.startsWith('-')) {
+      row.classList.add('removed');
+      numEl.textContent = '';
+      contentEl.textContent = raw;
+    } else {
+      lineNum++;
+      numEl.textContent = lineNum;
+      contentEl.textContent = raw;
+    }
+    row.appendChild(numEl);
+    row.appendChild(contentEl);
+    frag.appendChild(row);
+  }
+  diffContentEl.innerHTML = '';
+  diffContentEl.appendChild(frag);
+}
+
+function closeDiffViewer() {
+  if (diffViewerEl) diffViewerEl.classList.add('diff-viewer-hidden');
+  diffCurrentFile = null;
+}
+
+async function scmActionStageToggle(filePath, isUnstage) {
+  if (!explorerRoot) return;
+  try {
+    if (isUnstage) {
+      await invoke('git_unstage', { workspacePath: explorerRoot, filePath });
+    } else {
+      await invoke('git_stage', { workspacePath: explorerRoot, filePath });
+    }
+    await renderScmPanel();
+  } catch (e) {
+    console.error('SCM stage/unstage error:', e);
+  }
+}
+
+async function scmActionDiscard(filePath) {
+  if (!explorerRoot) return;
+  // Use Tauri dialog instead of browser confirm() which may be blocked in WebView
+  let confirmed = false;
+  try {
+    confirmed = await window.__TAURI__.dialog.confirm(
+      `Discard changes to "${filePath}"? This cannot be undone.`,
+      { title: 'Discard Changes', kind: 'warning' }
+    );
+  } catch {
+    // Fallback if dialog API unavailable
+    confirmed = window.confirm(`Discard changes to "${filePath}"? This cannot be undone.`);
+  }
+  if (!confirmed) return;
+  try {
+    await invoke('git_discard', { workspacePath: explorerRoot, filePath });
+    await renderScmPanel();
+  } catch (e) {
+    console.error('SCM discard error:', e);
+  }
+}
+
+diffViewerClose?.addEventListener('click', closeDiffViewer);
+
+diffStageBtn?.addEventListener('click', async () => {
+  if (diffCurrentFile && explorerRoot) {
+    await scmActionStageToggle(diffCurrentFile.path, false);
+    closeDiffViewer();
+  }
+});
+diffUnstageBtn?.addEventListener('click', async () => {
+  if (diffCurrentFile && explorerRoot) {
+    await scmActionStageToggle(diffCurrentFile.path, true);
+    closeDiffViewer();
+  }
+});
+diffDiscardBtn?.addEventListener('click', async () => {
+  if (diffCurrentFile && explorerRoot) {
+    await scmActionDiscard(diffCurrentFile.path);
+    closeDiffViewer();
+  }
+});
+
+// Close diff viewer on Escape
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && diffViewerEl && !diffViewerEl.classList.contains('diff-viewer-hidden')) {
+    e.stopPropagation();
+    closeDiffViewer();
+  }
+}, true);
+
+// Commit button
+scmCommitBtn?.addEventListener('click', async () => {
+  const msg = scmCommitInput?.value.trim();
+  if (!msg) { scmCommitInput?.focus(); return; }
+  if (!explorerRoot) return;
+  try {
+    await invoke('git_commit', { workspacePath: explorerRoot, message: msg });
+    scmCommitInput.value = '';
+    await renderScmPanel();
+  } catch (e) {
+    alert('Commit failed: ' + String(e));
+  }
+});
+
+// Ctrl+Enter to commit from textarea
+scmCommitInput?.addEventListener('keydown', (e) => {
+  if (e.ctrlKey && e.key === 'Enter') {
+    e.preventDefault();
+    scmCommitBtn?.click();
+  }
+});
+
+// Poll SCM status every 5s when the panel is visible
+const scmPollInterval = setInterval(async () => {
+  if (activePanel === 'scm' && explorerRoot) {
+    await renderScmPanel();
+  }
+}, 5000);
 
 // ─── Cleanup ─────────────────────────────────────────────────
 
-const _ccIntervals = [statusBarInterval, outputInterval, diagnosticsInterval, extHostInterval, notifInterval, uiReqInterval, webviewInterval];
+const _ccIntervals = [statusBarInterval, outputInterval, diagnosticsInterval, extHostInterval, notifInterval, uiReqInterval, webviewInterval, terminalEventsInterval, decorationsInterval, debugStartInterval, debugEventsInterval, workspaceEditInterval, treeViewEventsInterval, showTextDocumentInterval, scmPollInterval, commentThreadsInterval];
 
 window.addEventListener('beforeunload', () => {
   _ccIntervals.forEach(id => clearInterval(id));

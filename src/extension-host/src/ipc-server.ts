@@ -68,7 +68,13 @@ export class IpcServer {
             }
           }, AUTH_TIMEOUT_MS);
         } else {
-          // No token configured — skip auth (development mode)
+          // No token configured — all connections are accepted without authentication.
+          // WARNING: this should only occur in development. In production the Tauri
+          // backend always generates a token and passes it via CORECODE_IPC_TOKEN.
+          console.error(
+            "[IPC] SECURITY WARNING: no auth token set — accepting all connections without authentication. " +
+            "Set CORECODE_IPC_TOKEN to enable authentication."
+          );
           this.authenticated = true;
         }
 

@@ -29,6 +29,17 @@ enum EditOp {
     Group(Vec<EditOp>),
 }
 
+/// In-memory undo/redo manager for a single document buffer.
+///
+/// # Persistence limitation
+/// The undo and redo stacks are held **entirely in memory** and are not written
+/// to disk at any point.  If the application exits (cleanly or via crash) the
+/// undo history for all open documents is permanently lost.  The file contents
+/// themselves are saved by the user explicitly; only the edit history is lost.
+///
+/// Future work: serialise the undo stacks to a per-session directory
+/// (e.g. `~/.config/corecode/session/<buffer_hash>.undo`) so that history
+/// survives restarts.  Tracked as a known limitation in STATUS.md.
 struct UndoManager {
     undo_stack: VecDeque<EditOp>,
     redo_stack: Vec<EditOp>,
@@ -423,6 +434,13 @@ impl DocumentBuffer {
 
     // --- Find ---
 
+    /// Search for all occurrences of `query` in the buffer.
+    ///
+    /// # Performance note
+    /// `rope.to_string()` materialises the entire document into a single heap
+    /// allocation.  For files larger than a few MB this is the dominant cost.
+    /// A future optimisation is to iterate `Rope::chunks()` and implement a
+    /// cross-chunk Boyer-Moore search to avoid the allocation entirely.
     pub fn find_all(&self, query: &str, case_sensitive: bool) -> Vec<FindMatch> {
         if query.is_empty() {
             return vec![];
@@ -688,6 +706,21 @@ impl WorkspaceState {
         // Work around borrow checker
         let path = self.active_path.clone();
         path.and_then(move |p| self.buffers.get_mut(&p))
+    }
+
+    /// Get a mutable reference to a buffer by path (any open buffer, not just active).
+    pub fn get_buffer_mut_by_path(&mut self, path: &Path) -> Option<&mut DocumentBuffer> {
+        self.buffers.get_mut(path)
+    }
+
+    /// Check if a buffer is open for the given path.
+    pub fn has_buffer(&self, path: &Path) -> bool {
+        self.buffers.contains_key(path)
+    }
+
+    /// Return the active buffer's filesystem path as a string, if any.
+    pub fn active_path(&self) -> Option<&PathBuf> {
+        self.active_path.as_ref()
     }
 
     /// Reparse the active buffer using the shared parser.

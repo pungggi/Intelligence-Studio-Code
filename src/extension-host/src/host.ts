@@ -85,6 +85,24 @@ async function main(): Promise<void> {
       }
       return;
     }
+    // Multi-workspace: register/unregister workspace roots so extensions see the
+    // correct vscode.workspace.workspaceFolders for each open window.
+    if (msg.method === "workspace/register") {
+      const p = msg.params as { workspace_id: string; root_path: string };
+      if (p?.workspace_id && p?.root_path) {
+        apiShim.registerWorkspace(p.workspace_id, p.root_path);
+        console.log(`[ExtensionHost] Workspace registered: ${p.workspace_id} → ${p.root_path}`);
+      }
+      return;
+    }
+    if (msg.method === "workspace/unregister") {
+      const p = msg.params as { workspace_id: string };
+      if (p?.workspace_id) {
+        apiShim.unregisterWorkspace(p.workspace_id);
+        console.log(`[ExtensionHost] Workspace unregistered: ${p.workspace_id}`);
+      }
+      return;
+    }
     apiShim.handleFrontendMessage(msg);
   });
 
