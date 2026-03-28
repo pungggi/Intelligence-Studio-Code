@@ -1,50 +1,103 @@
 /**
- * IPC Server - Unix Domain Socket server for communication with the native frontend.
+ * IPC Server - TCP server for communication with the native frontend.
  *
- * Handles:
- * - Connection lifecycle (accept, disconnect, reconnect)
- * - FlatBuffers message framing
- * - Message routing
+ * Cross-platform: uses TCP on localhost instead of Unix Domain Sockets.
+ * Protocol: Length-prefixed JSON frames.
+ * Each frame is [4 bytes LE length][JSON payload].
+ *
+ * Security: Requires authentication via a shared secret token.
+ * The first message on any new connection must be an `ipc/auth` message
+ * containing the expected token. Unauthenticated connections are rejected.
  */
 
 import { createServer, Server, Socket } from "net";
-import { unlinkSync, existsSync } from "fs";
 
-export type MessageHandler = (message: Buffer) => void;
+const IPC_HOST = "127.0.0.1";
+const IPC_PORT = parseInt(process.env.CORECODE_IPC_PORT ?? "0", 10);
+
+/** Maximum IPC frame size (10 MB). Must match Rust side. */
+const MAX_FRAME_SIZE = 10 * 1024 * 1024;
+
+/** Timeout for authentication handshake (5 seconds). */
+const AUTH_TIMEOUT_MS = 5000;
+
+export interface IpcMessage {
+  method: string;
+  params?: Record<string, unknown>;
+}
+
+export type MessageHandler = (message: IpcMessage) => void;
 
 export class IpcServer {
   private server: Server | null = null;
   private client: Socket | null = null;
   private messageHandler: MessageHandler | null = null;
+  private bufferChunks: Buffer[] = [];
+  private bufferLength: number = 0;
+  private host: string;
+  private port: number;
+  private authToken: string;
+  private authenticated: boolean = false;
+  private authTimer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(private socketPath: string) {}
+  constructor(host?: string, port?: number, authToken?: string) {
+    this.host = host ?? IPC_HOST;
+    this.port = port ?? IPC_PORT;
+    this.authToken = authToken ?? "";
+  }
 
   async start(): Promise<void> {
-    // Clean up stale socket file
-    if (existsSync(this.socketPath)) {
-      unlinkSync(this.socketPath);
-    }
-
     return new Promise((resolve, reject) => {
-      this.server = createServer((socket) => {
+      this.server = createServer((socket: Socket) => {
         console.log("[IPC] Frontend connected");
+        if (this.client && !this.client.destroyed) {
+          console.warn("[IPC] Closing previous client connection before accepting new one");
+          this.client.destroy();
+        }
         this.client = socket;
+        this.authenticated = false;
+        this.bufferChunks = [];
+        this.bufferLength = 0;
 
-        socket.on("data", (data) => {
-          this.messageHandler?.(data);
+        // Start auth timeout — disconnect if not authenticated in time
+        if (this.authToken) {
+          this.authTimer = setTimeout(() => {
+            if (!this.authenticated) {
+              console.error("[IPC] Auth timeout — disconnecting unauthenticated client");
+              socket.destroy();
+            }
+          }, AUTH_TIMEOUT_MS);
+        } else {
+          // No token configured — all connections are accepted without authentication.
+          // WARNING: this should only occur in development. In production the Tauri
+          // backend always generates a token and passes it via CORECODE_IPC_TOKEN.
+          console.error(
+            "[IPC] SECURITY WARNING: no auth token set — accepting all connections without authentication. " +
+            "Set CORECODE_IPC_TOKEN to enable authentication."
+          );
+          this.authenticated = true;
+        }
+
+        socket.on("data", (data: Buffer) => {
+          this.onData(data);
         });
 
         socket.on("close", () => {
           console.log("[IPC] Frontend disconnected");
           this.client = null;
+          this.authenticated = false;
+          if (this.authTimer) {
+            clearTimeout(this.authTimer);
+            this.authTimer = null;
+          }
         });
 
-        socket.on("error", (err) => {
+        socket.on("error", (err: Error) => {
           console.error("[IPC] Socket error:", err.message);
         });
       });
 
-      this.server.listen(this.socketPath, () => {
+      this.server.listen(this.port, this.host, () => {
         resolve();
       });
 
@@ -52,23 +105,121 @@ export class IpcServer {
     });
   }
 
+  private compactBuffer(): Buffer {
+    if (this.bufferChunks.length === 0) return Buffer.alloc(0);
+    if (this.bufferChunks.length === 1) return this.bufferChunks[0];
+    const buf = Buffer.concat(this.bufferChunks, this.bufferLength);
+    this.bufferChunks = [buf];
+    return buf;
+  }
+
+  private onData(data: Buffer): void {
+    this.bufferChunks.push(data);
+    this.bufferLength += data.length;
+
+    // Process complete frames
+    while (this.bufferLength >= 4) {
+      const buffer = this.compactBuffer();
+      const frameLen = buffer.readUInt32LE(0);
+
+      // Reject oversized frames
+      if (frameLen > MAX_FRAME_SIZE) {
+        console.error(
+          `[IPC] Frame too large (${frameLen} bytes, max ${MAX_FRAME_SIZE}), disconnecting client`
+        );
+        this.client?.destroy();
+        this.bufferChunks = [];
+        this.bufferLength = 0;
+        return;
+      }
+
+      if (this.bufferLength < 4 + frameLen) {
+        break; // Incomplete frame, wait for more data
+      }
+
+      const payload = buffer.subarray(4, 4 + frameLen);
+      const remaining = buffer.subarray(4 + frameLen);
+      this.bufferChunks = remaining.length > 0 ? [remaining] : [];
+      this.bufferLength = remaining.length;
+
+      try {
+        const msg: IpcMessage = JSON.parse(payload.toString("utf-8"));
+
+        // Gate on authentication: first message must be ipc/auth with correct token
+        if (!this.authenticated) {
+          if (msg.method === "ipc/auth" && this.authToken) {
+            const providedToken = (msg.params as { token?: string })?.token;
+            if (providedToken && providedToken === this.authToken) {
+              this.authenticated = true;
+              if (this.authTimer) {
+                clearTimeout(this.authTimer);
+                this.authTimer = null;
+              }
+              console.log("[IPC] Client authenticated successfully");
+            } else {
+              console.error("[IPC] Auth failed — invalid token, disconnecting");
+              this.client?.destroy();
+              this.bufferChunks = [];
+              this.bufferLength = 0;
+              return;
+            }
+          } else {
+            console.error("[IPC] Received message before authentication, disconnecting");
+            this.client?.destroy();
+            this.bufferChunks = [];
+            this.bufferLength = 0;
+            return;
+          }
+          continue; // Don't forward auth message to handler
+        }
+
+        this.messageHandler?.(msg);
+      } catch (err) {
+        console.error("[IPC] Failed to parse message:", err);
+      }
+    }
+
+    // Guard against unbounded accumulation
+    if (this.bufferLength > MAX_FRAME_SIZE + 4) {
+      console.error("[IPC] Accumulated buffer too large, disconnecting client");
+      this.client?.destroy();
+      this.bufferChunks = [];
+      this.bufferLength = 0;
+    }
+  }
+
   onMessage(handler: MessageHandler): void {
     this.messageHandler = handler;
   }
 
-  send(data: Buffer | Uint8Array): void {
-    if (this.client && !this.client.destroyed) {
-      this.client.write(data);
+  /** Send a JSON message with length-prefix framing. */
+  send(msg: IpcMessage): void {
+    if (!this.client || this.client.destroyed) return;
+
+    const json = Buffer.from(JSON.stringify(msg), "utf-8");
+
+    if (json.length > MAX_FRAME_SIZE) {
+      console.error(`[IPC] Outgoing message too large (${json.length} bytes), dropping`);
+      return;
     }
+
+    const header = Buffer.alloc(4);
+    header.writeUInt32LE(json.length, 0);
+    const ok = this.client.write(Buffer.concat([header, json]));
+    if (!ok) {
+      console.warn("[IPC] Write backpressure detected, kernel buffer full");
+    }
+  }
+
+  isConnected(): boolean {
+    return this.client !== null && !this.client.destroyed;
   }
 
   async stop(): Promise<void> {
     this.client?.destroy();
+    if (!this.server) return;
     return new Promise((resolve) => {
-      this.server?.close(() => {
-        if (existsSync(this.socketPath)) {
-          unlinkSync(this.socketPath);
-        }
+      this.server!.close(() => {
         resolve();
       });
     });

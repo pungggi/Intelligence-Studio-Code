@@ -9,11 +9,9 @@
     "start": "node dist/host.js",
     "test": "node --test src/**/*.test.ts"
   },
-  "dependencies": {
-    "flatbuffers": "^24.3.0"
-  },
+  "dependencies": {},
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^20.19.37",
     "typescript": "^5.4.0"
   }
 }

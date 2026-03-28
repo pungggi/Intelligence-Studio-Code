@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CoreCode</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="lib/xterm/xterm.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="titlebar">
+      <span id="file-name">CoreCode</span>
+      <span id="language-badge"></span>
+      <span id="status"></span>
+    </div>
+
+    <!-- M5: Tab bar for multi-file editing -->
+    <div id="tab-bar" role="tablist" aria-label="Open editors">
+      <div id="tabs"></div>
+    </div>
+
+    <div id="main-area">
+      <!-- M8: Activity bar for switching sidebar panels -->
+      <div id="activity-bar" role="toolbar" aria-label="Activity bar">
+        <button class="activity-btn active" data-panel="explorer" title="Explorer (Ctrl+B)" aria-label="Explorer" aria-pressed="true">&#128193;</button>
+        <button class="activity-btn" data-panel="scm" title="Source Control (Ctrl+Shift+G)" aria-label="Source Control" aria-pressed="false">&#10003;</button>
+        <button class="activity-btn" data-panel="extensions" title="Extensions (Ctrl+Shift+X)" aria-label="Extensions" aria-pressed="false">&#9881;</button>
+        <button class="activity-btn" data-panel="settings" title="Settings (Ctrl+,)" aria-label="Settings" aria-pressed="false">&#9776;</button>
+        <button class="activity-btn" data-panel="debug" title="Run and Debug (Ctrl+Shift+D)" aria-label="Run and Debug" aria-pressed="false">&#9654;</button>
+        <button class="activity-btn" data-panel="treeviews" title="Extension Views" aria-label="Extension Views" aria-pressed="false">&#127807;</button>
+      </div>
+
+      <!-- M5: File explorer sidebar -->
+      <div id="sidebar" class="sidebar-hidden">
+        <div id="sidebar-header">
+          <span id="sidebar-title">Explorer</span>
+          <button id="sidebar-close" title="Close sidebar">&times;</button>
+        </div>
+        <div id="file-tree"></div>
+      </div>
+
+      <!-- SCM sidebar panel -->
+      <div id="scm-panel" class="sidebar-hidden">
+        <div id="sidebar-header-scm">
+          <span>Source Control</span>
+          <button id="scm-panel-close" title="Close">&times;</button>
+        </div>
+        <div id="scm-commit-area">
+          <textarea id="scm-commit-input" placeholder="Message (Ctrl+Enter to commit)" rows="3" aria-label="Commit message"></textarea>
+          <button id="scm-commit-btn" title="Commit staged changes">&#10003; Commit</button>
+        </div>
+        <div id="scm-groups"></div>
+      </div>
+
+      <!-- M8: Extensions sidebar panel -->
+      <div id="extensions-panel" class="sidebar-hidden">
+        <div id="sidebar-header-ext">
+          <span id="ext-panel-title">Extensions</span>
+          <button id="ext-panel-close" title="Close">&times;</button>
+        </div>
+        <div id="ext-search-box">
+          <input id="ext-search-input" type="text" placeholder="Search extensions..." autocomplete="off" />
+        </div>
+        <div id="ext-tabs">
+          <button class="ext-tab active" data-tab="marketplace">Marketplace</button>
+          <button class="ext-tab" data-tab="installed">Installed</button>
+        </div>
+        <div id="ext-list"></div>
+      </div>
+
+      <!-- M8: Settings sidebar panel -->
+      <div id="settings-panel" class="sidebar-hidden">
+        <div id="sidebar-header-settings">
+          <span id="settings-panel-title">Settings</span>
+          <button id="settings-panel-close" title="Close">&times;</button>
+        </div>
+        <div id="settings-search-box">
+          <input id="settings-search-input" type="text" placeholder="Search settings..." autocomplete="off" />
+        </div>
+        <div id="settings-list"></div>
+      </div>
+
+      <!-- DAP: Run & Debug sidebar panel -->
+      <div id="debug-panel" class="sidebar-hidden">
+        <div id="sidebar-header-debug">
+          <span id="debug-panel-title">Run and Debug</span>
+          <button id="debug-panel-close" title="Close">&times;</button>
+        </div>
+        <div id="debug-toolbar">
+          <button id="debug-btn-start" title="Start Debugging (F5)" aria-label="Start Debugging">&#9654; Start</button>
+          <button id="debug-btn-continue" title="Continue (F5)" aria-label="Continue" style="display:none;">&#9654;</button>
+          <button id="debug-btn-pause" title="Pause" aria-label="Pause" style="display:none;">&#10073;&#10073;</button>
+          <button id="debug-btn-stepover" title="Step Over (F10)" aria-label="Step Over" style="display:none;">&#8594;</button>
+          <button id="debug-btn-stepin" title="Step Into (F11)" aria-label="Step Into" style="display:none;">&#8600;</button>
+          <button id="debug-btn-stepout" title="Step Out (Shift+F11)" aria-label="Step Out" style="display:none;">&#8598;</button>
+          <button id="debug-btn-restart" title="Restart (Ctrl+Shift+F5)" aria-label="Restart" style="display:none;">&#8635;</button>
+          <button id="debug-btn-stop" title="Stop (Shift+F5)" aria-label="Stop" style="display:none;">&#9632;</button>
+        </div>
+        <div class="debug-section">
+          <div class="debug-section-header">CALL STACK</div>
+          <div id="debug-callstack"></div>
+        </div>
+        <div class="debug-section">
+          <div class="debug-section-header">VARIABLES</div>
+          <div id="debug-variables"></div>
+        </div>
+        <div class="debug-section">
+          <div class="debug-section-header">BREAKPOINTS</div>
+          <div id="debug-breakpoints-list"></div>
+        </div>
+      </div>
+
+      <!-- Extension Tree Views panel -->
+      <div id="treeviews-panel" class="sidebar-hidden">
+        <div id="sidebar-header-treeviews">
+          <span>Extension Views</span>
+          <button id="treeviews-panel-close" title="Close">&times;</button>
+        </div>
+        <div id="treeviews-container">
+          <div id="treeviews-empty" style="padding:8px;color:#888;font-size:12px;">No extension views registered.</div>
+        </div>
+      </div>
+
+      <div id="editor-area" role="main" aria-label="Code editor">
+        <div id="editor-container">
+          <div id="gutter" aria-hidden="true"><canvas id="gutter-canvas"></canvas></div>
+          <div id="editor" tabindex="0" role="textbox" aria-multiline="true" aria-label="Code editor" aria-live="off">
+            <canvas id="editor-canvas"></canvas>
+            <div id="scroll-sizer"></div>
+          </div>
+        </div>
+
+        <!-- M5: Minimap -->
+        <div id="minimap" class="minimap-hidden">
+          <canvas id="minimap-canvas"></canvas>
+          <div id="minimap-viewport"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Find/Replace Bar -->
+    <div id="find-bar" class="find-hidden" role="search" aria-label="Find and replace">
+      <div id="find-row">
+        <input id="find-input" type="text" placeholder="Find..." autocomplete="off" aria-label="Find" />
+        <span id="find-count" aria-live="polite" aria-atomic="true"></span>
+        <button id="find-prev" title="Previous (Shift+Enter)" aria-label="Previous match">&uarr;</button>
+        <button id="find-next" title="Next (Enter)" aria-label="Next match">&darr;</button>
+        <label id="find-case-label"><input id="find-case" type="checkbox" aria-label="Match case" /> Aa</label>
+        <button id="find-toggle-replace" title="Toggle Replace" aria-label="Toggle replace">&#x25BC;</button>
+        <button id="find-close" title="Close (Escape)" aria-label="Close find bar">&times;</button>
+      </div>
+      <div id="replace-row" class="find-hidden">
+        <input id="replace-input" type="text" placeholder="Replace..." autocomplete="off" />
+        <button id="replace-one" title="Replace">Replace</button>
+        <button id="replace-all" title="Replace All">All</button>
+      </div>
+    </div>
+
+    <!-- Bottom Panel: Output + Terminal (toggle with Ctrl+`) -->
+    <div id="bottom-panel" class="bottom-panel-hidden">
+      <div id="bottom-panel-header">
+        <div id="bottom-panel-tabs">
+          <button class="bottom-tab" data-panel="output">Output</button>
+          <button class="bottom-tab active" data-panel="terminal">Terminal</button>
+          <button class="bottom-tab" data-panel="debug-console">Debug Console</button>
+        </div>
+        <div id="bottom-panel-actions">
+          <button id="terminal-new" title="New Terminal">+</button>
+          <button id="bottom-panel-close" title="Close">&times;</button>
+        </div>
+      </div>
+
+      <!-- Output sub-panel -->
+      <div id="output-panel" class="bottom-sub-panel" style="display:none;">
+        <div id="output-sub-header">
+          <select id="output-channel-select"></select>
+          <button id="output-clear" title="Clear">Clear</button>
+        </div>
+        <div id="output-content"></div>
+      </div>
+
+      <!-- Terminal sub-panel -->
+      <div id="terminal-panel" class="bottom-sub-panel">
+        <div id="terminal-tabs"></div>
+        <div id="terminal-container"></div>
+      </div>
+
+      <!-- Debug Console sub-panel -->
+      <div id="debug-console-panel" class="bottom-sub-panel" style="display:none;">
+        <div id="debug-console-content"></div>
+      </div>
+    </div>
+
+    <div id="statusbar">
+      <span id="cursor-pos">Ln 1, Col 1</span>
+      <span id="file-info"></span>
+      <span id="diagnostics-count"></span>
+      <span id="ext-status-bar-items"></span>
+      <span id="ext-host-status">Extension Host: Starting...</span>
+    </div>
+  </div>
+
+  <!-- M6: Autocomplete Popup -->
+  <div id="autocomplete-popup" class="lsp-hidden">
+    <div id="autocomplete-list"></div>
+    <div id="autocomplete-detail"></div>
+  </div>
+
+  <!-- M6: Hover Tooltip -->
+  <div id="hover-tooltip" class="lsp-hidden">
+    <div id="hover-content"></div>
+  </div>
+
+  <!-- M6: Signature Help -->
+  <div id="signature-help" class="lsp-hidden">
+    <div id="signature-label"></div>
+    <div id="signature-docs"></div>
+  </div>
+
+  <!-- M6: Code Actions Menu -->
+  <div id="code-actions-menu" class="lsp-hidden">
+    <div id="code-actions-list"></div>
+  </div>
+
+  <!-- M6: References Panel -->
+  <div id="references-panel" class="lsp-hidden">
+    <div id="references-header">
+      <span id="references-title">References</span>
+      <button id="references-close">&times;</button>
+    </div>
+    <div id="references-list"></div>
+  </div>
+
+  <!-- M6: Document Symbols Outline (Ctrl+Shift+O) -->
+  <div id="symbols-palette" class="palette-hidden">
+    <div id="symbols-backdrop"></div>
+    <div id="symbols-panel">
+      <input id="symbols-input" type="text" placeholder="Go to symbol..." autocomplete="off" />
+      <div id="symbols-list"></div>
+    </div>
+  </div>
+
+  <!-- Comment Thread Popup -->
+  <div id="comment-thread-popup" class="comment-popup-hidden" role="dialog" aria-label="Comment thread" aria-modal="false">
+    <div id="comment-thread-popup-header">
+      <span id="comment-thread-popup-label"></span>
+      <button id="comment-thread-popup-close" aria-label="Close comment thread">&times;</button>
+    </div>
+    <div id="comment-thread-popup-body"></div>
+  </div>
+
+  <!-- Diff Viewer Overlay -->
+  <div id="diff-viewer" class="diff-viewer-hidden" role="dialog" aria-label="Diff viewer" aria-modal="true">
+    <div id="diff-viewer-header">
+      <span id="diff-viewer-title">Diff</span>
+      <div id="diff-viewer-actions">
+        <button id="diff-stage-btn" title="Stage file">+ Stage</button>
+        <button id="diff-unstage-btn" title="Unstage file" style="display:none;">− Unstage</button>
+        <button id="diff-discard-btn" title="Discard changes">&#10006; Discard</button>
+        <button id="diff-viewer-close" title="Close (Escape)">&times;</button>
+      </div>
+    </div>
+    <div id="diff-content"></div>
+  </div>
+
+  <!-- Command Palette Overlay -->
+  <div id="command-palette" class="palette-hidden" role="dialog" aria-label="Command palette" aria-modal="true">
+    <div id="palette-backdrop"></div>
+    <div id="palette-panel">
+      <input id="palette-input" type="text" placeholder="Type a command..." autocomplete="off" aria-label="Command search" aria-autocomplete="list" aria-controls="palette-list" />
+      <div id="palette-list" role="listbox" aria-label="Commands"></div>
+    </div>
+  </div>
+
+  <!-- Accessibility: hidden textarea mirrors the current line so screen readers
+       can read the code content. Updated by editor.js on every cursor move. -->
+  <textarea
+    id="a11y-editor-proxy"
+    class="sr-only"
+    aria-label="Current editor line"
+    tabindex="-1"
+    readonly
+    autocomplete="off"
+    autocorrect="off"
+    autocapitalize="off"
+    spellcheck="false"
+  ></textarea>
+
+  <!-- Accessibility: polite live region for cursor-movement and edit announcements. -->
+  <div
+    id="a11y-announcer"
+    class="sr-only"
+    aria-live="polite"
+    aria-atomic="true"
+    aria-relevant="additions text"
+  ></div>
+
+  <script src="lib/xterm/xterm.js"></script>
+  <script src="lib/xterm/addon-fit.js"></script>
+  <script src="editor.js"></script>
+</body>
+</html>
