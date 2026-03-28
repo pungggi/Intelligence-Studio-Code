@@ -8,6 +8,9 @@ use ropey::Rope;
 
 /// Extract highlight tokens for a specific line from the syntax tree.
 pub fn highlight_line(tree: &tree_sitter::Tree, rope: &Rope, line_idx: usize) -> Vec<Token> {
+    if line_idx >= rope.len_lines() {
+        return vec![];
+    }
     let root = tree.root_node();
     let line_start_byte = rope.line_to_byte(line_idx);
     let line_end_byte = if line_idx + 1 < rope.len_lines() {
@@ -19,7 +22,7 @@ pub fn highlight_line(tree: &tree_sitter::Tree, rope: &Rope, line_idx: usize) ->
     let mut tokens = Vec::new();
     collect_tokens_in_range(root, line_start_byte, line_end_byte, line_start_byte, &mut tokens);
 
-    // Sort by start position and deduplicate overlaps
+    // Sort by start position
     tokens.sort_by_key(|t| t.start);
     tokens
 }

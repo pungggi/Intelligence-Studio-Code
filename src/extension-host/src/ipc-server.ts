@@ -11,6 +11,7 @@
  */
 
 import { createServer, Server, Socket } from "net";
+import { timingSafeEqual } from "node:crypto";
 
 const IPC_HOST = "127.0.0.1";
 const IPC_PORT = parseInt(process.env.CORECODE_IPC_PORT ?? "0", 10);
@@ -149,7 +150,10 @@ export class IpcServer {
         if (!this.authenticated) {
           if (msg.method === "ipc/auth" && this.authToken) {
             const providedToken = (msg.params as { token?: string })?.token;
-            if (providedToken && providedToken === this.authToken) {
+            const tokensMatch = providedToken != null &&
+              providedToken.length === this.authToken.length &&
+              timingSafeEqual(Buffer.from(providedToken), Buffer.from(this.authToken));
+            if (tokensMatch) {
               this.authenticated = true;
               if (this.authTimer) {
                 clearTimeout(this.authTimer);

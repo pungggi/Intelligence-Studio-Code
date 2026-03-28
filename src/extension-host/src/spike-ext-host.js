@@ -256,11 +256,14 @@ class ExtensionLoader {
       exports: vscodeApi,
     };
 
-    // Load the extension module
-    const extensionModule = require(mainPath);
-
-    // Restore original resolve
-    module.constructor._resolveFilename = originalResolveFilename;
+    // Load the extension module — restore resolver and clean up cache in all cases
+    let extensionModule;
+    try {
+      extensionModule = require(mainPath);
+    } finally {
+      module.constructor._resolveFilename = originalResolveFilename;
+      delete require.cache['__vscode_shim__'];
+    }
 
     // Create a minimal ExtensionContext
     const storagePath = path.join('/tmp', 'corecode-ext-storage', extensionId);

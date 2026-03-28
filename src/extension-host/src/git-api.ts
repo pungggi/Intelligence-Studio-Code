@@ -9,6 +9,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { join, isAbsolute, normalize } from "node:path";
 
 // ─── Types (mirrors vscode.git public API v1) ─────────────────
 
@@ -52,18 +53,25 @@ export interface LogOptions { maxEntries?: number; path?: string; follow?: boole
 
 // ─── git subprocess helper ────────────────────────────────────
 
+const GIT_TIMEOUT_MS = 30_000;
+
 function git(args: string[], cwd: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const proc = spawn('git', args, { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
     let stdout = '';
     let stderr = '';
+    const timer = setTimeout(() => {
+      proc.kill();
+      reject(new Error(`git ${args[0]} timed out after ${GIT_TIMEOUT_MS}ms`));
+    }, GIT_TIMEOUT_MS);
     proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
     proc.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
     proc.on('close', (code) => {
+      clearTimeout(timer);
       if (code !== 0) reject(new Error(`git ${args[0]} failed (${code}): ${stderr.trim()}`));
       else resolve(stdout);
     });
-    proc.on('error', reject);
+    proc.on('error', (err) => { clearTimeout(timer); reject(err); });
   });
 }
 
@@ -80,8 +88,8 @@ function parseCommits(raw: string): Commit[] {
       message: message ?? '',
       authorName: authorName ?? '',
       authorEmail: authorEmail ?? '',
-      authorDate: new Date(aDate ?? 0),
-      commitDate: new Date(cDate ?? 0),
+      authorDate: new Date(aDate || 0),
+      commitDate: new Date(cDate || 0),
       parents: parents ? parents.split(' ').filter(Boolean) : [],
     };
   });
@@ -94,7 +102,7 @@ function parseBlame(raw: string): BlameHunk[] {
   while (i < lines.length) {
     const headerMatch = lines[i]?.match(/^([0-9a-f]{40}) (\d+) (\d+)(?: (\d+))?/);
     if (!headerMatch) { i++; continue; }
-    const [, hash, origLine, finalLine, numLines] = headerMatch;
+    const [, hash = '', origLine = '0', finalLine = '0', numLines] = headerMatch;
     const count = parseInt(numLines ?? '1', 10);
     // scan for author info in following lines
     let authorName = '', authorEmail = '', aDate = '';
@@ -163,7 +171,7 @@ function makeRepository(root: string): Repository {
         const x = entry[0];
         const y = entry[1];
         const fp = entry.slice(3);
-        const uri = { fsPath: root + '/' + fp };
+        const uri = { fsPath: join(root, fp) };
         if (x !== ' ' && x !== '?') _changesCache.index.push({ uri, status: x.charCodeAt(0) });
         if (y !== ' ' && y !== '?') _changesCache.working.push({ uri, status: y.charCodeAt(0) });
         if (x === 'U' || y === 'U') _changesCache.merge.push({ uri, status: x.charCodeAt(0) });
@@ -174,9 +182,10 @@ function makeRepository(root: string): Repository {
   }
 
   refresh();
-  setInterval(refresh, 5000);
+  const _refreshInterval = setInterval(refresh, 5000);
 
   return {
+    dispose() { clearInterval(_refreshInterval); },
     rootUri,
     get state(): RepositoryState {
       return {
@@ -214,6 +223,19 @@ function makeRepository(root: string): Repository {
       return git(args, root);
     },
     async show(ref: string, filePath: string): Promise<string> {
+      // Validate filePath: must be relative and must not traverse outside the repo root
+      if (isAbsolute(filePath)) {
+        throw new Error(`show: filePath must be relative, got '${filePath}'`);
+      }
+      const normalized = normalize(filePath);
+      if (normalized.startsWith('..')) {
+        throw new Error(`show: filePath '${filePath}' traverses outside repository`);
+      }
+      // Validate ref: only allow safe characters to prevent shell injection via the git argument.
+      // Includes {} for stash refs (stash@{0}) and branch@{n} syntax.
+      if (!/^[A-Za-z0-9_./:@^~\-{}]+$/.test(ref)) {
+        throw new Error(`show: unsafe ref '${ref}'`);
+      }
       return git(['show', `${ref}:${filePath}`], root);
     },
     async getConfig(key: string): Promise<string> {
@@ -248,11 +270,15 @@ export function createGitExtension(workspaceRoot: string) {
           state: 'initialized' as const,
           repositories,
           getRepository(uri: { fsPath: string }) {
-            return repositories.find(r => uri.fsPath.startsWith(r.rootUri.fsPath)) ?? null;
+            const fp = uri.fsPath;
+            return repositories.find(r => {
+              const rp = r.rootUri.fsPath;
+              return fp === rp || fp.startsWith(rp + '/') || fp.startsWith(rp + '\\');
+            }) ?? null;
           },
-          onDidOpenRepository: { event: (_l: unknown) => ({ dispose: () => {} }) },
-          onDidCloseRepository: { event: (_l: unknown) => ({ dispose: () => {} }) },
-          onDidChangeState: { event: (_l: unknown) => ({ dispose: () => {} }) },
+          onDidOpenRepository: (_l: unknown) => ({ dispose: () => {} }),
+          onDidCloseRepository: (_l: unknown) => ({ dispose: () => {} }),
+          onDidChangeState: (_l: unknown) => ({ dispose: () => {} }),
         };
       },
       isAuthenticated: false,
@@ -261,5 +287,6 @@ export function createGitExtension(workspaceRoot: string) {
     extensionUri: { fsPath: '' },
     isActive: true,
     activate: async () => {},
+    deactivate: () => { (repo as unknown as { dispose(): void }).dispose(); },
   };
 }

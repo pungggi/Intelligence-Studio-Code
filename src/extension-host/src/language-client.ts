@@ -161,9 +161,10 @@ export class LanguageClient {
     // Security: log full spawn details for audit trail
     console.warn(`[LanguageClient:${this.id}] SPAWN AUDIT: command=${JSON.stringify(command)}, args=${JSON.stringify(args)}, cwd=${JSON.stringify(spawnOpts?.cwd)}, env_overrides=${JSON.stringify(Object.keys(spawnOpts?.env ?? {}))}`);
 
-    // Validate command doesn't contain shell metacharacters
-    if (/[;&|`$]/.test(command)) {
-      console.error(`[LanguageClient:${this.id}] Refusing to spawn command with shell metacharacters: ${command}`);
+    // Validate command uses only safe characters (allowlist) to prevent shell injection
+    // Permits: letters, digits, dots, slashes, backslashes, hyphens, underscores, colons, spaces
+    if (!/^[A-Za-z0-9_.\/\\\-: ]+$/.test(command)) {
+      console.error(`[LanguageClient:${this.id}] Refusing to spawn command with disallowed characters: ${command}`);
       this.started = false;
       return;
     }
@@ -203,7 +204,11 @@ export class LanguageClient {
       this.sendNotification("initialized", {});
 
       // Create a single diagnostic collection for this client
-      this.diagnosticCollection = this.vscodeApi!.languages.createDiagnosticCollection(this.id + "-lsp");
+      if (!this.vscodeApi) {
+        console.error(`[LanguageClient:${this.id}] vscodeApi not set — cannot register diagnostics or providers`);
+        return;
+      }
+      this.diagnosticCollection = this.vscodeApi.languages.createDiagnosticCollection(this.id + "-lsp");
 
       // Register VS Code providers based on server capabilities
       this.registerProviders();
@@ -219,6 +224,12 @@ export class LanguageClient {
       this.sendNotification("exit", null);
     } catch (err) {
       console.error(`[LanguageClient:${this.id}] Shutdown error:`, err);
+    }
+    // Cancel all pending requests before killing the process
+    for (const [id, pending] of this.pendingRequests) {
+      if (pending.timer) clearTimeout(pending.timer);
+      pending.reject(new Error("LanguageClient stopped"));
+      this.pendingRequests.delete(id);
     }
     this.process.kill();
     this.started = false;
@@ -377,12 +388,16 @@ export class LanguageClient {
               const d = doc as { uri: string };
               const p = pos as { line: number; character: number };
               const ctx = context as { triggerKind?: number; triggerCharacter?: string };
-              const result = await this.sendRequest("textDocument/completion", {
-                textDocument: { uri: d.uri },
-                position: { line: p.line, character: p.character },
-                context: { triggerKind: ctx?.triggerKind ?? 1, triggerCharacter: ctx?.triggerCharacter },
-              });
-              return result;
+              try {
+                return await this.sendRequest("textDocument/completion", {
+                  textDocument: { uri: d.uri },
+                  position: { line: p.line, character: p.character },
+                  context: { triggerKind: ctx?.triggerKind ?? 1, triggerCharacter: ctx?.triggerCharacter },
+                });
+              } catch (err) {
+                console.error(`[LanguageClient:${this.id}] completion error:`, err);
+                return undefined;
+              }
             },
           },
           ...triggerChars
@@ -396,10 +411,15 @@ export class LanguageClient {
           provideHover: async (doc: unknown, pos: unknown) => {
             const d = doc as { uri: string };
             const p = pos as { line: number; character: number };
-            return this.sendRequest("textDocument/hover", {
-              textDocument: { uri: d.uri },
-              position: { line: p.line, character: p.character },
-            });
+            try {
+              return await this.sendRequest("textDocument/hover", {
+                textDocument: { uri: d.uri },
+                position: { line: p.line, character: p.character },
+              });
+            } catch (err) {
+              console.error(`[LanguageClient:${this.id}] hover error:`, err);
+              return undefined;
+            }
           },
         })
       );
@@ -411,10 +431,15 @@ export class LanguageClient {
           provideDefinition: async (doc: unknown, pos: unknown) => {
             const d = doc as { uri: string };
             const p = pos as { line: number; character: number };
-            return this.sendRequest("textDocument/definition", {
-              textDocument: { uri: d.uri },
-              position: { line: p.line, character: p.character },
-            });
+            try {
+              return await this.sendRequest("textDocument/definition", {
+                textDocument: { uri: d.uri },
+                position: { line: p.line, character: p.character },
+              });
+            } catch (err) {
+              console.error(`[LanguageClient:${this.id}] definition error:`, err);
+              return undefined;
+            }
           },
         })
       );
@@ -426,11 +451,16 @@ export class LanguageClient {
           provideReferences: async (doc: unknown, pos: unknown, ctx: unknown) => {
             const d = doc as { uri: string };
             const p = pos as { line: number; character: number };
-            return this.sendRequest("textDocument/references", {
-              textDocument: { uri: d.uri },
-              position: { line: p.line, character: p.character },
-              context: ctx ?? { includeDeclaration: true },
-            });
+            try {
+              return await this.sendRequest("textDocument/references", {
+                textDocument: { uri: d.uri },
+                position: { line: p.line, character: p.character },
+                context: ctx ?? { includeDeclaration: true },
+              });
+            } catch (err) {
+              console.error(`[LanguageClient:${this.id}] references error:`, err);
+              return undefined;
+            }
           },
         })
       );
@@ -443,11 +473,16 @@ export class LanguageClient {
             const d = doc as { uri: string };
             const r = range as Range;
             const c = ctx as { diagnostics?: unknown[] };
-            return this.sendRequest("textDocument/codeAction", {
-              textDocument: { uri: d.uri },
-              range: { start: { line: r.start.line, character: r.start.character }, end: { line: r.end.line, character: r.end.character } },
-              context: { diagnostics: c?.diagnostics ?? [] },
-            });
+            try {
+              return await this.sendRequest("textDocument/codeAction", {
+                textDocument: { uri: d.uri },
+                range: { start: { line: r.start.line, character: r.start.character }, end: { line: r.end.line, character: r.end.character } },
+                context: { diagnostics: c?.diagnostics ?? [] },
+              });
+            } catch (err) {
+              console.error(`[LanguageClient:${this.id}] codeAction error:`, err);
+              return undefined;
+            }
           },
         })
       );
@@ -462,10 +497,15 @@ export class LanguageClient {
             provideSignatureHelp: async (doc: unknown, pos: unknown) => {
               const d = doc as { uri: string };
               const p = pos as { line: number; character: number };
-              return this.sendRequest("textDocument/signatureHelp", {
-                textDocument: { uri: d.uri },
-                position: { line: p.line, character: p.character },
-              });
+              try {
+                return await this.sendRequest("textDocument/signatureHelp", {
+                  textDocument: { uri: d.uri },
+                  position: { line: p.line, character: p.character },
+                });
+              } catch (err) {
+                console.error(`[LanguageClient:${this.id}] signatureHelp error:`, err);
+                return undefined;
+              }
             },
           },
           ...triggerChars
@@ -478,9 +518,14 @@ export class LanguageClient {
         this.vscodeApi.languages.registerDocumentSymbolProvider(selector, {
           provideDocumentSymbols: async (doc: unknown) => {
             const d = doc as { uri: string };
-            return this.sendRequest("textDocument/documentSymbol", {
-              textDocument: { uri: d.uri },
-            });
+            try {
+              return await this.sendRequest("textDocument/documentSymbol", {
+                textDocument: { uri: d.uri },
+              });
+            } catch (err) {
+              console.error(`[LanguageClient:${this.id}] documentSymbol error:`, err);
+              return undefined;
+            }
           },
         })
       );
@@ -492,10 +537,15 @@ export class LanguageClient {
           provideDocumentFormattingEdits: async (doc: unknown, options: unknown) => {
             const d = doc as { uri: string };
             const o = options as { tabSize?: number; insertSpaces?: boolean };
-            return this.sendRequest("textDocument/formatting", {
-              textDocument: { uri: d.uri },
-              options: { tabSize: o?.tabSize ?? 2, insertSpaces: o?.insertSpaces ?? true },
-            });
+            try {
+              return await this.sendRequest("textDocument/formatting", {
+                textDocument: { uri: d.uri },
+                options: { tabSize: o?.tabSize ?? 2, insertSpaces: o?.insertSpaces ?? true },
+              });
+            } catch (err) {
+              console.error(`[LanguageClient:${this.id}] formatting error:`, err);
+              return undefined;
+            }
           },
         })
       );

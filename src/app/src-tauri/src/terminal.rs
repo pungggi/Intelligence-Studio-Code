@@ -169,6 +169,8 @@ impl TerminalManager {
             let _ = session.child.kill();
             let _ = session.child.wait();
             log::info!("[Terminal] Closed terminal {}", terminal_id);
+        } else {
+            log::warn!("[Terminal] close called for unknown terminal: {}", terminal_id);
         }
         Ok(())
     }

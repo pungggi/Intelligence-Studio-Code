@@ -15,7 +15,15 @@ import { VscodeApiShim } from "./vscode-api-shim";
 
 const IPC_HOST = process.env.CORECODE_IPC_HOST ?? "127.0.0.1";
 const IPC_PORT = parseInt(process.env.CORECODE_IPC_PORT ?? "17532", 10);
+if (isNaN(IPC_PORT) || IPC_PORT < 1 || IPC_PORT > 65535) {
+  console.error(`[ExtensionHost] Invalid IPC port: '${process.env.CORECODE_IPC_PORT}'`);
+  process.exit(1);
+}
 const IPC_TOKEN = process.env.CORECODE_IPC_TOKEN ?? "";
+if (!IPC_TOKEN) {
+  console.error("[ExtensionHost] CORECODE_IPC_TOKEN is not set — refusing to start without auth token");
+  process.exit(1);
+}
 
 async function main(): Promise<void> {
   console.log("[ExtensionHost] Starting...");
@@ -127,8 +135,11 @@ async function main(): Promise<void> {
     `[ExtensionHost] Ready — ${active.length} extension(s) active: ${active.join(", ") || "none"}`
   );
 
-  // Graceful shutdown on SIGTERM and SIGINT
+  // Graceful shutdown on SIGTERM and SIGINT (reentrancy guard prevents double-shutdown)
+  let shutdownStarted = false;
   const shutdown = async () => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
     console.log("[ExtensionHost] Shutting down...");
     await extensionLoader.deactivateAll();
     await ipcServer.stop();

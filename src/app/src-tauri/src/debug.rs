@@ -67,6 +67,14 @@ impl DebugManager {
         adapter_cmd: String,
         adapter_args: Vec<String>,
     ) -> Result<(), String> {
+        // 0. Check session uniqueness before spawning anything.
+        {
+            let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            if sessions.contains_key(&session_id) {
+                return Err(format!("Debug session '{}' already exists", session_id));
+            }
+        }
+
         // 1. Reject bare names — require an absolute path.
         let cmd_path = std::path::Path::new(&adapter_cmd);
         if !cmd_path.is_absolute() {
@@ -93,14 +101,15 @@ impl DebugManager {
         //    arbitrary system binaries (e.g. /bin/sh, C:\Windows\cmd.exe).
         //    Debug adapters installed by extensions always live under the user
         //    home directory on all supported platforms.
-        if let Some(home) = dirs::home_dir() {
-            let home_canonical = std::fs::canonicalize(&home).unwrap_or(home);
-            if !canonical.starts_with(&home_canonical) {
-                return Err(format!(
-                    "Debug adapter '{}' is not within the user home directory",
-                    canonical.display()
-                ));
-            }
+        let home = dirs::home_dir().ok_or_else(|| {
+            "could not determine user home directory — debug adapter restricted".to_string()
+        })?;
+        let home_canonical = std::fs::canonicalize(&home).unwrap_or(home);
+        if !canonical.starts_with(&home_canonical) {
+            return Err(format!(
+                "Debug adapter '{}' is not within the user home directory",
+                canonical.display()
+            ));
         }
 
         let canonical_str = canonical.to_string_lossy().to_string();
@@ -127,6 +136,9 @@ impl DebugManager {
                 let mut stdin = stdin;
                 while let Ok(bytes) = rx.recv() {
                     if stdin.write_all(&bytes).is_err() {
+                        break;
+                    }
+                    if stdin.flush().is_err() {
                         break;
                     }
                 }
@@ -184,6 +196,12 @@ impl DebugManager {
                             let mut store = events_reader.lock().unwrap_or_else(|p| p.into_inner());
                             if store.len() < 1000 {
                                 store.push(evt);
+                            } else {
+                                log::warn!(
+                                    "[DAP:{}] Event buffer full (1000 events), dropping event type '{}'",
+                                    sid_reader,
+                                    evt.msg_type
+                                );
                             }
                         }
                         Err(e) => log::warn!("[DAP:{}] Malformed message: {}", sid_reader, e),
@@ -193,9 +211,6 @@ impl DebugManager {
             .map_err(|e| e.to_string())?;
 
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        if sessions.contains_key(&session_id) {
-            return Err(format!("Debug session '{}' already exists", session_id));
-        }
         sessions.insert(session_id, DebugSessionData { stdin_tx: tx, events, seq_counter: 0, child });
         Ok(())
     }

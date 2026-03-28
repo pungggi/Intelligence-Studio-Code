@@ -90,6 +90,8 @@ pub fn start_extension_host(_app: &AppHandle, ipc_port: u16, user_extensions_dir
                         // Force kill in case process is still running
                         let _ = process.kill();
                         let _ = process.wait();
+                        // Clear the stale PID so kill_extension_host() won't act on a recycled PID
+                        EXT_HOST_PID.store(0, Ordering::SeqCst);
                     }
                 }
             }

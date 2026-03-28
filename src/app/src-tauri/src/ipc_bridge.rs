@@ -615,7 +615,8 @@ impl IpcHandle {
                 Err("LSP request timed out".to_string())
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                // Channel was dropped (e.g., disconnect)
+                // Channel was dropped (e.g., disconnect) — clean up pending entry
+                lock_or_default(&self.pending_requests).remove(&request_id);
                 Err("LSP request cancelled".to_string())
             }
         }
@@ -944,12 +945,17 @@ fn handle_incoming(
                         }
                     }
 
+                    const MAX_DIAGNOSTICS: usize = 1000;
                     let mut store = lock_or_default(diagnostics);
                     if let Some(ref u) = uri {
                         store.retain(|d| d.uri.as_deref() != Some(u));
                     }
                     let count = diags.len();
                     store.extend(diags);
+                    if store.len() > MAX_DIAGNOSTICS {
+                        let drain_count = store.len() - MAX_DIAGNOSTICS;
+                        store.drain(..drain_count);
+                    }
                     log::info!("[IPC] Received {} diagnostics for {:?}", count, uri);
                 }
             }
@@ -1015,9 +1021,14 @@ fn handle_incoming(
         "setDecorations" => {
             if let Some(params) = &msg.params {
                 if let Ok(dec) = serde_json::from_value::<TextDecoration>(params.clone()) {
+                    const MAX_DECORATIONS: usize = 10_000;
                     let mut store = lock_or_default(decorations);
                     store.retain(|d| !(d.uri == dec.uri && d.decoration_type == dec.decoration_type));
                     store.push(dec);
+                    if store.len() > MAX_DECORATIONS {
+                        let drain_count = store.len() - MAX_DECORATIONS;
+                        store.drain(..drain_count);
+                    }
                 }
             }
         }

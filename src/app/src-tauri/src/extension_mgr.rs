@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+/// Maximum size of a single file extracted from a VSIX archive (50 MB).
+const MAX_VSIX_FILE_SIZE: u64 = 50 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledExtension {
     pub id: String,
@@ -174,18 +177,25 @@ impl ExtensionManager {
                 }
             }
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).ok();
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    log::warn!("Failed to create directory {}: {}", parent.display(), e);
+                }
             }
 
             if file.is_dir() {
                 std::fs::create_dir_all(&target)
                     .map_err(|e| format!("Failed to create directory {relative_path}: {e}"))?;
             } else {
+                // Check declared size before allocating memory
+                if file.size() > MAX_VSIX_FILE_SIZE {
+                    log::warn!("Skipping oversized file in VSIX: {relative_path}");
+                    continue;
+                }
                 let mut contents = Vec::new();
                 file.read_to_end(&mut contents)
                     .map_err(|e| format!("Failed to read {relative_path}: {e}"))?;
-                // Only write files up to 50MB each
-                if contents.len() > 50 * 1024 * 1024 {
+                // Double-check actual decompressed size
+                if contents.len() > MAX_VSIX_FILE_SIZE as usize {
                     log::warn!("Skipping oversized file in VSIX: {relative_path}");
                     continue;
                 }
@@ -237,16 +247,22 @@ impl ExtensionManager {
                 }
 
                 if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent).ok();
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        log::warn!("Failed to create directory {}: {}", parent.display(), e);
+                    }
                 }
 
                 if file.is_dir() {
                     std::fs::create_dir_all(&target).ok();
                 } else {
+                    if file.size() > MAX_VSIX_FILE_SIZE {
+                        log::warn!("Skipping oversized file in VSIX: {raw_name}");
+                        continue;
+                    }
                     let mut contents = Vec::new();
                     file.read_to_end(&mut contents)
                         .map_err(|e| format!("Failed to read {raw_name}: {e}"))?;
-                    if contents.len() <= 50 * 1024 * 1024 {
+                    if contents.len() <= MAX_VSIX_FILE_SIZE as usize {
                         std::fs::write(&target, &contents)
                             .map_err(|e| format!("Failed to write {raw_name}: {e}"))?;
                     }

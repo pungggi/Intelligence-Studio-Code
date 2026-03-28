@@ -37,6 +37,7 @@ interface LoadedExtension {
   } | null;
   isActive: boolean;
   extensionPath: string;
+  context: { subscriptions: { dispose: () => void }[] } | null;
 }
 
 export class ExtensionLoader {
@@ -139,6 +140,7 @@ export class ExtensionLoader {
           module: null,
           isActive: false,
           extensionPath: extPath,
+          context: null,
         });
 
         // Register configuration defaults from this extension
@@ -172,7 +174,7 @@ export class ExtensionLoader {
         console.error(`[ExtLoader] Failed to activate ${id}:`, err);
         // Notify frontend of activation failure via showMessage
         try {
-          this.apiShim.createVscodeApi().window.showErrorMessage(
+          this.getVscodeApi().window.showErrorMessage(
             `Extension ${id} failed to activate: ${msg}`
           );
         } catch { /* ignore send failure */ }
@@ -200,18 +202,24 @@ export class ExtensionLoader {
 
     // Validate the main entry point stays within the extension directory
     const mainPath = resolve(ext.extensionPath, ext.manifest.main);
+    const mainPathJs = mainPath + ".js";
     const realExtPath = realpathSync(ext.extensionPath);
-    const realMainPath = existsSync(mainPath) ? realpathSync(mainPath) : mainPath;
+    // Resolve whichever path variant actually exists; fall back to the raw path for the check
+    const resolvedMain = existsSync(mainPath)
+      ? realpathSync(mainPath)
+      : existsSync(mainPathJs)
+      ? realpathSync(mainPathJs)
+      : mainPath;
 
     // Check for path traversal: resolved main must be inside extension dir
-    const rel = relative(realExtPath, realMainPath);
+    const rel = relative(realExtPath, resolvedMain);
     if (rel.startsWith("..") || isAbsolute(rel)) {
       throw new Error(
         `[ExtLoader] ${extensionId}: main entry '${ext.manifest.main}' escapes extension directory`
       );
     }
 
-    if (!existsSync(mainPath) && !existsSync(mainPath + ".js")) {
+    if (!existsSync(mainPath) && !existsSync(mainPathJs)) {
       console.warn(
         `[ExtLoader] ${extensionId} main not found: ${mainPath}`
       );
@@ -286,6 +294,7 @@ export class ExtensionLoader {
           update: async () => {},
         },
       };
+      ext.context = context;
 
       // Call activate
       if (typeof mod.activate === "function") {
@@ -320,6 +329,13 @@ export class ExtensionLoader {
           console.error(`[ExtLoader] Failed to deactivate ${id}:`, err);
         }
       }
+      // Dispose all subscriptions registered by the extension
+      if (ext.context) {
+        for (const sub of ext.context.subscriptions) {
+          try { sub.dispose(); } catch { /* ignore */ }
+        }
+      }
+      ext.isActive = false;
     }
   }
 
@@ -341,6 +357,9 @@ export class ExtensionLoader {
     if (!manifest.name || typeof manifest.name !== "string") {
       throw new Error(`Invalid extension manifest: missing 'name'`);
     }
+    if (!manifest.version || typeof manifest.version !== "string") {
+      throw new Error(`Invalid extension manifest: missing 'version'`);
+    }
 
     const id = `${manifest.publisher ?? "unknown"}.${manifest.name}`;
 
@@ -355,6 +374,7 @@ export class ExtensionLoader {
       module: null,
       isActive: false,
       extensionPath: absPath,
+      context: null,
     });
 
     // Register configuration defaults
@@ -380,6 +400,13 @@ export class ExtensionLoader {
         console.log(`[ExtLoader] Deactivated: ${extensionId}`);
       } catch (err) {
         console.error(`[ExtLoader] Error deactivating ${extensionId}:`, err);
+      }
+    }
+
+    // Dispose all subscriptions registered by the extension
+    if (ext.context) {
+      for (const sub of ext.context.subscriptions) {
+        try { sub.dispose(); } catch { /* ignore */ }
       }
     }
 

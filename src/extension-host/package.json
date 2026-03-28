@@ -2,12 +2,13 @@
   "name": "corecode-extension-host",
   "version": "0.1.0",
   "description": "CoreCode Extension Host - VS Code extension runtime",
+  "type": "module",
   "main": "dist/host.js",
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/host.js",
-    "test": "node --test src/**/*.test.ts"
+    "test": "node --experimental-strip-types --test src/**/*.test.ts"
   },
   "dependencies": {},
   "devDependencies": {

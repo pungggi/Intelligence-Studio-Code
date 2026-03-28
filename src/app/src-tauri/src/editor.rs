@@ -240,7 +240,12 @@ impl DocumentBuffer {
             if line == 0 { return Ok(()); }
             let prev_line = line - 1;
             let prev_line_len = self.rope.line(prev_line).len_chars();
-            let nl_pos = self.rope.line_to_char(prev_line) + prev_line_len - 1;
+            let base = self.rope.line_to_char(prev_line) + prev_line_len;
+            // Defensively compute the deletion position: the last char of prev_line
+            let nl_pos = base.saturating_sub(1);
+            if nl_pos >= self.rope.len_chars() {
+                return Ok(());
+            }
             let deleted = self.raw_delete_at_char(nl_pos, 1);
             if !deleted.is_empty() {
                 self.undo_mgr.push(EditOp::Delete {
@@ -611,7 +616,7 @@ impl WorkspaceState {
     /// Open a file into a new buffer (or switch to it if already open).
     /// Returns true if the buffer was newly created.
     pub fn open_file(&mut self, path: &str) -> Result<bool> {
-        let canonical = PathBuf::from(path);
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
 
         if self.buffers.contains_key(&canonical) {
             // Already open — just switch to it

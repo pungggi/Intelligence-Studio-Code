@@ -23,6 +23,13 @@
   --syn-constant: #fab387;
   --syn-operator: #94e2d5;
   --syn-punctuation: #6c7086;
+
+  /* Semantic aliases used by component styles */
+  --fg-muted: var(--fg-dim);
+  --hover-bg: rgba(255,255,255,0.05);
+  --selection-bg: var(--selection);
+  --bg-editor: var(--bg);
+  --bg-sidebar: var(--bg-gutter);
 }
 
 * {

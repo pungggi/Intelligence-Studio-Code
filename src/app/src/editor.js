@@ -120,7 +120,8 @@ let editQueueTail = Promise.resolve();
 function queueEdit(fn) {
   editQueueTail = editQueueTail.then(fn).catch(err => {
     console.error('[queueEdit] Edit failed:', err);
-    return fn();
+    // Do not retry — propagate failure so the queue doesn't hang
+    return Promise.reject(err);
   });
   return editQueueTail;
 }
@@ -530,7 +531,7 @@ function paintDecorations(ctx, firstVisibleLine, subPixelOffset) {
 
         if (afterText && lineIdx === r.end_line) {
           ctx.fillStyle = fgColor ?? 'rgba(150,150,150,0.7)';
-          ctx.fillText(afterText, EDITOR_PADDING_LEFT + colEnd * cellWidth + 4, y + (lineHeight - (window.__cachedFontSize ?? lineHeight * 0.65)) / 2);
+          ctx.fillText(afterText, EDITOR_PADDING_LEFT + colEnd * cellWidth + 4, y + (lineHeight - (cachedFontSize || lineHeight * 0.65)) / 2);
         }
       }
     }
@@ -2828,8 +2829,9 @@ let _a11yLastCol = -1;
 
 function a11yUpdateProxy() {
   if (!a11yProxy) return;
-  const text = (visibleLines && visibleLines[cursorLine - firstVisibleLine])
-    ? (visibleLines[cursorLine - firstVisibleLine].text ?? '')
+  const lineOffset = cursorLine - cachedFirstLine;
+  const text = (lineOffset >= 0 && lineOffset < cachedLines.length && cachedLines[lineOffset])
+    ? (cachedLines[lineOffset].text ?? '')
     : '';
   a11yProxy.value = text;
   try { a11yProxy.setSelectionRange(cursorCol, cursorCol); } catch (_) {}
@@ -2941,8 +2943,8 @@ async function pollDecorations() {
   try {
     const uri = filePathToUri(filePath);
     const decs = await invoke('get_decorations', { uri });
-    if (decs && decs.length !== activeDecorations.length ||
-        JSON.stringify(decs) !== JSON.stringify(activeDecorations)) {
+    if (decs && (decs.length !== activeDecorations.length ||
+        JSON.stringify(decs) !== JSON.stringify(activeDecorations))) {
       activeDecorations = decs || [];
       requestRender();
     }
@@ -3351,7 +3353,7 @@ function handleQuickPick(req) {
   }, { signal: qpAbort.signal });
   paletteBackdropEl.addEventListener('click', () => closePaletteAndRespond(req.request_id, null), { signal: qpAbort.signal });
 
-  function closePaletteAndRespond(requestId, value) {
+  async function closePaletteAndRespond(requestId, value) {
     paletteOpen = false;
     paletteEl.classList.add('palette-hidden');
     paletteInputEl.placeholder = 'Type a command...';
@@ -3360,7 +3362,7 @@ function handleQuickPick(req) {
     paletteInputEl.addEventListener('keydown', paletteKeydownHandler);
     paletteBackdropEl.addEventListener('click', closePalette);
     editorEl.focus();
-    invoke('respond_ui_request', { requestId, value: value });
+    await invoke('respond_ui_request', { requestId, value: value });
   }
 
   paletteInputEl.focus();
@@ -3391,7 +3393,7 @@ function handleInputBox(req) {
   }, { signal: ibAbort.signal });
   paletteBackdropEl.addEventListener('click', () => closeInputAndRespond(req.request_id, null), { signal: ibAbort.signal });
 
-  function closeInputAndRespond(requestId, value) {
+  async function closeInputAndRespond(requestId, value) {
     paletteOpen = false;
     paletteEl.classList.add('palette-hidden');
     paletteInputEl.placeholder = 'Type a command...';
@@ -3400,7 +3402,7 @@ function handleInputBox(req) {
     paletteInputEl.addEventListener('keydown', paletteKeydownHandler);
     paletteBackdropEl.addEventListener('click', closePalette);
     editorEl.focus();
-    invoke('respond_ui_request', { requestId, value: value });
+    await invoke('respond_ui_request', { requestId, value: value });
   }
 
   paletteInputEl.focus();
