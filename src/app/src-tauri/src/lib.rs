@@ -7,6 +7,7 @@ mod ipc_bridge;
 mod marketplace;
 mod settings;
 mod terminal;
+mod wasm_host;
 
 use editor::WorkspaceState;
 use ipc_bridge::{IpcHandle, OutgoingMessage};
@@ -31,6 +32,8 @@ struct AppState {
     debug_mgr: Arc<debug::DebugManager>,
     /// Count of open windows; extension host is killed when this reaches zero.
     window_count: Arc<Mutex<usize>>,
+    /// WASM extension host — runs extensions compiled to wasm32-wasi in-process.
+    wasm_host: wasm_host::WasmHostManager,
 }
 
 
@@ -1587,6 +1590,8 @@ pub fn run() {
     let settings_store = settings::SettingsStore::new()
         .expect("Failed to create settings store");
     let debug_manager = Arc::new(debug::DebugManager::new());
+    let wasm_host_mgr = wasm_host::WasmHostManager::new()
+        .expect("Failed to initialise WASM extension host");
 
     // Get user extensions directory path for Extension Host
     let user_extensions_dir = ext_mgr.extensions_dir().to_string_lossy().to_string();
@@ -1604,6 +1609,7 @@ pub fn run() {
             terminal_mgr: Mutex::new(terminal::TerminalManager::new()),
             debug_mgr: debug_manager,
             window_count: Arc::new(Mutex::new(1)), // main window
+            wasm_host: wasm_host_mgr,
         })
         .invoke_handler(tauri::generate_handler![
             open_file,
@@ -1716,6 +1722,26 @@ pub fn run() {
                 })
                 .expect("Failed to spawn Extension Host manager thread");
 
+            // Activate WASM extensions in a background thread (in-process but
+            // potentially slow on first engine compilation).
+            let wasm_ext_dir = user_extensions_dir.clone();
+            let app_handle2 = app.handle().clone();
+            std::thread::Builder::new()
+                .name("wasm-ext-host".to_string())
+                .spawn(move || {
+                    let state = app_handle2.state::<AppState>();
+                    let extensions_dir = std::path::PathBuf::from(&wasm_ext_dir);
+                    let errors = state.wasm_host.activate_all(&extensions_dir, None);
+                    for e in errors {
+                        log::error!("WASM extension error: {e}");
+                    }
+                    log::info!(
+                        "WASM extension host ready ({} active)",
+                        state.wasm_host.active_count()
+                    );
+                })
+                .expect("Failed to spawn WASM Extension Host thread");
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1725,6 +1751,7 @@ pub fn run() {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     ext_host::kill_extension_host();
+                    state.wasm_host.deactivate_all();
                 }
             }
         })

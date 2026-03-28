@@ -1,0 +1,52 @@
+package corecode:extension@0.1.0;
+
+// ── Host imports — UI ───────────────────────────────────────────────────────
+
+interface ui {
+  /// Append a line to a named output channel.
+  log: func(channel: string, message: string);
+
+  /// Show a transient notification. level: "info" | "warning" | "error"
+  show-message: func(level: string, message: string);
+
+  /// Create or update a status bar item. Passing empty text removes it.
+  set-status: func(id: string, text: string, tooltip: option<string>);
+}
+
+// ── Host imports — Workspace ────────────────────────────────────────────────
+
+interface workspace {
+  /// Read the content of a workspace-relative file.
+  read-file: func(path: string) -> result<string, string>;
+
+  /// Return workspace-relative paths matching a glob pattern.
+  find-files: func(glob: string) -> result<list<string>, string>;
+
+  /// Return the workspace root URI (file://).
+  root-uri: func() -> string;
+
+  /// Read a configuration value by dotted key, e.g. "editor.tabSize".
+  get-config: func(key: string) -> option<string>;
+}
+
+// ── Extension exports — lifecycle ───────────────────────────────────────────
+
+interface lifecycle {
+  /// Called once when the extension is loaded.
+  /// Return err to abort activation; the message is shown to the user.
+  activate: func() -> result<_, string>;
+
+  /// Called when the host is shutting down. Return value is ignored.
+  deactivate: func();
+}
+
+// ── World ───────────────────────────────────────────────────────────────────
+
+world corecode-extension {
+  /// Host imports available to every extension.
+  import ui;
+  import workspace;
+
+  /// Extension exports required by every extension.
+  export lifecycle;
+}

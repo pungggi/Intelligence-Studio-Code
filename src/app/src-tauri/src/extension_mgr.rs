@@ -47,6 +47,37 @@ pub struct ExtensionManager {
     registry_path: PathBuf,
 }
 
+/// Which host type an extension directory targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionKind {
+    /// Has `package.json` — routed to the Node.js extension host.
+    NodeJs,
+    /// Has `corecode.toml` — routed to the in-process WASM host.
+    Wasm,
+}
+
+/// Detect the host type for an extension directory.
+///
+/// Returns `None` if neither manifest file is present (not a recognised extension).
+/// If both manifests are present, `Wasm` wins and a warning is logged.
+pub fn detect_kind(ext_dir: &std::path::Path) -> Option<ExtensionKind> {
+    let has_toml = ext_dir.join("corecode.toml").exists();
+    let has_pkg  = ext_dir.join("package.json").exists();
+    match (has_toml, has_pkg) {
+        (true, true) => {
+            log::warn!(
+                "Extension '{}' has both corecode.toml and package.json; \
+                 treating as WASM extension",
+                ext_dir.display()
+            );
+            Some(ExtensionKind::Wasm)
+        }
+        (true, false) => Some(ExtensionKind::Wasm),
+        (false, true) => Some(ExtensionKind::NodeJs),
+        (false, false) => None,
+    }
+}
+
 /// Validate that an extension identifier component contains no path traversal sequences.
 /// Rejects `/`, `\`, `..`, and empty strings.
 fn validate_extension_id_component(component: &str, label: &str) -> Result<(), String> {

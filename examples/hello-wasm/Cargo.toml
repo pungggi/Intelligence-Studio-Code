@@ -1,0 +1,11 @@
+[package]
+name    = "hello-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# WIT bindings generated from corecode.wit
+wit-bindgen = "0.26"
