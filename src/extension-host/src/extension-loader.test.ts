@@ -17,7 +17,6 @@ import { tmpdir } from "node:os";
 interface ExtensionManifest {
   name?: unknown;
   version?: unknown;
-  publisher?: string;
 }
 
 function validateManifest(manifest: ExtensionManifest): void {

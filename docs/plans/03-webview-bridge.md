@@ -54,6 +54,13 @@ host calls Tauri webview evaluate_script():
 Webview JS event listener fires
 ```
 
+**Security note:** The host must safely serialize the JSON payload when building the
+`evaluate_script` call. Use `serde_json::to_string(&value)` to produce a canonical JSON
+string, then embed it as:
+`window.dispatchEvent(new MessageEvent('message', { data: JSON.parse(${escaped_json}) }))`
+where `escaped_json` is the output of `serde_json::to_string`. This ensures no arbitrary
+code can be injected via the payload.
+
 ### Webview → extension (request/response)
 
 ```
@@ -76,19 +83,29 @@ If response is Some(json):
   window.dispatchEvent(new MessageEvent('message', { data: JSON.parse(json) }))
 ```
 
+The bridge implementation in Phase 4 adds a `window.coreCode.request()` helper that attaches
+a `__requestId` to each outgoing message and returns a Promise that resolves when the extension's
+response includes the same `__requestId`. This enables clean async request/response patterns
+without manual correlation logic in the extension's panel JS.
+
+See the bridge script in Phase 4 (`corecode-bridge.js`) for the full implementation including
+the `request()` helper with correlation IDs.
+
 ---
 
 ## The injected bridge script
 
-The WASM host prepends `corecode-bridge.js` to every webview HTML response. The extension's
-`get-html` return value is wrapped at injection time:
+The WASM host inlines the bridge script directly into the HTML before `</head>`, rather than
+serving it as an external file. This avoids the need for a file:// or custom protocol handler
+for the bridge. The extension's `get-html` return value is wrapped at injection time:
 
 ```html
 <!-- Original extension HTML -->
 <html>
   <head>
-    <!-- INJECTED by host: -->
-    <script src="corecode-bridge.js"></script>
+    <!-- INJECTED by host (inline, not external file): -->
+    <script>window.__CORECODE_PANEL_ID__ = "panel-id-here";</script>
+    <script>/* corecode-bridge.js contents inlined here */</script>
     <!-- end injection -->
     <script src="panel.js"></script>
   </head>
@@ -193,3 +210,10 @@ path traversal protection matching the existing `extension_mgr.rs` guards.
   an unknown panel-id is rejected.
 - Extension assets served from the extension directory are path-traversal-checked with the same
   guard already in `extension_mgr.rs`.
+- Recommended CSP for extension webview windows:
+  `default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'`
+  Note: the injected bridge script uses an inline `<script>` block, so `script-src` must include `'nonce-<random>'`
+  or the bridge must be moved to an external file served as `'self'`. The `webview_message` invoke handler
+  is the only Tauri command exposed to the webview; all other commands remain inaccessible.
+  Extension assets served from the extension directory via the sidecar handler must still pass the
+  existing path-traversal checks in `extension_mgr.rs`.

@@ -1,5 +1,4 @@
-/**
- * LanguageClient — VS Code compatible LSP client for the Extension Host.
+/* LanguageClient — VS Code compatible LSP client for the Extension Host.
  *
  * M6: Enables extensions to spawn LSP servers as child processes and
  * communicate via JSON-RPC 2.0 over stdio. The client auto-registers
@@ -11,8 +10,8 @@
  */
 
 import { ChildProcess, spawn } from "child_process";
-import type { VscodeApiShim } from "./vscode-api-shim";
-import { Position, Range, Uri, Location } from "./vscode-api-shim";
+import type { VscodeApiShim } from "./vscode-api-shim.js";
+import { Range } from "./vscode-api-shim.js";
 
 // --- JSON-RPC 2.0 Types ---
 
@@ -169,7 +168,19 @@ export class LanguageClient {
       return;
     }
 
+    // Validate each arg with the same allowlist to prevent injection via arguments
+    const argAllowlist = /^[A-Za-z0-9_.\/\\\-: ]+$/;
+    for (const arg of args) {
+      if (!argAllowlist.test(arg)) {
+        console.error(`[LanguageClient:${this.id}] Refusing to spawn: arg contains disallowed characters: ${arg}`);
+        this.started = false;
+        return;
+      }
+    }
+
+    // shell: false (Node.js default) is set explicitly to ensure args are never interpolated
     this.process = spawn(command, args, {
+      shell: false,
       cwd: spawnOpts?.cwd,
       env: { ...process.env, ...spawnOpts?.env },
       stdio: ["pipe", "pipe", "pipe"],
@@ -261,7 +272,23 @@ export class LanguageClient {
 
       const json = JSON.stringify(msg);
       const header = `Content-Length: ${Buffer.byteLength(json)}\r\n\r\n`;
-      this.process.stdin.write(header + json);
+
+      // Reject immediately on a broken-pipe write error; keep the timeout as a fallback.
+      const onWriteError = (err: Error) => {
+        const inflight = this.pendingRequests.get(id);
+        if (inflight) {
+          if (inflight.timer) clearTimeout(inflight.timer);
+          this.pendingRequests.delete(id);
+          reject(err);
+        }
+      };
+
+      this.process.stdin.once("error", onWriteError);
+      this.process.stdin.write(header + json, (writeErr) => {
+        // Remove the one-time listener once the write callback fires to avoid leaks.
+        this.process?.stdin?.removeListener("error", onWriteError);
+        if (writeErr) onWriteError(writeErr);
+      });
     });
   }
 
@@ -273,7 +300,18 @@ export class LanguageClient {
     this.process.stdin.write(header + json);
   }
 
+  /** Maximum combined buffer size (50 MB) — guards against unbounded memory growth. */
+  private static readonly MAX_BUFFER_SIZE = 50 * 1024 * 1024;
+
   private onStdoutData(data: Buffer): void {
+    if (this.buffer.length + data.length > LanguageClient.MAX_BUFFER_SIZE) {
+      console.error(
+        `[LanguageClient:${this.id}] Incoming data would exceed max buffer size (${LanguageClient.MAX_BUFFER_SIZE} bytes), resetting buffer`
+      );
+      this.buffer = Buffer.alloc(0);
+      this.contentLength = -1;
+      return;
+    }
     this.buffer = Buffer.concat([this.buffer, data]);
 
     while (true) {
@@ -335,17 +373,42 @@ export class LanguageClient {
       case "textDocument/publishDiagnostics": {
         // Forward diagnostics to the Extension Host via vscode API
         // (LSP server sends diagnostics, we convert to VS Code format)
-        const params = msg.params as { uri: string; diagnostics: Array<{ range: { start: { line: number; character: number }; end: { line: number; character: number } }; message: string; severity?: number; source?: string }> };
+        const rawParams = msg.params;
+        if (
+          !rawParams ||
+          typeof rawParams !== "object" ||
+          typeof (rawParams as Record<string, unknown>).uri !== "string" ||
+          !Array.isArray((rawParams as Record<string, unknown>).diagnostics)
+        ) {
+          console.error(`[LanguageClient:${this.id}] publishDiagnostics: malformed params, skipping`);
+          break;
+        }
+        const params = rawParams as { uri: string; diagnostics: unknown[] };
         if (this.diagnosticCollection) {
-          const diags = (params.diagnostics ?? []).map(d => ({
-            range: {
-              start: { line: d.range.start.line, character: d.range.start.character },
-              end: { line: d.range.end.line, character: d.range.end.character },
-            },
-            message: d.message,
-            severity: this.mapSeverity(d.severity ?? 1),
-            source: d.source ?? this.name,
-          }));
+          const diags = params.diagnostics.flatMap((d) => {
+            const diag = d as Record<string, unknown>;
+            const range = diag?.range as Record<string, unknown> | undefined;
+            const start = range?.start as Record<string, unknown> | undefined;
+            const end = range?.end as Record<string, unknown> | undefined;
+            if (
+              typeof start?.line !== "number" ||
+              typeof start?.character !== "number" ||
+              typeof end?.line !== "number" ||
+              typeof end?.character !== "number" ||
+              typeof diag?.message !== "string"
+            ) {
+              return [];
+            }
+            return [{
+              range: {
+                start: { line: start.line, character: start.character },
+                end: { line: end.line, character: end.character },
+              },
+              message: diag.message,
+              severity: this.mapSeverity(typeof diag.severity === "number" ? diag.severity : 1),
+              source: typeof diag.source === "string" ? diag.source : this.name,
+            }];
+          });
           this.diagnosticCollection.set(params.uri, diags);
         }
         break;

@@ -433,7 +433,7 @@ impl ApplicationHandler for AppState {
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     println!("=== CoreCode Spike 1: wgpu Text Rendering ===\n");
 
     let event_loop = EventLoop::new()?;

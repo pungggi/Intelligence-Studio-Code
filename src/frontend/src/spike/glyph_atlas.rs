@@ -40,7 +40,7 @@ impl GlyphAtlas {
     pub fn new(font_size: f32) -> Self {
         // Use a built-in monospaced font approximation.
         // In production, load JetBrains Mono or similar.
-        let font_data = include_bytes!("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf");
+        let font_data = include_bytes!("DejaVuSansMono.ttf");
         let font = Font::from_bytes(
             font_data as &[u8],
             FontSettings {
@@ -132,7 +132,12 @@ impl GlyphAtlas {
             self.glyphs.insert(ch, glyph_info);
         }
 
-        println!(
+        tracing::info!(
+            atlas_width = self.atlas_width,
+            atlas_height = self.atlas_height,
+            glyphs = self.glyphs.len(),
+            cell_w,
+            cell_h,
             "[GlyphAtlas] Built {}x{} atlas with {} glyphs, cell={}x{}",
             self.atlas_width,
             self.atlas_height,

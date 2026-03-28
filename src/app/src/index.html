@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>CoreCode</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
   <link rel="stylesheet" href="style.css" />
   <link rel="stylesheet" href="lib/xterm/xterm.css" />
 </head>
@@ -89,13 +90,13 @@
         </div>
         <div id="debug-toolbar">
           <button id="debug-btn-start" title="Start Debugging (F5)" aria-label="Start Debugging">&#9654; Start</button>
-          <button id="debug-btn-continue" title="Continue (F5)" aria-label="Continue" style="display:none;">&#9654;</button>
-          <button id="debug-btn-pause" title="Pause" aria-label="Pause" style="display:none;">&#10073;&#10073;</button>
-          <button id="debug-btn-stepover" title="Step Over (F10)" aria-label="Step Over" style="display:none;">&#8594;</button>
-          <button id="debug-btn-stepin" title="Step Into (F11)" aria-label="Step Into" style="display:none;">&#8600;</button>
-          <button id="debug-btn-stepout" title="Step Out (Shift+F11)" aria-label="Step Out" style="display:none;">&#8598;</button>
-          <button id="debug-btn-restart" title="Restart (Ctrl+Shift+F5)" aria-label="Restart" style="display:none;">&#8635;</button>
-          <button id="debug-btn-stop" title="Stop (Shift+F5)" aria-label="Stop" style="display:none;">&#9632;</button>
+          <button id="debug-btn-continue" title="Continue (F5)" aria-label="Continue" class="debug-btn-hidden">&#9654;</button>
+          <button id="debug-btn-pause" title="Pause" aria-label="Pause" class="debug-btn-hidden">&#10073;&#10073;</button>
+          <button id="debug-btn-stepover" title="Step Over (F10)" aria-label="Step Over" class="debug-btn-hidden">&#8594;</button>
+          <button id="debug-btn-stepin" title="Step Into (F11)" aria-label="Step Into" class="debug-btn-hidden">&#8600;</button>
+          <button id="debug-btn-stepout" title="Step Out (Shift+F11)" aria-label="Step Out" class="debug-btn-hidden">&#8598;</button>
+          <button id="debug-btn-restart" title="Restart (Ctrl+Shift+F5)" aria-label="Restart" class="debug-btn-hidden">&#8635;</button>
+          <button id="debug-btn-stop" title="Stop (Shift+F5)" aria-label="Stop" class="debug-btn-hidden">&#9632;</button>
         </div>
         <div class="debug-section">
           <div class="debug-section-header">CALL STACK</div>
@@ -118,7 +119,7 @@
           <button id="treeviews-panel-close" title="Close">&times;</button>
         </div>
         <div id="treeviews-container">
-          <div id="treeviews-empty" style="padding:8px;color:#888;font-size:12px;">No extension views registered.</div>
+          <div id="treeviews-empty" class="empty-state">No extension views registered.</div>
         </div>
       </div>
 
@@ -242,7 +243,7 @@
   </div>
 
   <!-- Comment Thread Popup -->
-  <div id="comment-thread-popup" class="comment-popup-hidden" role="dialog" aria-label="Comment thread" aria-modal="false">
+  <div id="comment-thread-popup" class="comment-popup-hidden" role="dialog" aria-label="Comment thread">
     <div id="comment-thread-popup-header">
       <span id="comment-thread-popup-label"></span>
       <button id="comment-thread-popup-close" aria-label="Close comment thread">&times;</button>

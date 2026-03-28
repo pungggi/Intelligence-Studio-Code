@@ -14,7 +14,6 @@
 
 const net = require('net');
 const fs = require('fs');
-const path = require('path');
 
 const SOCKET_PATH = '/tmp/corecode-spike-ipc.sock';
 
@@ -32,8 +31,6 @@ const server = net.createServer((socket) => {
 
   let protocol = null; // 'binary' or 'json'
   let messageCount = 0;
-  let buffer = Buffer.alloc(0);
-
   socket.on('data', (data) => {
     // First byte selects protocol
     if (protocol === null) {
@@ -157,19 +154,14 @@ server.listen(SOCKET_PATH, () => {
 });
 
 // Cleanup on exit
-process.on('SIGINT', () => {
+function gracefulShutdown() {
   console.log('\nShutting down...');
   server.close();
   if (fs.existsSync(SOCKET_PATH)) {
     fs.unlinkSync(SOCKET_PATH);
   }
   process.exit(0);
-});
+}
 
-process.on('SIGTERM', () => {
-  server.close();
-  if (fs.existsSync(SOCKET_PATH)) {
-    fs.unlinkSync(SOCKET_PATH);
-  }
-  process.exit(0);
-});
+process.on('SIGINT', gracefulShutdown);
+process.on('SIGTERM', gracefulShutdown);

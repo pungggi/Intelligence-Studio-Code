@@ -170,7 +170,7 @@ fn lock_or_default<T: Default>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T>
 const MAX_WEBVIEW_EVENTS: usize = 100;
 
 /// Push a webview panel event, dropping it (with a warning) if the queue is full.
-fn push_webview_event(store: &Arc<Mutex<Vec<WebviewPanelEvent>>>, event: WebviewPanelEvent) {
+fn push_webview_event(store: &Mutex<Vec<WebviewPanelEvent>>, event: WebviewPanelEvent) {
     let mut guard = lock_or_default(store);
     if guard.len() < MAX_WEBVIEW_EVENTS {
         guard.push(event);
@@ -252,7 +252,7 @@ pub struct TerminalEvent {
 
 const MAX_TERMINAL_EVENTS: usize = 200;
 
-fn push_terminal_event(store: &Arc<Mutex<Vec<TerminalEvent>>>, event: TerminalEvent) {
+fn push_terminal_event(store: &Mutex<Vec<TerminalEvent>>, event: TerminalEvent) {
     let mut guard = lock_or_default(store);
     if guard.len() < MAX_TERMINAL_EVENTS {
         guard.push(event);
@@ -299,7 +299,7 @@ pub struct DebugStartRequest {
 
 const MAX_DEBUG_START_REQUESTS: usize = 16;
 
-fn push_debug_start_request(store: &Arc<Mutex<Vec<DebugStartRequest>>>, req: DebugStartRequest) {
+fn push_debug_start_request(store: &Mutex<Vec<DebugStartRequest>>, req: DebugStartRequest) {
     let mut guard = lock_or_default(store);
     if guard.len() >= MAX_DEBUG_START_REQUESTS {
         log::warn!("[IPC] Debug start request queue full — dropping session '{}'", req.session_id);
@@ -432,36 +432,63 @@ pub struct DecorationRange {
     pub hover_message: Option<String>,
 }
 
-/// M6: Pending request awaiting a response from Extension Host.
-/// Uses std::sync::mpsc so recv_timeout works reliably from any thread
-/// (unlike tokio::time::timeout which depends on the tokio runtime's timer driver).
-type PendingRequests = Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<serde_json::Value>>>>;
 
 /// M6: Default timeout for LSP requests (10 seconds).
 const LSP_REQUEST_TIMEOUT_MS: u64 = 10_000;
+
+/// Shared state for the IPC bridge, bundling all synchronized fields so they
+/// can be passed as a single `Arc<IpcState>` instead of 18 separate Arcs.
+pub(crate) struct IpcState {
+    pub diagnostics: Mutex<Vec<Diagnostic>>,
+    pub connected: Mutex<bool>,
+    pub commands: Mutex<Vec<String>>,
+    pub notifications: Mutex<Vec<Notification>>,
+    pub ui_requests: Mutex<Vec<UiRequest>>,
+    pub status_bar_items: Mutex<Vec<StatusBarItem>>,
+    pub output_lines: Mutex<Vec<OutputLine>>,
+    pub decorations: Mutex<Vec<TextDecoration>>,
+    pub pending_requests: Mutex<HashMap<String, std::sync::mpsc::Sender<serde_json::Value>>>,
+    pub request_counter: Mutex<u64>,
+    pub webview_events: Mutex<Vec<WebviewPanelEvent>>,
+    pub terminal_events: Mutex<Vec<TerminalEvent>>,
+    pub debug_start_requests: Mutex<Vec<DebugStartRequest>>,
+    pub workspace_edit_requests: Mutex<Vec<WorkspaceEditRequest>>,
+    pub tree_view_events: Mutex<Vec<TreeViewEvent>>,
+    pub show_text_document_requests: Mutex<Vec<ShowTextDocumentRequest>>,
+    pub scm_states: Mutex<HashMap<String, ScmSourceControlState>>,
+    pub comment_threads: Mutex<HashMap<String, CommentThread>>,
+}
+
+impl IpcState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            diagnostics: Mutex::new(Vec::new()),
+            connected: Mutex::new(false),
+            commands: Mutex::new(Vec::new()),
+            notifications: Mutex::new(Vec::new()),
+            ui_requests: Mutex::new(Vec::new()),
+            status_bar_items: Mutex::new(Vec::new()),
+            output_lines: Mutex::new(Vec::new()),
+            decorations: Mutex::new(Vec::new()),
+            pending_requests: Mutex::new(HashMap::new()),
+            request_counter: Mutex::new(0u64),
+            webview_events: Mutex::new(Vec::new()),
+            terminal_events: Mutex::new(Vec::new()),
+            debug_start_requests: Mutex::new(Vec::new()),
+            workspace_edit_requests: Mutex::new(Vec::new()),
+            tree_view_events: Mutex::new(Vec::new()),
+            show_text_document_requests: Mutex::new(Vec::new()),
+            scm_states: Mutex::new(HashMap::new()),
+            comment_threads: Mutex::new(HashMap::new()),
+        })
+    }
+}
 
 /// Handle to the IPC bridge for sending messages.
 #[derive(Clone)]
 pub struct IpcHandle {
     sender: mpsc::Sender<OutgoingMessage>,
-    diagnostics: Arc<Mutex<Vec<Diagnostic>>>,
-    connected: Arc<Mutex<bool>>,
-    commands: Arc<Mutex<Vec<String>>>,
-    notifications: Arc<Mutex<Vec<Notification>>>,
-    ui_requests: Arc<Mutex<Vec<UiRequest>>>,
-    status_bar_items: Arc<Mutex<Vec<StatusBarItem>>>,
-    output_lines: Arc<Mutex<Vec<OutputLine>>>,
-    decorations: Arc<Mutex<Vec<TextDecoration>>>,
-    pending_requests: PendingRequests,
-    request_counter: Arc<Mutex<u64>>,
-    webview_events: Arc<Mutex<Vec<WebviewPanelEvent>>>,
-    terminal_events: Arc<Mutex<Vec<TerminalEvent>>>,
-    debug_start_requests: Arc<Mutex<Vec<DebugStartRequest>>>,
-    workspace_edit_requests: Arc<Mutex<Vec<WorkspaceEditRequest>>>,
-    tree_view_events: Arc<Mutex<Vec<TreeViewEvent>>>,
-    show_text_document_requests: Arc<Mutex<Vec<ShowTextDocumentRequest>>>,
-    scm_states: Arc<Mutex<HashMap<String, ScmSourceControlState>>>,
-    comment_threads: Arc<Mutex<HashMap<String, CommentThread>>>,
+    state: Arc<IpcState>,
 }
 
 impl IpcHandle {
@@ -472,11 +499,11 @@ impl IpcHandle {
     }
 
     pub fn get_diagnostics(&self) -> Vec<Diagnostic> {
-        lock_or_default(&self.diagnostics).clone()
+        lock_or_default(&self.state.diagnostics).clone()
     }
 
     pub fn get_diagnostics_for_uri(&self, uri: &str) -> Vec<Diagnostic> {
-        lock_or_default(&self.diagnostics)
+        lock_or_default(&self.state.diagnostics)
             .iter()
             .filter(|d| d.uri.as_deref() == Some(uri))
             .cloned()
@@ -484,43 +511,43 @@ impl IpcHandle {
     }
 
     pub fn clear_diagnostics_for_uri(&self, uri: &str) {
-        lock_or_default(&self.diagnostics).retain(|d| d.uri.as_deref() != Some(uri));
+        lock_or_default(&self.state.diagnostics).retain(|d| d.uri.as_deref() != Some(uri));
     }
 
     pub fn is_connected(&self) -> bool {
-        *lock_or_default(&self.connected)
+        *lock_or_default(&self.state.connected)
     }
 
     pub fn get_commands(&self) -> Vec<String> {
-        lock_or_default(&self.commands).clone()
+        lock_or_default(&self.state.commands).clone()
     }
 
     /// Drain all pending notifications (returns and clears them).
     pub fn drain_notifications(&self) -> Vec<Notification> {
-        let mut store = lock_or_default(&self.notifications);
+        let mut store = lock_or_default(&self.state.notifications);
         std::mem::take(&mut *store)
     }
 
     /// Drain all pending UI requests (QuickPick/InputBox).
     pub fn drain_ui_requests(&self) -> Vec<UiRequest> {
-        let mut store = lock_or_default(&self.ui_requests);
+        let mut store = lock_or_default(&self.state.ui_requests);
         std::mem::take(&mut *store)
     }
 
     /// Get current status bar items.
     pub fn get_status_bar_items(&self) -> Vec<StatusBarItem> {
-        lock_or_default(&self.status_bar_items).clone()
+        lock_or_default(&self.state.status_bar_items).clone()
     }
 
     /// Drain pending output lines.
     pub fn drain_output_lines(&self) -> Vec<OutputLine> {
-        let mut store = lock_or_default(&self.output_lines);
+        let mut store = lock_or_default(&self.state.output_lines);
         std::mem::take(&mut *store)
     }
 
     /// Get decorations for a specific URI.
     pub fn get_decorations_for_uri(&self, uri: &str) -> Vec<TextDecoration> {
-        lock_or_default(&self.decorations)
+        lock_or_default(&self.state.decorations)
             .iter()
             .filter(|d| d.uri == uri)
             .cloned()
@@ -529,48 +556,48 @@ impl IpcHandle {
 
     /// M8b: Drain all pending webview panel events.
     pub fn drain_webview_events(&self) -> Vec<WebviewPanelEvent> {
-        let mut store = lock_or_default(&self.webview_events);
+        let mut store = lock_or_default(&self.state.webview_events);
         std::mem::take(&mut *store)
     }
 
     /// Drain all pending terminal events from the Extension Host.
     pub fn drain_terminal_events(&self) -> Vec<TerminalEvent> {
-        let mut store = lock_or_default(&self.terminal_events);
+        let mut store = lock_or_default(&self.state.terminal_events);
         std::mem::take(&mut *store)
     }
 
     /// Drain all pending debug session start requests from the Extension Host.
     pub fn drain_debug_start_requests(&self) -> Vec<DebugStartRequest> {
-        let mut store = lock_or_default(&self.debug_start_requests);
+        let mut store = lock_or_default(&self.state.debug_start_requests);
         std::mem::take(&mut *store)
     }
 
     /// Drain all pending workspace edit requests from the Extension Host.
     pub fn drain_workspace_edit_requests(&self) -> Vec<WorkspaceEditRequest> {
-        let mut store = lock_or_default(&self.workspace_edit_requests);
+        let mut store = lock_or_default(&self.state.workspace_edit_requests);
         std::mem::take(&mut *store)
     }
 
     /// Drain all pending tree view events from the Extension Host.
     pub fn drain_tree_view_events(&self) -> Vec<TreeViewEvent> {
-        let mut store = lock_or_default(&self.tree_view_events);
+        let mut store = lock_or_default(&self.state.tree_view_events);
         std::mem::take(&mut *store)
     }
 
     /// Drain all pending showTextDocument requests from the Extension Host.
     pub fn drain_show_text_document_requests(&self) -> Vec<ShowTextDocumentRequest> {
-        let mut store = lock_or_default(&self.show_text_document_requests);
+        let mut store = lock_or_default(&self.state.show_text_document_requests);
         std::mem::take(&mut *store)
     }
 
     /// Get current SCM source control states (keyed by id) from Extension Host.
     pub fn get_scm_states(&self) -> HashMap<String, ScmSourceControlState> {
-        lock_or_default(&self.scm_states).clone()
+        lock_or_default(&self.state.scm_states).clone()
     }
 
     /// Get all comment threads for the given URI.
     pub fn get_comment_threads_for_uri(&self, uri: &str) -> Vec<CommentThread> {
-        lock_or_default(&self.comment_threads)
+        lock_or_default(&self.state.comment_threads)
             .values()
             .filter(|t| t.uri == uri)
             .cloned()
@@ -579,7 +606,7 @@ impl IpcHandle {
 
     /// M6: Generate a unique request ID.
     fn next_request_id(&self) -> String {
-        let mut counter = lock_or_default(&self.request_counter);
+        let mut counter = lock_or_default(&self.state.request_counter);
         *counter += 1;
         format!("req-{}", *counter)
     }
@@ -597,7 +624,7 @@ impl IpcHandle {
         let (tx, rx) = std::sync::mpsc::channel();
 
         // Register pending request
-        lock_or_default(&self.pending_requests).insert(request_id.clone(), tx);
+        lock_or_default(&self.state.pending_requests).insert(request_id.clone(), tx);
 
         // Send the request
         self.send(OutgoingMessage::LspRequest {
@@ -611,12 +638,12 @@ impl IpcHandle {
             Ok(value) => Ok(value),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Timeout — remove from pending
-                lock_or_default(&self.pending_requests).remove(&request_id);
+                lock_or_default(&self.state.pending_requests).remove(&request_id);
                 Err("LSP request timed out".to_string())
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 // Channel was dropped (e.g., disconnect) — clean up pending entry
-                lock_or_default(&self.pending_requests).remove(&request_id);
+                lock_or_default(&self.state.pending_requests).remove(&request_id);
                 Err("LSP request cancelled".to_string())
             }
         }
@@ -635,45 +662,11 @@ pub fn find_free_port() -> u16 {
 /// The bridge runs in a background thread with its own Tokio runtime.
 pub fn start_ipc_bridge(port: u16, auth_token: &str) -> IpcHandle {
     let (tx, rx) = mpsc::channel::<OutgoingMessage>(256);
-    let diagnostics = Arc::new(Mutex::new(Vec::new()));
-    let connected = Arc::new(Mutex::new(false));
-    let commands = Arc::new(Mutex::new(Vec::new()));
-    let notifications = Arc::new(Mutex::new(Vec::new()));
-    let ui_requests = Arc::new(Mutex::new(Vec::new()));
-    let status_bar_items = Arc::new(Mutex::new(Vec::new()));
-    let output_lines = Arc::new(Mutex::new(Vec::new()));
-    let decorations = Arc::new(Mutex::new(Vec::new()));
-    let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
-    let request_counter = Arc::new(Mutex::new(0u64));
-    let webview_events: Arc<Mutex<Vec<WebviewPanelEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let terminal_events: Arc<Mutex<Vec<TerminalEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let debug_start_requests: Arc<Mutex<Vec<DebugStartRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let workspace_edit_requests: Arc<Mutex<Vec<WorkspaceEditRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let tree_view_events: Arc<Mutex<Vec<TreeViewEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let show_text_document_requests: Arc<Mutex<Vec<ShowTextDocumentRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let scm_states: Arc<Mutex<HashMap<String, ScmSourceControlState>>> = Arc::new(Mutex::new(HashMap::new()));
-    let comment_threads: Arc<Mutex<HashMap<String, CommentThread>>> = Arc::new(Mutex::new(HashMap::new()));
+    let state = IpcState::new();
 
     let handle = IpcHandle {
         sender: tx,
-        diagnostics: diagnostics.clone(),
-        connected: connected.clone(),
-        commands: commands.clone(),
-        notifications: notifications.clone(),
-        ui_requests: ui_requests.clone(),
-        status_bar_items: status_bar_items.clone(),
-        output_lines: output_lines.clone(),
-        decorations: decorations.clone(),
-        pending_requests: pending_requests.clone(),
-        request_counter,
-        webview_events: webview_events.clone(),
-        terminal_events: terminal_events.clone(),
-        debug_start_requests: debug_start_requests.clone(),
-        workspace_edit_requests: workspace_edit_requests.clone(),
-        tree_view_events: tree_view_events.clone(),
-        show_text_document_requests: show_text_document_requests.clone(),
-        scm_states: scm_states.clone(),
-        comment_threads: comment_threads.clone(),
+        state: state.clone(),
     };
 
     let token_for_thread = auth_token.to_string();
@@ -686,7 +679,7 @@ pub fn start_ipc_bridge(port: u16, auth_token: &str) -> IpcHandle {
                 .expect("Failed to create Tokio runtime");
 
             rt.block_on(async move {
-                ipc_loop(port, &token_for_thread, rx, diagnostics, connected, commands, notifications, ui_requests, status_bar_items, output_lines, decorations, pending_requests, webview_events, terminal_events, debug_start_requests, workspace_edit_requests, tree_view_events, show_text_document_requests, scm_states, comment_threads).await;
+                ipc_loop(port, &token_for_thread, rx, state).await;
             });
         })
         .expect("Failed to spawn IPC bridge thread");
@@ -698,23 +691,7 @@ async fn ipc_loop(
     port: u16,
     auth_token: &str,
     mut rx: mpsc::Receiver<OutgoingMessage>,
-    diagnostics: Arc<Mutex<Vec<Diagnostic>>>,
-    connected: Arc<Mutex<bool>>,
-    commands: Arc<Mutex<Vec<String>>>,
-    notifications: Arc<Mutex<Vec<Notification>>>,
-    ui_requests: Arc<Mutex<Vec<UiRequest>>>,
-    status_bar_items: Arc<Mutex<Vec<StatusBarItem>>>,
-    output_lines: Arc<Mutex<Vec<OutputLine>>>,
-    decorations: Arc<Mutex<Vec<TextDecoration>>>,
-    pending_requests: PendingRequests,
-    webview_events: Arc<Mutex<Vec<WebviewPanelEvent>>>,
-    terminal_events: Arc<Mutex<Vec<TerminalEvent>>>,
-    debug_start_requests: Arc<Mutex<Vec<DebugStartRequest>>>,
-    workspace_edit_requests: Arc<Mutex<Vec<WorkspaceEditRequest>>>,
-    tree_view_events: Arc<Mutex<Vec<TreeViewEvent>>>,
-    show_text_document_requests: Arc<Mutex<Vec<ShowTextDocumentRequest>>>,
-    scm_states: Arc<Mutex<HashMap<String, ScmSourceControlState>>>,
-    comment_threads: Arc<Mutex<HashMap<String, CommentThread>>>,
+    state: Arc<IpcState>,
 ) {
     let addr = format!("{}:{}", IPC_HOST, port);
     let mut retry_count: u32 = 0;
@@ -732,18 +709,18 @@ async fn ipc_loop(
 
         match TcpStream::connect(&addr).await {
             Ok(stream) => {
-                *lock_or_default(&connected) = true;
+                *lock_or_default(&state.connected) = true;
                 log::info!("[IPC] Connected to Extension Host at {}", addr);
 
                 // Reset backoff on successful connection
                 retry_count = 0;
                 delay_ms = INITIAL_RETRY_DELAY_MS;
 
-                if let Err(e) = handle_connection(stream, auth_token, &mut rx, &diagnostics, &commands, &notifications, &ui_requests, &status_bar_items, &output_lines, &decorations, &pending_requests, &webview_events, &terminal_events, &debug_start_requests, &workspace_edit_requests, &tree_view_events, &show_text_document_requests, &scm_states, &comment_threads).await {
+                if let Err(e) = handle_connection(stream, auth_token, &mut rx, &state).await {
                     log::warn!("[IPC] Connection lost: {}", e);
                 }
 
-                *lock_or_default(&connected) = false;
+                *lock_or_default(&state.connected) = false;
             }
             Err(e) => {
                 if retry_count % 10 == 0 {
@@ -768,22 +745,7 @@ async fn handle_connection(
     stream: TcpStream,
     auth_token: &str,
     rx: &mut mpsc::Receiver<OutgoingMessage>,
-    diagnostics: &Arc<Mutex<Vec<Diagnostic>>>,
-    commands: &Arc<Mutex<Vec<String>>>,
-    notifications: &Arc<Mutex<Vec<Notification>>>,
-    ui_requests: &Arc<Mutex<Vec<UiRequest>>>,
-    status_bar_items: &Arc<Mutex<Vec<StatusBarItem>>>,
-    output_lines: &Arc<Mutex<Vec<OutputLine>>>,
-    decorations: &Arc<Mutex<Vec<TextDecoration>>>,
-    pending_requests: &PendingRequests,
-    webview_events: &Arc<Mutex<Vec<WebviewPanelEvent>>>,
-    terminal_events: &Arc<Mutex<Vec<TerminalEvent>>>,
-    debug_start_requests: &Arc<Mutex<Vec<DebugStartRequest>>>,
-    workspace_edit_requests: &Arc<Mutex<Vec<WorkspaceEditRequest>>>,
-    tree_view_events: &Arc<Mutex<Vec<TreeViewEvent>>>,
-    show_text_document_requests: &Arc<Mutex<Vec<ShowTextDocumentRequest>>>,
-    scm_states: &Arc<Mutex<HashMap<String, ScmSourceControlState>>>,
-    comment_threads: &Arc<Mutex<HashMap<String, CommentThread>>>,
+    state: &Arc<IpcState>,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
 
@@ -795,26 +757,12 @@ async fn handle_connection(
         let len = (json.len() as u32).to_le_bytes();
         writer.write_all(&len).await?;
         writer.write_all(&json).await?;
+        writer.flush().await?;
         log::info!("[IPC] Auth token sent");
     }
 
     // Spawn reader task
-    let diag_clone = diagnostics.clone();
-    let cmd_clone = commands.clone();
-    let notif_clone = notifications.clone();
-    let ui_clone = ui_requests.clone();
-    let sb_clone = status_bar_items.clone();
-    let out_clone = output_lines.clone();
-    let dec_clone = decorations.clone();
-    let pending_clone = pending_requests.clone();
-    let wv_clone = webview_events.clone();
-    let te_clone = terminal_events.clone();
-    let dsr_clone = debug_start_requests.clone();
-    let wer_clone = workspace_edit_requests.clone();
-    let tve_clone = tree_view_events.clone();
-    let std_clone = show_text_document_requests.clone();
-    let scm_clone = scm_states.clone();
-    let ct_clone = comment_threads.clone();
+    let state_clone = state.clone();
     let mut read_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         let mut accumulated = Vec::new();
@@ -857,7 +805,7 @@ async fn handle_connection(
 
                         let payload = &accumulated[4..4 + frame_len];
                         match serde_json::from_slice::<IncomingMessage>(payload) {
-                            Ok(msg) => handle_incoming(&msg, &diag_clone, &cmd_clone, &notif_clone, &ui_clone, &sb_clone, &out_clone, &dec_clone, &pending_clone, &wv_clone, &te_clone, &dsr_clone, &wer_clone, &tve_clone, &std_clone, &scm_clone, &ct_clone),
+                            Ok(msg) => handle_incoming(&msg, &state_clone),
                             Err(e) => log::warn!("[IPC] Malformed message: {}", e),
                         }
 
@@ -883,6 +831,7 @@ async fn handle_connection(
                         let len = (json.len() as u32).to_le_bytes();
                         writer.write_all(&len).await?;
                         writer.write_all(&json).await?;
+                        writer.flush().await?;
                     }
                     None => break,
                 }
@@ -893,28 +842,40 @@ async fn handle_connection(
         }
     }
 
+    // Drain pending LSP requests so callers unblock immediately on disconnect
+    // instead of waiting for the 10-second timeout.
+    {
+        let mut pending = lock_or_default(&state.pending_requests);
+        if !pending.is_empty() {
+            log::info!("[IPC] Draining {} pending requests on disconnect", pending.len());
+            pending.clear();
+        }
+    }
+
     Ok(())
 }
 
 fn handle_incoming(
     msg: &IncomingMessage,
-    diagnostics: &Arc<Mutex<Vec<Diagnostic>>>,
-    commands: &Arc<Mutex<Vec<String>>>,
-    notifications: &Arc<Mutex<Vec<Notification>>>,
-    ui_requests: &Arc<Mutex<Vec<UiRequest>>>,
-    status_bar_items: &Arc<Mutex<Vec<StatusBarItem>>>,
-    output_lines: &Arc<Mutex<Vec<OutputLine>>>,
-    decorations: &Arc<Mutex<Vec<TextDecoration>>>,
-    pending_requests: &PendingRequests,
-    webview_events: &Arc<Mutex<Vec<WebviewPanelEvent>>>,
-    terminal_events: &Arc<Mutex<Vec<TerminalEvent>>>,
-    debug_start_requests: &Arc<Mutex<Vec<DebugStartRequest>>>,
-    workspace_edit_requests: &Arc<Mutex<Vec<WorkspaceEditRequest>>>,
-    tree_view_events: &Arc<Mutex<Vec<TreeViewEvent>>>,
-    show_text_document_requests: &Arc<Mutex<Vec<ShowTextDocumentRequest>>>,
-    scm_states: &Arc<Mutex<HashMap<String, ScmSourceControlState>>>,
-    comment_threads: &Arc<Mutex<HashMap<String, CommentThread>>>,
+    state: &Arc<IpcState>,
 ) {
+    let diagnostics = &state.diagnostics;
+    let commands = &state.commands;
+    let notifications = &state.notifications;
+    let ui_requests = &state.ui_requests;
+    let status_bar_items = &state.status_bar_items;
+    let output_lines = &state.output_lines;
+    let decorations = &state.decorations;
+    let pending_requests = &state.pending_requests;
+    let webview_events = &state.webview_events;
+    let terminal_events = &state.terminal_events;
+    let debug_start_requests = &state.debug_start_requests;
+    let workspace_edit_requests = &state.workspace_edit_requests;
+    let tree_view_events = &state.tree_view_events;
+    let show_text_document_requests = &state.show_text_document_requests;
+    let scm_states = &state.scm_states;
+    let comment_threads = &state.comment_threads;
+
     match msg.method.as_str() {
         // M6: LSP response correlation
         "lsp/response" => {
@@ -1067,7 +1028,7 @@ fn handle_incoming(
                 let panel_id = params.get("panel_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let view_type = params.get("view_type").and_then(|v| v.as_str()).map(|s| s.to_string());
                 let title = params.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
-                let column = params.get("column").and_then(|v| v.as_u64()).map(|n| n as u32);
+                let column = params.get("column").and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok());
                 let enable_scripts = params.get("enable_scripts").and_then(|v| v.as_bool());
                 push_webview_event(webview_events, WebviewPanelEvent { kind: "create".to_string(), panel_id, title, view_type, column, enable_scripts, html: None, message: None });
             }
@@ -1089,7 +1050,7 @@ fn handle_incoming(
         "webview/reveal" => {
             if let Some(params) = &msg.params {
                 let panel_id = params.get("panel_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let column = params.get("column").and_then(|v| v.as_u64()).map(|n| n as u32);
+                let column = params.get("column").and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok());
                 push_webview_event(webview_events, WebviewPanelEvent { kind: "reveal".to_string(), panel_id, title: None, view_type: None, column, enable_scripts: None, html: None, message: None });
             }
         }

@@ -218,7 +218,7 @@ read_directory(path)      → Vec<DirEntry>
 | **LSP client** | `LanguageClient` class, JSON-RPC 2.0 over stdio, child process management | Done |
 | **Request/response IPC** | Correlation IDs with oneshot channels (Rust), async dispatch (Node.js) | Done |
 | **CompletionItemProvider** | `registerCompletionItemProvider` → autocomplete popup with icons, detail panel | Done |
-| **HoverProvider** | `registerHoverProvider` → hover tooltip on mouse hover (5090ms delay) | Done |
+| **HoverProvider** | `registerHoverProvider` → hover tooltip on mouse hover (500ms delay) | Done |
 | **Go-to-definition** | `registerDefinitionProvider` → Ctrl+Click / F12, cross-file navigation | Done |
 | **Find references** | `registerReferenceProvider` → Shift+F12, floating references panel | Done |
 | **Code actions** | `registerCodeActionProvider` → Ctrl+., quick fix menu with workspace edits | Done |

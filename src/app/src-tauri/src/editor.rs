@@ -453,34 +453,58 @@ impl DocumentBuffer {
 
         let mut matches = Vec::new();
         let text = self.rope.to_string();
-
-        let (search_text, search_query) = if case_sensitive {
-            (std::borrow::Cow::Borrowed(text.as_str()), std::borrow::Cow::Borrowed(query))
-        } else {
-            (std::borrow::Cow::Owned(text.to_lowercase()), std::borrow::Cow::Owned(query.to_lowercase()))
-        };
-
         let query_char_len = query.chars().count();
-        let mut start = 0;
-        let mut char_offset_at_start: usize = 0;
-        while let Some(pos) = search_text[start..].find(&*search_query) {
-            let byte_pos = start + pos;
-            // Count chars only in the segment since last position (incremental, not O(n))
-            char_offset_at_start += text[start..byte_pos].chars().count();
-            let char_pos = char_offset_at_start;
-            let line = self.rope.char_to_line(char_pos);
-            let line_start = self.rope.line_to_char(line);
-            let col = char_pos - line_start;
 
-            matches.push(FindMatch {
-                line,
-                col,
-                length: query_char_len,
-            });
+        if case_sensitive {
+            let mut start = 0;
+            let mut char_offset_at_start: usize = 0;
+            while let Some(pos) = text[start..].find(query) {
+                let byte_pos = start + pos;
+                // Count chars only in the segment since last position (incremental, not O(n))
+                char_offset_at_start += text[start..byte_pos].chars().count();
+                let char_pos = char_offset_at_start;
+                let line = self.rope.char_to_line(char_pos);
+                let line_start = self.rope.line_to_char(line);
+                let col = char_pos - line_start;
+                matches.push(FindMatch { line, col, length: query_char_len });
+                let next_start = byte_pos + query.len();
+                char_offset_at_start += text[byte_pos..next_start].chars().count();
+                start = next_start;
+            }
+        } else {
+            // Case-insensitive: build a mapping from byte positions in the lowercased text
+            // back to char indices in the original text. This correctly handles non-ASCII
+            // characters whose lowercase form differs in byte length (e.g., Turkish dotted-I).
+            let query_lower = query.to_lowercase();
 
-            let next_start = byte_pos + search_query.len();
-            char_offset_at_start += text[byte_pos..next_start].chars().count();
-            start = next_start;
+            // lower_to_orig_char[i] = original char index for byte i of the lowercased text.
+            let mut lower_to_orig_char: Vec<usize> = Vec::with_capacity(text.len());
+            let mut lower_text = String::with_capacity(text.len());
+            for (char_idx, ch) in text.chars().enumerate() {
+                for lc in ch.to_lowercase() {
+                    let lc_len = lc.len_utf8();
+                    lower_text.push(lc);
+                    for _ in 0..lc_len {
+                        lower_to_orig_char.push(char_idx);
+                    }
+                }
+            }
+
+            let mut start_lower = 0; // byte offset into lower_text
+            while let Some(pos) = lower_text[start_lower..].find(query_lower.as_str()) {
+                let lower_byte_pos = start_lower + pos;
+                // Map the match start back to an original char index.
+                let orig_char_pos = lower_to_orig_char
+                    .get(lower_byte_pos)
+                    .copied()
+                    .unwrap_or(0);
+                // rope.char_to_line is O(log n) — no need for incremental char counting here.
+                let line = self.rope.char_to_line(orig_char_pos);
+                let line_start = self.rope.line_to_char(line);
+                let col = orig_char_pos - line_start;
+                matches.push(FindMatch { line, col, length: query_char_len });
+                start_lower = lower_byte_pos + query_lower.len();
+            }
         }
 
         matches
@@ -598,6 +622,8 @@ pub struct WorkspaceState {
     buffers: HashMap<PathBuf, DocumentBuffer>,
     active_path: Option<PathBuf>,
     parser: tree_sitter::Parser,
+    /// Canonicalized root of the open workspace folder, if any.
+    workspace_root: Option<PathBuf>,
 }
 
 #[allow(dead_code)]
@@ -610,7 +636,18 @@ impl WorkspaceState {
             buffers: HashMap::new(),
             active_path: None,
             parser,
+            workspace_root: None,
         }
+    }
+
+    /// Record the workspace root so that out-of-buffer write paths can be
+    /// restricted to files within the workspace folder.
+    pub fn set_workspace_root(&mut self, root: PathBuf) {
+        self.workspace_root = Some(root);
+    }
+
+    pub fn workspace_root(&self) -> Option<&PathBuf> {
+        self.workspace_root.as_ref()
     }
 
     /// Open a file into a new buffer (or switch to it if already open).
@@ -790,31 +827,49 @@ impl WorkspaceState {
     fn set_language_from_ext(&mut self, ext: &str) {
         match ext {
             "js" | "jsx" | "mjs" | "cjs" => {
-                let _ = self.parser.set_language(&tree_sitter_javascript::LANGUAGE.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_javascript::LANGUAGE.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             "ts" => {
-                let _ = self.parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             "tsx" => {
-                let _ = self.parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             "rs" => {
-                let _ = self.parser.set_language(&tree_sitter_rust::LANGUAGE.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_rust::LANGUAGE.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             "py" | "pyw" => {
-                let _ = self.parser.set_language(&tree_sitter_python::LANGUAGE.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_python::LANGUAGE.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             "json" | "jsonc" => {
-                let _ = self.parser.set_language(&tree_sitter_json::LANGUAGE.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_json::LANGUAGE.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             "html" | "htm" => {
-                let _ = self.parser.set_language(&tree_sitter_html::LANGUAGE.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_html::LANGUAGE.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             "css" | "scss" => {
-                let _ = self.parser.set_language(&tree_sitter_css::LANGUAGE.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_css::LANGUAGE.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             "md" | "markdown" => {
-                let _ = self.parser.set_language(&tree_sitter_md::LANGUAGE.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_md::LANGUAGE.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             _ => {
                 // Unknown language — no tree-sitter support

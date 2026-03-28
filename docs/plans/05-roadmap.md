@@ -117,7 +117,7 @@ Each phase is a shippable increment. Earlier phases do not depend on later ones.
 | Zed packager | Generates `extension.toml`, language dirs from grammar-provider output |
 | VS Code adapter generator | Generates `package.json` + `dist/extension.js` adapter |
 | `corecode-bridge.js` — VS Code variant | `acquireVsCodeApi()` implementation |
-| `corecode-bridge.js` — Zed variant | Zed postMessage shim (if Zed adds webview support) |
+| `corecode-bridge.js` — Zed variant | Zed postMessage shim — **conditional on Zed adding webview support** (pending Zed roadmap confirmation; omit from Phase 5 if not available) |
 | `cargo corecode check` | Compatibility matrix output for each target |
 | Documentation | Developer guide: "Write once, publish everywhere" |
 | Example | `examples/simple-lsp/` built for all three targets; manual test in each editor |
@@ -147,11 +147,11 @@ Each phase is a shippable increment. Earlier phases do not depend on later ones.
 
 ```
 Phase 1 (WASM Host)
-  └── Phase 2 (Language APIs)
-        └── Phase 3 (Grammar)
-        └── Phase 4 (Webview)
-              └── Phase 5 (Toolchain) ← also depends on Phase 2
-                    └── Phase 6 (Marketplace)
+  ├── Phase 2 (Language APIs)
+  │     └── Phase 4 (Webview)
+  │           └── Phase 5 (Toolchain) ← also depends on Phase 2
+  │                 └── Phase 6 (Marketplace)
+  └── Phase 3 (Grammar)
 ```
 
 Phases 2 and 3 are independent of each other; both depend on Phase 1.

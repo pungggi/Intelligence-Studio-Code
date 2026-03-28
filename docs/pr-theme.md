@@ -34,7 +34,15 @@ CoreCode uses a **"Frankenstein" hybrid architecture** — native Rust performan
 │  │  • Notification toasts                            │  │
 │  └──────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
-```
+
+### IPC Port Management (127.0.0.1:17532)
+
+While the IPC connection currently defaults to the hardcoded address `127.0.0.1:17532`, the Tauri v2 Shell / TCP IPC implementation handles address conflicts with the following strategy:
+- **Bind Failures**: Startup will detect TCP bind failures immediately if the port is already in use.
+- **Configurability**: It is recommended to make the port configurable via an environment variable or CLI flag.
+- **Fallback Behavior**: If the default port is taken, the system will fallback by trying a configurable port range or selecting a random ephemeral port.
+- **User Error Communication**: For port-in-use failures, the exact user-facing error text shown will be: `Error: IPC port 17532 is already in use. Please specify a different port or check if another instance is running.`
+- **Instance Detection & Coordination**: The implementation should use an optional instance detection/coordination strategy (e.g., using a lockfile, a PID socket, or discovery on the same port) so users know how multi-instance conflicts are detected and intelligently resolved.
 
 ## Key Design Decisions
 
@@ -89,4 +97,4 @@ CoreCode uses a **"Frankenstein" hybrid architecture** — native Rust performan
 | IPC round-trip | 60µs (JSON) | < 1ms |
 | Extension command RTT | 131µs avg | < 5ms |
 | Tree-sitter initial parse (10k lines) | 37ms | < 50ms |
-| Tree-sitter incremental re-parse | 1.4ms | < 1ms |
+| Tree-sitter incremental re-parse | 1.4ms | < 1ms _(1.4ms measured; ~15% above target; async thread optimization planned)_ |

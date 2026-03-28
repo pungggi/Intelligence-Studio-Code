@@ -16,6 +16,7 @@ import { join, isAbsolute, normalize } from "node:path";
 export interface Repository {
   rootUri: { fsPath: string; toString(): string };
   state: RepositoryState;
+  dispose(): void;
   log(options?: LogOptions): Promise<Commit[]>;
   getCommit(hash: string): Promise<Commit>;
   blame(path: string): Promise<BlameHunk[]>;
@@ -49,11 +50,12 @@ export interface Remote { name: string; fetchUrl?: string; pushUrl?: string }
 export interface Change { uri: { fsPath: string }; status: number }
 export interface Commit { hash: string; message: string; authorName: string; authorEmail: string; authorDate: Date; commitDate: Date; parents: string[] }
 export interface BlameHunk { originalStartLineNumber: number; originalEndLineNumber: number; finalStartLineNumber: number; finalEndLineNumber: number; commit: Commit }
-export interface LogOptions { maxEntries?: number; path?: string; follow?: boolean }
+export interface LogOptions { maxEntries?: number; path?: string; follow?: boolean; excludeMerges?: boolean }
 
 // ─── git subprocess helper ────────────────────────────────────
 
 const GIT_TIMEOUT_MS = 30_000;
+const MAX_OUTPUT_BYTES = 10 * 1024 * 1024; // 10 MB per stream
 
 function git(args: string[], cwd: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -64,8 +66,32 @@ function git(args: string[], cwd: string): Promise<string> {
       proc.kill();
       reject(new Error(`git ${args[0]} timed out after ${GIT_TIMEOUT_MS}ms`));
     }, GIT_TIMEOUT_MS);
-    proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
-    proc.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    proc.stdout.on('data', (d: Buffer) => {
+      stdoutBytes += d.length;
+      if (stdoutBytes > MAX_OUTPUT_BYTES) {
+        proc.stdout.removeAllListeners('data');
+        proc.stderr.removeAllListeners('data');
+        proc.kill();
+        clearTimeout(timer);
+        reject(new Error(`git ${args[0]} output exceeded ${MAX_OUTPUT_BYTES} bytes (stdout truncated at: ${stdout.slice(-256)})`));
+        return;
+      }
+      stdout += d.toString();
+    });
+    proc.stderr.on('data', (d: Buffer) => {
+      stderrBytes += d.length;
+      if (stderrBytes > MAX_OUTPUT_BYTES) {
+        proc.stdout.removeAllListeners('data');
+        proc.stderr.removeAllListeners('data');
+        proc.kill();
+        clearTimeout(timer);
+        reject(new Error(`git ${args[0]} stderr exceeded ${MAX_OUTPUT_BYTES} bytes`));
+        return;
+      }
+      stderr += d.toString();
+    });
     proc.on('close', (code) => {
       clearTimeout(timer);
       if (code !== 0) reject(new Error(`git ${args[0]} failed (${code}): ${stderr.trim()}`));
@@ -80,6 +106,11 @@ function git(args: string[], cwd: string): Promise<string> {
 const LOG_SEP = '\x00';
 const LOG_FMT = `%H${LOG_SEP}%s${LOG_SEP}%an${LOG_SEP}%ae${LOG_SEP}%aI${LOG_SEP}%cI${LOG_SEP}%P`;
 
+function safeDate(value: string | undefined): Date {
+  const d = new Date(value || 0);
+  return isNaN(d.getTime()) ? new Date(0) : d;
+}
+
 function parseCommits(raw: string): Commit[] {
   return raw.trim().split('\n').filter(Boolean).map(line => {
     const [hash, message, authorName, authorEmail, aDate, cDate, parents] = line.split(LOG_SEP);
@@ -88,8 +119,8 @@ function parseCommits(raw: string): Commit[] {
       message: message ?? '',
       authorName: authorName ?? '',
       authorEmail: authorEmail ?? '',
-      authorDate: new Date(aDate || 0),
-      commitDate: new Date(cDate || 0),
+      authorDate: safeDate(aDate),
+      commitDate: safeDate(cDate),
       parents: parents ? parents.split(' ').filter(Boolean) : [],
     };
   });
@@ -163,6 +194,15 @@ function makeRepository(root: string): Repository {
         } catch { /* no upstream */ }
       }
 
+      // Refs (local branches)
+      try {
+        const refsOut = (await git(['for-each-ref', '--format=%(refname:short)\t%(objectname:short)\t%(refname:strip=2)', 'refs/heads/'], root)).trim();
+        _refsCache = refsOut ? refsOut.split('\n').map(line => {
+          const [name, commit] = line.split('\t');
+          return { name, commit: commit ?? '', type: 0 as 0 };
+        }) : [];
+      } catch { _refsCache = []; }
+
       // Status
       const statusOut = await git(['status', '--porcelain=v1', '-z'], root).catch(() => '');
       _changesCache = { working: [], index: [], merge: [] };
@@ -202,7 +242,8 @@ function makeRepository(root: string): Repository {
       };
     },
     async log(options: LogOptions = {}): Promise<Commit[]> {
-      const args = ['log', `--format=${LOG_FMT}`, '--no-merges'];
+      const args = ['log', `--format=${LOG_FMT}`];
+      if (options.excludeMerges) args.push('--no-merges');
       if (options.maxEntries) args.push(`-${options.maxEntries}`);
       if (options.follow && options.path) args.push('--follow');
       if (options.path) args.push('--', options.path);
@@ -210,11 +251,21 @@ function makeRepository(root: string): Repository {
       return parseCommits(raw);
     },
     async getCommit(hash: string): Promise<Commit> {
-      const raw = await git(['show', '-s', `--format=${LOG_FMT}`, hash], root);
+      if (hash.startsWith('-') || !/^[A-Za-z0-9_./:@^~\-{}]+$/.test(hash)) {
+        throw new Error(`getCommit: unsafe hash '${hash}'`);
+      }
+      const raw = await git(['show', '-s', `--format=${LOG_FMT}`, '--', hash], root);
       return parseCommits(raw)[0] ?? { hash, message: '', authorName: '', authorEmail: '', authorDate: new Date(), commitDate: new Date(), parents: [] };
     },
     async blame(filePath: string): Promise<BlameHunk[]> {
-      const raw = await git(['blame', '--porcelain', filePath], root);
+      if (isAbsolute(filePath)) {
+        throw new Error(`blame: filePath must be relative, got '${filePath}'`);
+      }
+      const normalized = normalize(filePath);
+      if (normalized.startsWith('..')) {
+        throw new Error(`blame: filePath '${filePath}' traverses outside repository`);
+      }
+      const raw = await git(['blame', '--porcelain', '--', filePath], root);
       return parseBlame(raw);
     },
     async diff(options: { cached?: boolean } = {}): Promise<string> {
@@ -231,18 +282,24 @@ function makeRepository(root: string): Repository {
       if (normalized.startsWith('..')) {
         throw new Error(`show: filePath '${filePath}' traverses outside repository`);
       }
-      // Validate ref: only allow safe characters to prevent shell injection via the git argument.
-      // Includes {} for stash refs (stash@{0}) and branch@{n} syntax.
-      if (!/^[A-Za-z0-9_./:@^~\-{}]+$/.test(ref)) {
+      // Validate ref: only allow safe characters and reject leading dashes to prevent
+      // flag injection. Includes {} for stash refs (stash@{0}) and branch@{n} syntax.
+      if (ref.startsWith('-') || !/^[A-Za-z0-9_./:@^~\-{}]+$/.test(ref)) {
         throw new Error(`show: unsafe ref '${ref}'`);
       }
       return git(['show', `${ref}:${filePath}`], root);
     },
     async getConfig(key: string): Promise<string> {
-      return (await git(['config', '--get', key], root)).trim();
+      if (!/^[a-zA-Z][a-zA-Z0-9._-]*$/.test(key)) {
+        throw new Error(`getConfig: unsafe key '${key}'`);
+      }
+      return (await git(['config', '--get', '--', key], root)).trim();
     },
     async getBranch(name: string): Promise<Branch> {
-      const hash = (await git(['rev-parse', name], root)).trim();
+      if (name.startsWith('-') || !/^[A-Za-z0-9_./:@^~\-{}]+$/.test(name)) {
+        throw new Error(`getBranch: unsafe name '${name}'`);
+      }
+      const hash = (await git(['rev-parse', '--', name], root)).trim();
       return { name, commit: hash, type: name.includes('/') ? 1 : 0 };
     },
     async getBranches(query: { remote?: boolean } = {}): Promise<Branch[]> {
@@ -276,9 +333,9 @@ export function createGitExtension(workspaceRoot: string) {
               return fp === rp || fp.startsWith(rp + '/') || fp.startsWith(rp + '\\');
             }) ?? null;
           },
-          onDidOpenRepository: (_l: unknown) => ({ dispose: () => {} }),
-          onDidCloseRepository: (_l: unknown) => ({ dispose: () => {} }),
-          onDidChangeState: (_l: unknown) => ({ dispose: () => {} }),
+          onDidOpenRepository: (_l: unknown) => ({ dispose: () => { } }),
+          onDidCloseRepository: (_l: unknown) => ({ dispose: () => { } }),
+          onDidChangeState: (_l: unknown) => ({ dispose: () => { } }),
         };
       },
       isAuthenticated: false,
@@ -286,7 +343,7 @@ export function createGitExtension(workspaceRoot: string) {
     id: 'vscode.git',
     extensionUri: { fsPath: '' },
     isActive: true,
-    activate: async () => {},
-    deactivate: () => { (repo as unknown as { dispose(): void }).dispose(); },
+    activate: async () => { },
+    deactivate: () => { repo.dispose(); },
   };
 }

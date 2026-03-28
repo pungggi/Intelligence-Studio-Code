@@ -3,6 +3,7 @@
 //! These functions are called from inside the WASM sandbox via the wasmtime linker.
 //! All state that the WASM extension can observe is mediated through `HostContext`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -16,16 +17,30 @@ pub struct HostContext {
     /// Buffered output lines: (channel, message). Drained by `drain_all_output_lines`.
     pub(crate) output_lines: Arc<Mutex<Vec<(String, String)>>>,
     /// Status bar items: id → (text, tooltip).
-    pub(crate) status_items: Arc<Mutex<std::collections::HashMap<String, (String, Option<String>)>>>,
+    pub(crate) status_items: Arc<Mutex<HashMap<String, (String, Option<String>)>>>,
+    /// Buffered notification toasts: (level, message). Drained by `drain_all_notifications`.
+    pub(crate) notifications: Arc<Mutex<Vec<(String, String)>>>,
+    /// Extension id — used to scope config key lookups.
+    pub(crate) extension_id: String,
+    /// Shared settings store for `get-config` lookups.
+    pub(crate) settings: Option<Arc<Mutex<crate::settings::SettingsStore>>>,
 }
 
 impl HostContext {
-    pub fn new(workspace_root: Option<PathBuf>, workspace_read: bool) -> Self {
+    pub fn new(
+        workspace_root: Option<PathBuf>,
+        workspace_read: bool,
+        extension_id: String,
+        settings: Option<Arc<Mutex<crate::settings::SettingsStore>>>,
+    ) -> Self {
         Self {
             workspace_root,
             workspace_read_allowed: workspace_read,
             output_lines: Arc::new(Mutex::new(Vec::new())),
-            status_items: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            status_items: Arc::new(Mutex::new(HashMap::new())),
+            notifications: Arc::new(Mutex::new(Vec::new())),
+            extension_id,
+            settings,
         }
     }
 }
@@ -48,13 +63,17 @@ pub fn host_log(ctx: &mut HostContext, channel: String, message: String) {
 
 // ── ui::show_message ─────────────────────────────────────────────────────────
 
-pub fn host_show_message(_ctx: &mut HostContext, level: String, message: String) {
+pub fn host_show_message(ctx: &mut HostContext, level: String, message: String) {
     match level.as_str() {
         "error"   => log::error!("[wasm-ext] {}", message),
         "warning" => log::warn!("[wasm-ext] {}", message),
         _         => log::info!("[wasm-ext] {}", message),
     }
-    // TODO Phase 1 follow-up: emit a Tauri event so the frontend shows a notification toast.
+    if let Ok(mut notifs) = ctx.notifications.lock() {
+        if notifs.len() < MAX_OUTPUT_LINES {
+            notifs.push((level, message));
+        }
+    }
 }
 
 // ── ui::set_status ────────────────────────────────────────────────────────────
@@ -72,12 +91,11 @@ pub fn host_set_status(
             items.insert(id, (text, tooltip));
         }
     }
-    // TODO Phase 1 follow-up: emit a Tauri event so the frontend refreshes the status bar.
 }
 
 // ── workspace::root_uri ───────────────────────────────────────────────────────
 
-pub fn host_root_uri(ctx: &mut HostContext) -> String {
+pub fn host_root_uri(ctx: &HostContext) -> String {
     ctx.workspace_root
         .as_ref()
         .and_then(|p| url::Url::from_file_path(p).ok())
@@ -137,9 +155,13 @@ pub fn host_find_files(ctx: &mut HostContext, _glob: String) -> Result<Vec<Strin
 
 // ── workspace::get_config ─────────────────────────────────────────────────────
 
-pub fn host_get_config(_ctx: &mut HostContext, _key: String) -> Option<String> {
-    // Phase 1 stub — wired to SettingsStore in Phase 2.
-    None
+pub fn host_get_config(ctx: &mut HostContext, key: String) -> Option<String> {
+    // Scope the key to the extension's namespace:
+    // e.g. extension "my.ext" requesting "format.tabSize" becomes "my.ext.format.tabSize"
+    let scoped_key = format!("{}.{}", ctx.extension_id, key);
+    ctx.settings.as_ref()?
+        .lock().ok()?
+        .get_string(&scoped_key)
 }
 
 #[cfg(test)]
@@ -148,11 +170,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn ctx_no_workspace() -> HostContext {
-        HostContext::new(None, false)
+        HostContext::new(None, false, "test.ext".to_string(), None)
     }
 
     fn ctx_with_workspace(root: &std::path::Path, read: bool) -> HostContext {
-        HostContext::new(Some(root.to_path_buf()), read)
+        HostContext::new(Some(root.to_path_buf()), read, "test.ext".to_string(), None)
     }
 
     #[test]
@@ -162,6 +184,15 @@ mod tests {
         let lines = ctx.output_lines.lock().unwrap();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], ("MyExt".to_string(), "hello".to_string()));
+    }
+
+    #[test]
+    fn show_message_buffers_notification() {
+        let mut ctx = ctx_no_workspace();
+        host_show_message(&mut ctx, "warning".to_string(), "test warning".to_string());
+        let notifs = ctx.notifications.lock().unwrap();
+        assert_eq!(notifs.len(), 1);
+        assert_eq!(notifs[0], ("warning".to_string(), "test warning".to_string()));
     }
 
     #[test]
@@ -192,8 +223,10 @@ mod tests {
     fn read_file_denied_absolute_path() {
         let dir = TempDir::new().unwrap();
         let mut ctx = ctx_with_workspace(dir.path(), true);
-        // Use a platform-appropriate absolute path.
-        // Forward slashes work for is_absolute() on Windows too.
+        // On Windows, a path is absolute only if it includes a drive letter or UNC root
+        // (e.g., "C:/..."). A leading forward slash alone is drive-relative and not
+        // considered absolute by is_absolute(). We use #[cfg(windows)] to supply a true
+        // absolute path versus a POSIX absolute path ("/etc/passwd") for non-Windows.
         #[cfg(windows)]
         let abs_path = "C:/Windows/System32/ntoskrnl.exe".to_string();
         #[cfg(not(windows))]
@@ -228,7 +261,15 @@ mod tests {
 
     #[test]
     fn root_uri_empty_when_no_workspace() {
-        let mut ctx = ctx_no_workspace();
-        assert_eq!(host_root_uri(&mut ctx), "");
+        let ctx = ctx_no_workspace();
+        assert_eq!(host_root_uri(&ctx), "");
+    }
+
+    #[test]
+    fn root_uri_returns_file_url_when_workspace_set() {
+        let dir = TempDir::new().unwrap();
+        let ctx = ctx_with_workspace(dir.path(), false);
+        let uri = host_root_uri(&ctx);
+        assert!(uri.starts_with("file://"), "{}", uri);
     }
 }

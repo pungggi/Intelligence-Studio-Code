@@ -11,7 +11,7 @@ mod buffer;
 use anyhow::Result;
 
 fn main() -> Result<()> {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     log::info!("CoreCode starting...");
 
     let buffer = buffer::TextBuffer::new();

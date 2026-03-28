@@ -16,10 +16,10 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-const SOCKET_PATH: &str = "/tmp/corecode-spike-ipc.sock";
+const SOCKET_PATH: &str = "127.0.0.1:17532";
 const MESSAGE_COUNT: usize = 10_000;
 const WARMUP_COUNT: usize = 500;
 
@@ -52,7 +52,7 @@ fn build_binary_message(id: u64, uri: &str, text: &str) -> Vec<u8> {
     frame
 }
 
-fn read_binary_response(stream: &mut UnixStream) -> Result<(u64, u8)> {
+fn read_binary_response(stream: &mut TcpStream) -> Result<(u64, u8)> {
     // Read 4-byte length
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
@@ -97,7 +97,7 @@ struct JsonRpcResult {
     status: String,
 }
 
-fn build_json_message(id: u64, uri: &str, text: &str) -> Vec<u8> {
+fn build_json_message(id: u64, uri: &str, text: &str) -> Result<Vec<u8>> {
     let req = JsonRpcRequest {
         jsonrpc: "2.0",
         id,
@@ -108,12 +108,12 @@ fn build_json_message(id: u64, uri: &str, text: &str) -> Vec<u8> {
             text: text.to_string(),
         },
     };
-    let mut json = serde_json::to_vec(&req).unwrap();
+    let mut json = serde_json::to_vec(&req)?;
     json.push(b'\n');
-    json
+    Ok(json)
 }
 
-fn read_json_response(stream: &mut UnixStream) -> Result<u64> {
+fn read_json_response(stream: &mut TcpStream) -> Result<u64> {
     // Read until newline
     let mut buf = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
@@ -143,7 +143,11 @@ impl BenchResult {
         let total_ms = self.total_time.as_secs_f64() * 1000.0;
         let throughput = self.message_count as f64 / self.total_time.as_secs_f64();
 
-        let mut rtt_us: Vec<f64> = self.rtts.iter().map(|d| d.as_secs_f64() * 1_000_000.0).collect();
+        let mut rtt_us: Vec<f64> = self
+            .rtts
+            .iter()
+            .map(|d| d.as_secs_f64() * 1_000_000.0)
+            .collect();
         rtt_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
         let count = rtt_us.len();
@@ -151,7 +155,7 @@ impl BenchResult {
         let min = rtt_us[0];
         let max = rtt_us[count - 1];
         let median = rtt_us[count / 2];
-        let p95 = rtt_us[(count as f64 * 0.95) as usize];
+        let p95 = rtt_us[(count as f64 * 0.95).min((count - 1) as f64) as usize];
         let p99 = rtt_us[(count as f64 * 0.99).min((count - 1) as f64) as usize];
 
         println!("\n--- {} ---", self.protocol);
@@ -171,20 +175,32 @@ impl BenchResult {
         // Pass/fail criteria
         let avg_ms = avg / 1000.0;
         if avg_ms < 1.0 {
-            println!("[{}] PASS: avg RTT {:.3}ms < 1ms target", self.protocol, avg_ms);
+            println!(
+                "[{}] PASS: avg RTT {:.3}ms < 1ms target",
+                self.protocol, avg_ms
+            );
         } else {
-            println!("[{}] FAIL: avg RTT {:.3}ms >= 1ms target", self.protocol, avg_ms);
+            println!(
+                "[{}] FAIL: avg RTT {:.3}ms >= 1ms target",
+                self.protocol, avg_ms
+            );
         }
 
         if throughput > 50_000.0 {
-            println!("[{}] PASS: throughput {:.0} > 50,000 msg/sec target", self.protocol, throughput);
+            println!(
+                "[{}] PASS: throughput {:.0} > 50,000 msg/sec target",
+                self.protocol, throughput
+            );
         } else {
-            println!("[{}] FAIL: throughput {:.0} <= 50,000 msg/sec target", self.protocol, throughput);
+            println!(
+                "[{}] FAIL: throughput {:.0} <= 50,000 msg/sec target",
+                self.protocol, throughput
+            );
         }
     }
 }
 
-fn run_binary_benchmark(stream: &mut UnixStream) -> Result<BenchResult> {
+fn run_binary_benchmark(stream: &mut TcpStream) -> Result<BenchResult> {
     let uri = "file:///workspace/src/main.rs";
     let text = "let x = 42; // edited line with some realistic content for benchmarking";
 
@@ -220,13 +236,13 @@ fn run_binary_benchmark(stream: &mut UnixStream) -> Result<BenchResult> {
     })
 }
 
-fn run_json_benchmark(stream: &mut UnixStream) -> Result<BenchResult> {
+fn run_json_benchmark(stream: &mut TcpStream) -> Result<BenchResult> {
     let uri = "file:///workspace/src/main.rs";
     let text = "let x = 42; // edited line with some realistic content for benchmarking";
 
     // Warmup
     for i in 0..WARMUP_COUNT {
-        let msg = build_json_message(i as u64, uri, text);
+        let msg = build_json_message(i as u64, uri, text)?;
         stream.write_all(&msg)?;
         let _ = read_json_response(stream)?;
     }
@@ -236,7 +252,7 @@ fn run_json_benchmark(stream: &mut UnixStream) -> Result<BenchResult> {
     let total_start = Instant::now();
 
     for i in 0..MESSAGE_COUNT {
-        let msg = build_json_message((WARMUP_COUNT + i) as u64, uri, text);
+        let msg = build_json_message((WARMUP_COUNT + i) as u64, uri, text)?;
         let rtt_start = Instant::now();
         stream.write_all(&msg)?;
         let resp_id = read_json_response(stream)?;
@@ -262,7 +278,7 @@ fn main() -> Result<()> {
 
     // Run binary benchmark
     println!("\n[1/2] Running binary protocol benchmark ({MESSAGE_COUNT} messages, {WARMUP_COUNT} warmup)...");
-    let mut stream = UnixStream::connect(SOCKET_PATH)?;
+    let mut stream = TcpStream::connect(SOCKET_PATH)?;
     // Send protocol selection: 'B' for binary
     stream.write_all(b"B")?;
     let binary_result = run_binary_benchmark(&mut stream)?;
@@ -272,8 +288,10 @@ fn main() -> Result<()> {
     std::thread::sleep(Duration::from_millis(100));
 
     // Run JSON benchmark
-    println!("[2/2] Running JSON-RPC benchmark ({MESSAGE_COUNT} messages, {WARMUP_COUNT} warmup)...");
-    let mut stream = UnixStream::connect(SOCKET_PATH)?;
+    println!(
+        "[2/2] Running JSON-RPC benchmark ({MESSAGE_COUNT} messages, {WARMUP_COUNT} warmup)..."
+    );
+    let mut stream = TcpStream::connect(SOCKET_PATH)?;
     // Send protocol selection: 'J' for JSON
     stream.write_all(b"J")?;
     let json_result = run_json_benchmark(&mut stream)?;
@@ -287,8 +305,18 @@ fn main() -> Result<()> {
     json_result.report();
 
     // Comparison
-    let binary_avg = binary_result.rtts.iter().map(|d| d.as_secs_f64()).sum::<f64>() / binary_result.rtts.len() as f64;
-    let json_avg = json_result.rtts.iter().map(|d| d.as_secs_f64()).sum::<f64>() / json_result.rtts.len() as f64;
+    let binary_avg = binary_result
+        .rtts
+        .iter()
+        .map(|d| d.as_secs_f64())
+        .sum::<f64>()
+        / binary_result.rtts.len() as f64;
+    let json_avg = json_result
+        .rtts
+        .iter()
+        .map(|d| d.as_secs_f64())
+        .sum::<f64>()
+        / json_result.rtts.len() as f64;
     let speedup = json_avg / binary_avg;
 
     println!("\n--- Comparison ---");
@@ -297,7 +325,10 @@ fn main() -> Result<()> {
     if speedup >= 3.0 {
         println!("[Comparison] PASS: Binary >= 3x faster than JSON");
     } else {
-        println!("[Comparison] INFO: Binary {:.1}x faster (target: 3x)", speedup);
+        println!(
+            "[Comparison] INFO: Binary {:.1}x faster (target: 3x)",
+            speedup
+        );
         println!("  Note: On local sockets, serialization overhead may be");
         println!("  small relative to syscall cost. FlatBuffers advantage");
         println!("  grows with larger payloads and complex message structures.");

@@ -10,8 +10,8 @@
 
 import { readFileSync, readdirSync, existsSync, realpathSync } from "fs";
 import { join, resolve, relative, isAbsolute } from "path";
-import { VscodeApiShim } from "./vscode-api-shim";
-import { LanguageClient } from "./language-client";
+import { VscodeApiShim } from "./vscode-api-shim.js";
+import { LanguageClient } from "./language-client.js";
 
 interface ExtensionManifest {
   name: string;
@@ -28,12 +28,14 @@ interface ExtensionManifest {
   };
 }
 
+type Thenable<T> = PromiseLike<T>;
+
 interface LoadedExtension {
   id: string;
   manifest: ExtensionManifest;
   module: {
     activate?: (ctx: unknown) => unknown;
-    deactivate?: () => void;
+    deactivate?: () => Thenable<void> | void;
   } | null;
   isActive: boolean;
   extensionPath: string;
@@ -81,58 +83,8 @@ export class ExtensionLoader {
           readFileSync(manifestPath, "utf-8")
         );
 
-        // --- Validate required fields ---
-        if (!manifest.name || typeof manifest.name !== "string") {
-          console.warn(
-            `[ExtLoader] Skipping ${entry.name}: missing or invalid 'name'`
-          );
-          continue;
-        }
-        if (!manifest.version || typeof manifest.version !== "string") {
-          console.warn(
-            `[ExtLoader] Skipping ${entry.name}: missing or invalid 'version'`
-          );
-          continue;
-        }
-
         const id = `${manifest.publisher ?? "unknown"}.${manifest.name}`;
-
-        // --- Validate activationEvents (must be string[] if present) ---
-        if (manifest.activationEvents !== undefined) {
-          if (!Array.isArray(manifest.activationEvents)) {
-            console.warn(`[ExtLoader] ${id}: 'activationEvents' must be an array — ignoring it`);
-            manifest.activationEvents = [];
-          } else {
-            manifest.activationEvents = manifest.activationEvents.filter((ev) => {
-              if (typeof ev === "string") return true;
-              console.warn(`[ExtLoader] ${id}: non-string activationEvent entry dropped:`, ev);
-              return false;
-            });
-          }
-        }
-
-        // --- Validate contributes.commands entries ---
-        if (manifest.contributes?.commands !== undefined) {
-          if (!Array.isArray(manifest.contributes.commands)) {
-            console.warn(`[ExtLoader] ${id}: 'contributes.commands' must be an array — ignoring it`);
-            manifest.contributes.commands = [];
-          } else {
-            manifest.contributes.commands = manifest.contributes.commands.filter((cmd) => {
-              if (
-                cmd && typeof cmd === "object" &&
-                typeof (cmd as { command?: unknown }).command === "string" &&
-                typeof (cmd as { title?: unknown }).title === "string"
-              ) {
-                return true;
-              }
-              console.warn(
-                `[ExtLoader] ${id}: dropping invalid command entry (must have string 'command' and 'title'):`,
-                cmd
-              );
-              return false;
-            }) as Array<{ command: string; title: string }>;
-          }
-        }
+        this.validateExtensionManifest(id, manifest);
 
         this.extensions.set(id, {
           id,
@@ -157,7 +109,7 @@ export class ExtensionLoader {
         );
       } catch (err) {
         console.error(
-          `[ExtLoader] Failed to parse ${manifestPath}:`,
+          `[ExtLoader] Failed to load extension from ${manifestPath}:`,
           err
         );
       }
@@ -234,7 +186,7 @@ export class ExtensionLoader {
       const languageClientShim = {
         LanguageClient: class extends LanguageClient {
           constructor(id: string, name: string, serverOptions: unknown, clientOptions: unknown) {
-            super(id, name, serverOptions as import("./language-client").ServerOptions, clientOptions as import("./language-client").ClientOptions);
+            super(id, name, serverOptions as import("./language-client.js").ServerOptions, clientOptions as import("./language-client.js").ClientOptions);
             this.setVscodeApi(vscodeApi);
           }
         },
@@ -269,7 +221,7 @@ export class ExtensionLoader {
       } as NodeJS.Module;
 
       // Load the extension module, then restore the global monkeypatch
-      let mod: { activate?: (ctx: unknown) => unknown; deactivate?: () => void };
+      let mod: { activate?: (ctx: unknown) => unknown; deactivate?: () => Thenable<void> | void };
       try {
         mod = require(mainPath);
       } finally {
@@ -350,18 +302,15 @@ export class ExtensionLoader {
       throw new Error(`No package.json found at ${absPath}`);
     }
 
-    const manifest: ExtensionManifest = JSON.parse(
-      readFileSync(manifestPath, "utf-8")
-    );
-
-    if (!manifest.name || typeof manifest.name !== "string") {
-      throw new Error(`Invalid extension manifest: missing 'name'`);
-    }
-    if (!manifest.version || typeof manifest.version !== "string") {
-      throw new Error(`Invalid extension manifest: missing 'version'`);
+    let manifest: ExtensionManifest;
+    try {
+      manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    } catch (err) {
+      throw new Error(`Failed to parse manifest at ${manifestPath}: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     const id = `${manifest.publisher ?? "unknown"}.${manifest.name}`;
+    this.validateExtensionManifest(id, manifest);
 
     // Deactivate existing version if loaded
     if (this.extensions.has(id)) {
@@ -414,6 +363,56 @@ export class ExtensionLoader {
   }
 
   getActivationErrors(): Map<string, string> {
-    return this.activationErrors;
+    return new Map(this.activationErrors);
+  }
+
+  /**
+   * Validates an extension manifest for required fields and correct data types.
+   * Throws if critical fields are missing.
+   */
+  private validateExtensionManifest(id: string, manifest: ExtensionManifest): void {
+    if (!manifest.name || typeof manifest.name !== "string") {
+      throw new Error(`[ExtLoader] ${id}: missing or invalid 'name'`);
+    }
+    if (!manifest.version || typeof manifest.version !== "string") {
+      throw new Error(`[ExtLoader] ${id}: missing or invalid 'version'`);
+    }
+
+    // Validate activationEvents (must be string[] if present)
+    if (manifest.activationEvents !== undefined) {
+      if (!Array.isArray(manifest.activationEvents)) {
+        console.warn(`[ExtLoader] ${id}: 'activationEvents' must be an array — ignoring it`);
+        manifest.activationEvents = [];
+      } else {
+        manifest.activationEvents = manifest.activationEvents.filter((ev) => {
+          if (typeof ev === "string") return true;
+          console.warn(`[ExtLoader] ${id}: non-string activationEvent entry dropped:`, ev);
+          return false;
+        });
+      }
+    }
+
+    // Validate contributes.commands entries
+    if (manifest.contributes?.commands !== undefined) {
+      if (!Array.isArray(manifest.contributes.commands)) {
+        console.warn(`[ExtLoader] ${id}: 'contributes.commands' must be an array — ignoring it`);
+        manifest.contributes.commands = [];
+      } else {
+        manifest.contributes.commands = manifest.contributes.commands.filter((cmd) => {
+          if (
+            cmd && typeof cmd === "object" &&
+            typeof (cmd as { command?: unknown }).command === "string" &&
+            typeof (cmd as { title?: unknown }).title === "string"
+          ) {
+            return true;
+          }
+          console.warn(
+            `[ExtLoader] ${id}: dropping invalid command entry (must have string 'command' and 'title'):`,
+            cmd
+          );
+          return false;
+        }) as Array<{ command: string; title: string }>;
+      }
+    }
   }
 }

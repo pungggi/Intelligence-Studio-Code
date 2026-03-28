@@ -29,8 +29,10 @@
       "title": "Simple Linter",
       "properties": {
         "simpleLinter.maxLineLength": {
-          "type": "number",
+          "type": "integer",
           "default": 120,
+          "minimum": 1,
+          "maximum": 1000,
           "description": "Maximum line length before warning"
         },
         "simpleLinter.warnConsoleLog": {

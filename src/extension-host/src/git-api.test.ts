@@ -22,14 +22,15 @@ function validateShowArgs(ref: string, filePath: string): void {
   if (normalized.startsWith("..")) {
     throw new Error(`show: filePath '${filePath}' traverses outside repository`);
   }
-  if (!/^[A-Za-z0-9_./:@^~\-{}]+$/.test(ref)) {
+  if (ref.startsWith("-") || !/^[A-Za-z0-9_./:@^~\-{}]+$/.test(ref)) {
     throw new Error(`show: unsafe ref '${ref}'`);
   }
 }
 
 // Re-implement parseCommits date logic
 function parseCommitsDate(aDate: string | undefined): Date {
-  return new Date(aDate || 0);
+  const d = new Date(aDate || 0);
+  return isNaN(d.getTime()) ? new Date(0) : d;
 }
 
 // Re-implement getRepository path check
@@ -53,6 +54,13 @@ describe("git-api show() — filePath validation", () => {
   it("rejects an absolute path on Unix", () => {
     assert.throws(
       () => validateShowArgs("HEAD", "/etc/passwd"),
+      /filePath must be relative/
+    );
+  });
+
+  it("rejects a Windows-style absolute path", () => {
+    assert.throws(
+      () => validateShowArgs("HEAD", "C:\\Windows\\System32\\config"),
       /filePath must be relative/
     );
   });
@@ -120,6 +128,104 @@ describe("git-api show() — ref validation", () => {
   it("rejects pipe characters", () => {
     assert.throws(() => validateShowArgs("HEAD|cat /etc/passwd", "file.txt"), /unsafe ref/);
   });
+
+  it("rejects spaces in ref", () => {
+    assert.throws(() => validateShowArgs("HEAD rm -rf", "file.txt"), /unsafe ref/);
+  });
+
+  it("rejects null bytes", () => {
+    assert.throws(() => validateShowArgs("HEAD\0rm", "file.txt"), /unsafe ref/);
+  });
+
+  it("rejects leading-dash flag injection", () => {
+    assert.throws(() => validateShowArgs("--help", "file.txt"), /unsafe ref/);
+    assert.throws(() => validateShowArgs("-n", "file.txt"), /unsafe ref/);
+  });
+});
+
+// ── blame() — filePath validation ────────────────────────────────────────────
+
+function validateBlameArgs(filePath: string): void {
+  if (isAbsolute(filePath)) {
+    throw new Error(`blame: filePath must be relative, got '${filePath}'`);
+  }
+  const normalized = normalize(filePath);
+  if (normalized.startsWith("..")) {
+    throw new Error(`blame: filePath '${filePath}' traverses outside repository`);
+  }
+}
+
+describe("git-api blame() — filePath validation", () => {
+  it("accepts a simple relative path", () => {
+    assert.doesNotThrow(() => validateBlameArgs("src/main.rs"));
+  });
+
+  it("rejects an absolute path", () => {
+    assert.throws(() => validateBlameArgs("/etc/passwd"), /filePath must be relative/);
+  });
+
+  it("rejects dotdot traversal", () => {
+    assert.throws(() => validateBlameArgs("../../.env"), /traverses outside repository/);
+  });
+});
+
+// ── getCommit() / getBranch() / getConfig() — input validation ──────────────
+
+// Combined validation: leading-dash check + character allowlist (mirrors git-api.ts)
+function isUnsafeRef(value: string): boolean {
+  return value.startsWith("-") || !/^[A-Za-z0-9_./:@^~\-{}]+$/.test(value);
+}
+
+function isUnsafeConfigKey(key: string): boolean {
+  return !/^[a-zA-Z][a-zA-Z0-9._-]*$/.test(key);
+}
+
+describe("git-api getCommit() — hash validation", () => {
+  it("accepts a hex hash", () => {
+    assert.ok(!isUnsafeRef("abc1234"));
+  });
+
+  it("accepts HEAD~1", () => {
+    assert.ok(!isUnsafeRef("HEAD~1"));
+  });
+
+  it("rejects --help flag injection", () => {
+    assert.ok(isUnsafeRef("--help"));
+  });
+
+  it("rejects semicolons", () => {
+    assert.ok(isUnsafeRef("abc;rm -rf /"));
+  });
+});
+
+describe("git-api getBranch() — name validation", () => {
+  it("accepts a simple branch name", () => {
+    assert.ok(!isUnsafeRef("main"));
+    assert.ok(!isUnsafeRef("feature/my-branch"));
+  });
+
+  it("rejects --show-toplevel flag injection", () => {
+    assert.ok(isUnsafeRef("--show-toplevel"));
+  });
+
+  it("rejects --local-env-vars flag injection", () => {
+    assert.ok(isUnsafeRef("--local-env-vars"));
+  });
+});
+
+describe("git-api getConfig() — key validation", () => {
+  it("accepts a standard config key", () => {
+    assert.ok(!isUnsafeConfigKey("user.name"));
+    assert.ok(!isUnsafeConfigKey("remote.origin.url"));
+  });
+
+  it("rejects --list flag injection", () => {
+    assert.ok(isUnsafeConfigKey("--list"));
+  });
+
+  it("rejects keys starting with a dash", () => {
+    assert.ok(isUnsafeConfigKey("-evil"));
+  });
 });
 
 // ── parseCommits — date handling ──────────────────────────────────────────────
@@ -140,6 +246,12 @@ describe("parseCommits — date handling", () => {
   it("produces epoch for undefined", () => {
     const d = parseCommitsDate(undefined);
     assert.ok(!isNaN(d.getTime()), "undefined must not produce Invalid Date");
+    assert.equal(d.getTime(), 0);
+  });
+
+  it("produces epoch for an unparseable date string", () => {
+    const d = parseCommitsDate("not-a-date");
+    assert.ok(!isNaN(d.getTime()), "unparseable string must not produce Invalid Date");
     assert.equal(d.getTime(), 0);
   });
 });

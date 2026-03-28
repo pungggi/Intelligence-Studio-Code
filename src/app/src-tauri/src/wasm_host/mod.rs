@@ -12,9 +12,11 @@
 //! - `api_impl` — host import implementations (ui, workspace)
 //! - `manifest` — corecode.toml parser and validator
 
-pub mod api_impl;
-pub mod instance;
-pub mod manager;
-pub mod manifest;
+pub(crate) mod api_impl;
+pub(crate) mod instance;
+pub(crate) mod manager;
+pub(crate) mod manifest;
+pub(crate) mod wit_types;
 
 pub use manager::WasmHostManager;
+pub use wit_types::*;

@@ -73,9 +73,7 @@ impl CoreCodeManifest {
         for component in joined.components() {
             use std::path::Component;
             if matches!(component, Component::ParentDir) {
-                return Err(
-                    "entry.wasm path traverses outside extension directory".to_string(),
-                );
+                return Err("entry.wasm path traverses outside extension directory".to_string());
             }
         }
 
@@ -91,7 +89,6 @@ impl CoreCodeManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use tempfile::TempDir;
 
     fn write_manifest(dir: &Path, content: &str) {
@@ -217,5 +214,79 @@ mod tests {
         assert!(!m.capabilities.workspace_read);
         assert!(!m.capabilities.network_fetch);
         assert!(!m.capabilities.webview_panels);
+    }
+
+    #[test]
+    fn rejects_id_with_backslash() {
+        let dir = TempDir::new().unwrap();
+        write_manifest(
+            dir.path(),
+            r#"
+            [extension]
+            id = "bad\id"
+            name = "Test"
+            version = "0.1.0"
+            [entry]
+            wasm = "ext.wasm"
+            "#,
+        );
+        let err = CoreCodeManifest::load(dir.path()).unwrap_err();
+        assert!(err.contains("id"), "expected 'id' in: {err}");
+    }
+
+    #[test]
+    fn rejects_id_with_double_dot_substring() {
+        let dir = TempDir::new().unwrap();
+        write_manifest(
+            dir.path(),
+            r#"
+            [extension]
+            id = "my..ext"
+            name = "Test"
+            version = "0.1.0"
+            [entry]
+            wasm = "ext.wasm"
+            "#,
+        );
+        let err = CoreCodeManifest::load(dir.path()).unwrap_err();
+        assert!(err.contains("id"), "expected 'id' in: {err}");
+    }
+
+    #[test]
+    fn accepts_nested_relative_wasm_path() {
+        let dir = TempDir::new().unwrap();
+        let subdir = dir.path().join("subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(subdir.join("ext.wasm"), b"").unwrap();
+        write_manifest(
+            dir.path(),
+            r#"
+            [extension]
+            id = "test.nested"
+            name = "Nested Test"
+            version = "0.1.0"
+            [entry]
+            wasm = "subdir/ext.wasm"
+            "#,
+        );
+        assert!(CoreCodeManifest::load(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn accepts_dot_slash_wasm_path() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("ext.wasm"), b"").unwrap();
+        write_manifest(
+            dir.path(),
+            r#"
+            [extension]
+            id = "test.dotSlash"
+            name = "Dot Slash Test"
+            version = "0.1.0"
+            [entry]
+            wasm = "./ext.wasm"
+            "#,
+        );
+        assert!(CoreCodeManifest::load(dir.path()).is_ok());
     }
 }

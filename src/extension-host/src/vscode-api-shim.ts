@@ -20,10 +20,10 @@
  * - LSP request/response handling via lsp/request and lsp/response IPC messages
  */
 
-import type { IpcMessage } from "./ipc-server";
+import type { IpcMessage } from "./ipc-server.js";
 import * as nodeFs from "node:fs/promises";
 import * as nodePath from "node:path";
-import { createGitExtension } from "./git-api";
+import { createGitExtension } from "./git-api.js";
 
 // --- Event Emitter ---
 
@@ -1452,9 +1452,10 @@ export class VscodeApiShim {
         return result;
       }
       case "textDocument/inlayHint": {
+        const endLine = params.endLine as number;
         const range = new Range(
           params.startLine as number, 0,
-          params.endLine as number, 0
+          endLine, doc ? doc.lineAt(endLine).text.length : Number.MAX_SAFE_INTEGER
         );
         const allHints: unknown[] = [];
         for (const entry of this.inlayHintsProviders) {
@@ -1779,7 +1780,7 @@ export class VscodeApiShim {
         const root = self._primaryWorkspaceRoot ?? process.env.CORECODE_WORKSPACE_ROOT ?? process.cwd();
         return { uri: Uri.file(root), name: root.split(/[\\/]/).pop() ?? "workspace", index: 0 };
       },
-      async findFiles(include: string, exclude?: string): Promise<Uri[]> {
+      async findFiles(include: string, exclude?: string, maxResults?: number): Promise<Uri[]> {
         const roots = self.workspaceRegistry.size > 0
           ? [...self.workspaceRegistry.values()]
           : [process.env.CORECODE_WORKSPACE_ROOT ?? process.cwd()];
@@ -1787,10 +1788,13 @@ export class VscodeApiShim {
         const excludeRe = exclude ? globToRegex(exclude) : null;
         const results: Uri[] = [];
         for (const root of roots) {
+          if (maxResults !== undefined && results.length >= maxResults) break;
           async function walk(dir: string) {
+            if (maxResults !== undefined && results.length >= maxResults) return;
             let entries: import("node:fs").Dirent[];
             try { entries = await nodeFs.readdir(dir, { withFileTypes: true }); } catch { return; }
             for (const e of entries) {
+              if (maxResults !== undefined && results.length >= maxResults) return;
               if (e.name.startsWith('.')) continue;
               const full = nodePath.join(dir, e.name);
               const rel = nodePath.relative(root, full).replace(/\\/g, '/');
@@ -1805,7 +1809,7 @@ export class VscodeApiShim {
           }
           await walk(root);
         }
-        return results;
+        return maxResults !== undefined ? results.slice(0, maxResults) : results;
       },
       fs: {
         async stat(uri: Uri): Promise<{ type: FileType; ctime: number; mtime: number; size: number }> {
@@ -2995,10 +2999,10 @@ export class VscodeApiShim {
 
     // Register a built-in GitHub provider using Device Flow on first access
     if (!self._authProviders.has('github')) {
-      const ghSessionKey = 'corecode.auth.github';
+      const ghSessionKey = 'CORECODE_AUTH_GITHUB';
       const loadedSession = (() => {
         try {
-          const raw = process.env[ghSessionKey];
+          const raw = process.env[ghSessionKey] ?? process.env['corecode.auth.github'];
           return raw ? (JSON.parse(raw) as AuthSession) : null;
         } catch { return null; }
       })();

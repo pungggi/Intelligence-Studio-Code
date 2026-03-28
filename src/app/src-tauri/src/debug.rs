@@ -45,13 +45,14 @@ struct DebugSessionData {
     child: Child,
 }
 
+#[derive(Default)]
 pub struct DebugManager {
     sessions: Mutex<HashMap<String, DebugSessionData>>,
 }
 
 impl DebugManager {
     pub fn new() -> Self {
-        Self { sessions: Mutex::new(HashMap::new()) }
+        Self::default()
     }
 
     /// Spawn a debug adapter process and start a DAP session.
@@ -67,13 +68,7 @@ impl DebugManager {
         adapter_cmd: String,
         adapter_args: Vec<String>,
     ) -> Result<(), String> {
-        // 0. Check session uniqueness before spawning anything.
-        {
-            let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-            if sessions.contains_key(&session_id) {
-                return Err(format!("Debug session '{}' already exists", session_id));
-            }
-        }
+        // 0. Check session uniqueness — will be enforced again atomically at insert time.
 
         // 1. Reject bare names — require an absolute path.
         let cmd_path = std::path::Path::new(&adapter_cmd);
@@ -117,12 +112,27 @@ impl DebugManager {
             .args(&adapter_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("Failed to spawn debug adapter '{}': {}", canonical_str, e))?;
 
         let stdin = child.stdin.take().ok_or("No stdin on debug adapter")?;
         let stdout = child.stdout.take().ok_or("No stdout on debug adapter")?;
+        let stderr = child.stderr.take().ok_or("No stderr on debug adapter")?;
+
+        let sid_stderr = session_id.clone();
+        let _stderr_handle = thread::Builder::new()
+            .name(format!("dap-stderr-{}", session_id))
+            .spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    match line {
+                        Ok(l) => log::warn!("[DAP:{}] adapter stderr: {}", sid_stderr, l),
+                        Err(_) => return,
+                    }
+                }
+            })
+            .map_err(|e| format!("Failed to spawn DAP stderr thread: {}", e))?;
 
         let events: Arc<Mutex<Vec<DebugEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let events_reader = events.clone();
@@ -130,7 +140,7 @@ impl DebugManager {
 
         // Background stdin writer thread — receives pre-framed bytes and writes to adapter.
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
-        thread::Builder::new()
+        let _writer_handle = thread::Builder::new()
             .name(format!("dap-writer-{}", session_id))
             .spawn(move || {
                 let mut stdin = stdin;
@@ -146,7 +156,8 @@ impl DebugManager {
             .map_err(|e| e.to_string())?;
 
         // Background stdout reader thread — parses Content-Length frames from the adapter.
-        thread::Builder::new()
+        // If this spawn fails, kill the child and let the writer thread drain/stop via drop(tx).
+        let reader_result = thread::Builder::new()
             .name(format!("dap-reader-{}", session_id))
             .spawn(move || {
                 let mut reader = BufReader::new(stdout);
@@ -171,8 +182,10 @@ impl DebugManager {
                     let len = match content_length {
                         Some(n) if n > 0 && n <= 10_000_000 => n,
                         _ => {
-                            log::warn!("[DAP:{}] Bad or missing Content-Length, skipping", sid_reader);
-                            continue;
+                            // Cannot resync a framed stream with an invalid Content-Length.
+                            // Terminate the reader thread to avoid consuming stale bytes.
+                            log::warn!("[DAP:{}] Bad or missing Content-Length, closing reader", sid_reader);
+                            return;
                         }
                     };
 
@@ -202,17 +215,56 @@ impl DebugManager {
                                     sid_reader,
                                     evt.msg_type
                                 );
+                                // Push a synthetic overflow marker so consumers can detect lost events.
+                                // Only insert one overflow marker to avoid filling the buffer entirely.
+                                if store.last().map(|e| e.msg_type != "overflow").unwrap_or(true) {
+                                    store.push(DebugEvent {
+                                        session_id: sid_reader.clone(),
+                                        msg_type: "overflow".to_string(),
+                                        seq: 0,
+                                        event: Some("overflow".to_string()),
+                                        command: None,
+                                        request_seq: None,
+                                        success: None,
+                                        body: Some(serde_json::json!({ "dropped_type": evt.msg_type })),
+                                    });
+                                }
                             }
                         }
                         Err(e) => log::warn!("[DAP:{}] Malformed message: {}", sid_reader, e),
                     }
                 }
-            })
-            .map_err(|e| e.to_string())?;
+            });
 
+        // If the reader thread failed to spawn, kill the child so it doesn't leak.
+        // Dropping `tx` causes the writer thread to exit once it drains its channel.
+        if let Err(e) = reader_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(tx);
+            return Err(format!("Failed to spawn DAP reader thread: {}", e));
+        }
+
+        // Use Entry API to atomically check-and-insert, preventing TOCTOU races
+        // if two callers try to create the same session_id concurrently.
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        sessions.insert(session_id, DebugSessionData { stdin_tx: tx, events, seq_counter: 0, child });
-        Ok(())
+        match sessions.entry(session_id.clone()) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                drop(sessions);
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(format!("Debug session '{}' already exists", session_id))
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(DebugSessionData {
+                    stdin_tx: tx,
+                    events,
+                    seq_counter: 0,
+                    child,
+                });
+                Ok(())
+            }
+        }
     }
 
     /// Send a DAP request to the adapter. Returns the request seq number.
@@ -239,6 +291,10 @@ impl DebugManager {
         let json = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
         let frame = format!("Content-Length: {}\r\n\r\n{}", json.len(), json);
 
+        // Intentionally using try_send (non-blocking) rather than the blocking
+        // SyncSender::send().  The sessions Mutex is still held here, so a
+        // blocking send could deadlock if the writer thread is waiting on this
+        // lock.  try_send fails fast and propagates the error to the caller.
         sess.stdin_tx
             .try_send(frame.into_bytes())
             .map_err(|e| format!("Failed to send DAP request: {}", e))?;
@@ -247,14 +303,16 @@ impl DebugManager {
     }
 
     /// Drain all pending events for a session (returns and clears them).
-    pub fn drain_events(&self, session_id: &str) -> Vec<DebugEvent> {
+    ///
+    /// Returns `Err` if the session does not exist, so callers can distinguish
+    /// "no events" (empty Vec) from "invalid session" (Err).
+    pub fn drain_events(&self, session_id: &str) -> Result<Vec<DebugEvent>, String> {
         let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(sess) = sessions.get(session_id) {
-            let mut store = sess.events.lock().unwrap_or_else(|p| p.into_inner());
-            std::mem::take(&mut *store)
-        } else {
-            vec![]
-        }
+        let sess = sessions
+            .get(session_id)
+            .ok_or_else(|| format!("Unknown debug session: {}", session_id))?;
+        let mut store = sess.events.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(std::mem::take(&mut *store))
     }
 
     /// Stop a debug session and kill the adapter process.
@@ -271,10 +329,18 @@ impl DebugManager {
     }
 
     pub fn has_session(&self, session_id: &str) -> bool {
-        self.sessions.lock().unwrap_or_else(|p| p.into_inner()).contains_key(session_id)
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(session_id)
     }
 
     pub fn list_sessions(&self) -> Vec<String> {
-        self.sessions.lock().unwrap_or_else(|p| p.into_inner()).keys().cloned().collect()
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect()
     }
 }

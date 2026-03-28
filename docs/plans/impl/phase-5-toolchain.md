@@ -127,20 +127,29 @@ fn main() -> anyhow::Result<()> {
 ## 3. `commands/build.rs`
 
 ```rust
+fn load_corecode_manifest() -> anyhow::Result<CoreCodeManifest> {
+    let text = std::fs::read_to_string("corecode.toml")
+        .context("Cannot read corecode.toml — run this command from your extension's root directory")?;
+    toml::from_str::<CoreCodeManifest>(&text)
+        .context("Failed to parse corecode.toml")
+}
+
 pub fn run(target: &str, release: bool) -> anyhow::Result<()> {
     let manifest = load_corecode_manifest()?;
-    let wasm_path = compile_wasm(release)?;   // cargo build --target wasm32-wasi
+
+    let cargo_manifest: toml::Value = toml::from_str(
+        &std::fs::read_to_string("Cargo.toml")?
+    )?;
+    let pkg_name = cargo_manifest["package"]["name"]
+        .as_str().unwrap_or("extension")
+        .replace('-', "_");
+
+    let wasm_path = compile_wasm(release, &pkg_name)?;
 
     match target {
         "corecode" => packagers::corecode::pack(&manifest, &wasm_path)?,
-        "zed"      => {
-            packagers::corecode::pack(&manifest, &wasm_path)?;
-            packagers::zed::pack(&manifest, &wasm_path)?;
-        }
-        "vscode"   => {
-            packagers::corecode::pack(&manifest, &wasm_path)?;
-            packagers::vscode::pack(&manifest, &wasm_path)?;
-        }
+        "zed"      => packagers::zed::pack(&manifest, &wasm_path)?,
+        "vscode"   => packagers::vscode::pack(&manifest, &wasm_path)?,
         "all" => {
             packagers::corecode::pack(&manifest, &wasm_path)?;
             packagers::zed::pack(&manifest, &wasm_path)?;
@@ -151,7 +160,7 @@ pub fn run(target: &str, release: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn compile_wasm(release: bool) -> anyhow::Result<std::path::PathBuf> {
+fn compile_wasm(release: bool, pkg_name: &str) -> anyhow::Result<std::path::PathBuf> {
     let mut cmd = std::process::Command::new("cargo");
     cmd.args(["build", "--target", "wasm32-wasi"]);
     if release { cmd.arg("--release"); }
@@ -162,14 +171,6 @@ fn compile_wasm(release: bool) -> anyhow::Result<std::path::PathBuf> {
     }
 
     let profile = if release { "release" } else { "debug" };
-    let manifest = load_corecode_manifest()?;
-    // Derive the binary name from Cargo.toml [package].name
-    let cargo_manifest: toml::Value = toml::from_str(
-        &std::fs::read_to_string("Cargo.toml")?
-    )?;
-    let pkg_name = cargo_manifest["package"]["name"]
-        .as_str().unwrap_or("extension")
-        .replace('-', "_");
 
     Ok(std::path::PathBuf::from(format!(
         "target/wasm32-wasi/{profile}/{pkg_name}.wasm"
@@ -272,6 +273,8 @@ fn generate_zed_manifest(manifest: &CoreCodeManifest) -> String {
 
         s.push_str(&format!("\n[language_servers.{}]\n", grammar.language_id));
         s.push_str(&format!("language = {:?}\n", grammar.language_id));
+        // Command field: extension provides its own language server via WASM exports
+        s.push_str(&format!("command = {{ extension = {:?} }}\n", grammar.language_id));
     }
     s
 }
@@ -325,6 +328,30 @@ pub fn pack(manifest: &CoreCodeManifest, wasm_path: &Path) -> anyhow::Result<()>
     zip.finish()?;
     println!("✓ VS Code package: {out_name}");
     Ok(())
+}
+
+fn generate_vscode_package_json(manifest: &CoreCodeManifest) -> String {
+    let lang_ids: Vec<&str> = manifest.languages.iter()
+        .filter(|(_, &v)| v)
+        .map(|(k, _)| k.as_str())
+        .collect();
+
+    let activation_events: Vec<String> = lang_ids.iter()
+        .map(|l| format!("onLanguage:{l}"))
+        .collect();
+
+    serde_json::to_string_pretty(&serde_json::json!({
+        "name": manifest.extension.id.split('.').last().unwrap_or(&manifest.extension.id),
+        "displayName": manifest.extension.name,
+        "publisher": manifest.extension.id.split('.').next().unwrap_or("unknown"),
+        "version": manifest.extension.version,
+        "engines": { "vscode": "^1.75.0" },
+        "categories": ["Other"],
+        "activationEvents": activation_events,
+        "contributes": {},
+        "main": "./dist/extension.js",
+        "extensionKind": ["workspace"]
+    })).unwrap_or_default()
 }
 ```
 
@@ -382,10 +409,26 @@ export async function activate(context) {{
       }},
     }},
     'corecode:extension/workspace': {{
-      'read-file'(p) {{ /* vscode.workspace.fs.readFile */ }},
-      'find-files'(glob) {{ /* vscode.workspace.findFiles */ }},
+      async 'read-file'(p) {{
+        if (!vscode.workspace.workspaceFolders?.length) {{
+          throw new Error('No workspace folder open');
+        }}
+        const uri = vscode.Uri.joinPath(vscode.workspace.workspaceFolders[0].uri, p);
+        const bytes = await vscode.workspace.fs.readFile(uri);
+        return new TextDecoder().decode(bytes);
+      }},
+      async 'find-files'(glob) {{
+        const uris = await vscode.workspace.findFiles(glob);
+        return uris.map(u => u.toString());
+      }},
       'root-uri'() {{ return vscode.workspace.workspaceFolders?.[0]?.uri.toString() ?? ''; }},
-      'get-config'(key) {{ /* vscode.workspace.getConfiguration */ }},
+      'get-config'(key) {{
+        const parts = key.split('.');
+        const section = parts.slice(0, -1).join('.');
+        const item = parts[parts.length - 1];
+        const val = vscode.workspace.getConfiguration(section).get(item);
+        return val !== undefined ? String(val) : undefined;
+      }},
     }},
     {webview_code}
   }});
@@ -445,6 +488,23 @@ fn generate_language_registrations(langs: &std::collections::HashMap<String, boo
 "#,
         lang_list = lang_ids.iter().map(|l| format!("{l:?}")).collect::<Vec<_>>().join(", "),
     )
+}
+
+fn injectVsCodeBridge(html, webview, context) {
+  const bridgeUri = webview.asWebviewUri(
+    vscode.Uri.joinPath(context.extensionUri, 'webview', 'corecode-bridge.js')
+  );
+  const scriptTag = `<script src="${bridgeUri}"></script>`;
+
+  const headClose = html.indexOf('</head>');
+  if (headClose !== -1) {
+    return html.slice(0, headClose) + scriptTag + html.slice(headClose);
+  }
+  const bodyClose = html.indexOf('</body>');
+  if (bodyClose !== -1) {
+    return html.slice(0, bodyClose) + scriptTag + html.slice(bodyClose);
+  }
+  return html + scriptTag;  // fallback: append
 }
 
 fn generate_webview_code() -> String {
@@ -539,6 +599,64 @@ pub fn run(target: &str) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Search target/wasm32-wasi/ for the compiled .wasm binary.
+fn find_wasm_binary() -> anyhow::Result<std::path::PathBuf> {
+    for profile in &["release", "debug"] {
+        let manifest: toml::Value = toml::from_str(&std::fs::read_to_string("Cargo.toml")?)?;
+        let pkg_name = manifest["package"]["name"]
+            .as_str().unwrap_or("extension")
+            .replace('-', "_");
+        let path = std::path::PathBuf::from(format!("target/wasm32-wasi/{profile}/{pkg_name}.wasm"));
+        if path.exists() { return Ok(path); }
+    }
+    anyhow::bail!("No wasm32-wasi binary found. Run `cargo build --target wasm32-wasi` first.")
+}
+
+/// Parse export names from a WASM binary (component model exports).
+fn inspect_wasm_exports(wasm_path: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    let bytes = std::fs::read(wasm_path)?;
+    // Use wasmparser for lightweight parsing without full instantiation.
+    // For Phase 5 initial implementation, use heuristic string scan:
+    let text = String::from_utf8_lossy(&bytes);
+    let exports: Vec<String> = ["lifecycle", "language-provider", "grammar-provider", "webview-provider"]
+        .iter()
+        .filter(|iface| text.contains(*iface))
+        .map(|s| s.to_string())
+        .collect();
+    Ok(exports)
+}
+
+fn targets_from_arg(target: &str) -> Vec<&'static str> {
+    match target {
+        "all" => vec!["corecode", "zed", "vscode"],
+        "corecode" => vec!["corecode"],
+        "zed" => vec!["zed"],
+        "vscode" => vec!["vscode"],
+        _ => vec![],
+    }
+}
+
+mod wit {
+    pub mod compat {
+        pub fn check(exports: &[String], _manifest: &super::super::CoreCodeManifest, target: &str)
+            -> (bool, Vec<String>)
+        {
+            let mut warnings = Vec::new();
+            let supported = match target {
+                "zed" => {
+                    if exports.contains(&"webview-provider".to_string()) {
+                        warnings.push("webview-provider — not supported in Zed (will be excluded)".to_string());
+                    }
+                    true
+                }
+                "vscode" => true,
+                _ => true,
+            };
+            (supported, warnings)
+        }
+    }
+}
 ```
 
 ---
@@ -566,6 +684,57 @@ Each template includes:
 - `corecode.toml` with minimal capabilities
 - `src/lib.rs` with the relevant WIT exports stubbed out
 - A `README.md` with build instructions
+
+```rust
+pub fn run(name: &str, template: &str) -> anyhow::Result<()> {
+    use std::fs;
+    let dir = std::path::Path::new(name);
+    anyhow::ensure!(!dir.exists(), "Directory '{}' already exists", name);
+    fs::create_dir_all(dir.join("src"))?;
+
+    // Cargo.toml
+    fs::write(dir.join("Cargo.toml"), format!(r#"[package]
+name    = "{name}"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.26"
+"#))?;
+
+    // corecode.toml
+    fs::write(dir.join("corecode.toml"), format!(r#"[extension]
+id      = "my-publisher.{name}"
+name    = "{name}"
+version = "0.1.0"
+
+[entry]
+wasm = "{name}.wasm"
+
+[capabilities]
+workspace_read = false
+network_fetch  = false
+webview_panels = false
+"#))?;
+
+    // src/lib.rs based on template
+    let lib_rs = match template {
+        "language-provider" => include_str!("../templates/language_provider.rs"),
+        "format-provider"   => include_str!("../templates/format_provider.rs"),
+        "grammar"           => include_str!("../templates/grammar.rs"),
+        "webview"           => include_str!("../templates/webview.rs"),
+        _                   => include_str!("../templates/language_provider.rs"),
+    };
+    fs::write(dir.join("src/lib.rs"), lib_rs)?;
+
+    println!("Created extension '{name}' with template '{template}'");
+    println!("Build: cargo build --target wasm32-wasi --release");
+    Ok(())
+}
+```
 
 ---
 

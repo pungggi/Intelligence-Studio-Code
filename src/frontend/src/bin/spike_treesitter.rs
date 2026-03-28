@@ -147,7 +147,7 @@ fn main() -> Result<()> {
 
     // Count node types in the first 100 lines
     let mut token_counts = std::collections::HashMap::new();
-    count_tokens(root, &source, 0, 100, &mut token_counts);
+    count_tokens(root, 0, 100, &mut token_counts);
 
     println!("  Token types in first 100 lines:");
     let mut sorted_tokens: Vec<_> = token_counts.iter().collect();
@@ -237,7 +237,11 @@ fn main() -> Result<()> {
     let max = reparse_times.iter().cloned().fold(0.0_f64, f64::max);
     let mut sorted = reparse_times.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p95 = sorted[(sorted.len() as f64 * 0.95) as usize];
+    let p95 = if sorted.is_empty() {
+        0.0
+    } else {
+        sorted[((sorted.len().saturating_sub(1)) as f64 * 0.95) as usize]
+    };
 
     println!("  100 incremental re-parses:");
     println!("    avg={:.3}ms  max={:.3}ms  p95={:.3}ms", avg, max, p95);
@@ -366,7 +370,6 @@ module.exports = { processBatch, transformRecord, DataPipeline };
 /// Recursively count named leaf node types within a line range.
 fn count_tokens(
     node: tree_sitter::Node,
-    source: &str,
     min_row: usize,
     max_row: usize,
     counts: &mut std::collections::HashMap<String, usize>,
@@ -386,7 +389,7 @@ fn count_tokens(
     } else {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            count_tokens(child, source, min_row, max_row, counts);
+            count_tokens(child, min_row, max_row, counts);
         }
     }
 }

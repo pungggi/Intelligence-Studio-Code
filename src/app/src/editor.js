@@ -104,6 +104,19 @@ function filePathToUri(p) {
   return 'file://' + p;
 }
 
+function detectLanguage(fp) {
+  if (!fp) return 'plaintext';
+  const ext = fp.split('.').pop()?.toLowerCase() ?? '';
+  const map = {
+    'rs': 'rust', 'js': 'javascript', 'mjs': 'javascript', 'cjs': 'javascript',
+    'jsx': 'javascriptreact', 'ts': 'typescript', 'tsx': 'typescriptreact',
+    'py': 'python', 'pyw': 'python', 'json': 'json', 'jsonc': 'json',
+    'html': 'html', 'htm': 'html', 'css': 'css', 'scss': 'scss',
+    'md': 'markdown', 'toml': 'toml', 'yaml': 'yaml', 'yml': 'yaml',
+  };
+  return map[ext] ?? 'plaintext';
+}
+
 // Rendering state
 let cellWidth = 0;     // monospace character width (px)
 let lineHeight = 0;    // line height (px)
@@ -657,11 +670,16 @@ function drawWavyUnderline(ctx, x, y, width, color) {
   ctx.lineWidth = 1;
   const amplitude = 2;
   const wavelength = 4;
-  for (let i = 0; i <= width; i += 0.5) {
+  const maxSegments = 500;
+  const step = Math.max(0.5, width / maxSegments);
+  for (let i = 0; i <= width; i += step) {
     const dy = Math.sin((i / wavelength) * Math.PI * 2) * amplitude;
     if (i === 0) ctx.moveTo(x + i, y + dy);
     else ctx.lineTo(x + i, y + dy);
   }
+  // Ensure the path reaches the end
+  const dyEnd = Math.sin((width / wavelength) * Math.PI * 2) * amplitude;
+  ctx.lineTo(x + width, y + dyEnd);
   ctx.stroke();
 }
 
@@ -2327,11 +2345,28 @@ document.addEventListener('keydown', (e) => {
           paletteBackdropEl.addEventListener('click', closePalette);
           editorEl.focus();
           if (!newName || newName === currentName) return;
-          invoke('lsp_rename', { uri: renameUri, line: renameLine, character: renameChar, newName })
-            .then(async result => {
-              if (!result || !result.changes || result.changes.length === 0) { showToast('error', 'Rename returned no edits'); return; }
+          const renameLangId = detectLanguage(filePath);
+          Promise.all([
+            invoke('lsp_rename', { uri: renameUri, line: renameLine, character: renameChar, newName }).catch(() => null),
+            invoke('wasm_rename', { langId: renameLangId, uri: renameUri, line: renameLine, character: renameChar, newName }).catch(() => []),
+          ]).then(async ([lspResult, wasmEdits]) => {
+              const hasLsp = lspResult && lspResult.changes && lspResult.changes.length > 0;
+              const hasWasm = wasmEdits && wasmEdits.length > 0;
+              if (!hasLsp && !hasWasm) { showToast('error', 'Rename returned no edits'); return; }
               try {
-                await invoke('apply_workspace_edit', { changes: result.changes });
+                if (hasLsp) {
+                  await invoke('apply_workspace_edit', { changes: lspResult.changes });
+                }
+                if (hasWasm) {
+                  // Apply WASM text edits directly (sorted bottom-up to preserve offsets)
+                  const sorted = wasmEdits.slice().sort((a, b) => b.range.start.line - a.range.start.line || b.range.start.character - a.range.start.character);
+                  for (const edit of sorted) {
+                    await invoke('edit_replace_range', {
+                      startLine: edit.range.start.line, startCol: edit.range.start.character,
+                      endLine: edit.range.end.line, endCol: edit.range.end.character, text: edit['new-text'] || edit.newText || edit.new_text || '',
+                    });
+                  }
+                }
                 await fetchVisibleContent();
                 requestRender();
               } catch (err) { showToast('error', String(err)); }
@@ -2962,11 +2997,15 @@ function isPageVisible() { return document.visibilityState === 'visible'; }
 async function pollStatusBarItems() {
   if (!isPageVisible()) return;
   try {
-    const items = await invoke('get_status_bar_items');
-    if (!items || items.length === 0) { extStatusBarEl.innerHTML = ''; return; }
-    items.sort((a, b) => (b.priority || 0) - (a.priority || 0));
+    const [items, wasmItems] = await Promise.all([
+      invoke('get_status_bar_items').catch(() => []),
+      invoke('get_wasm_status_bar_items').catch(() => []),
+    ]);
+    const allItems = [...(items || []), ...(wasmItems || [])];
+    if (allItems.length === 0) { extStatusBarEl.innerHTML = ''; return; }
+    allItems.sort((a, b) => (b.priority || 0) - (a.priority || 0));
     extStatusBarEl.innerHTML = '';
-    for (const item of items) {
+    for (const item of allItems) {
       const span = document.createElement('span');
       span.className = 'ext-sb-item';
       span.textContent = item.text;
@@ -3032,9 +3071,18 @@ bottomPanelCloseBtn.addEventListener('click', closeBottomPanel);
 async function pollOutputLines() {
   if (!isPageVisible() || !bottomPanelOpen) return;
   try {
-    const newLines = await invoke('get_output_lines');
-    if (!newLines || newLines.length === 0) return;
-    outputAllLines.push(...newLines);
+    // Poll both Node.js extension host and WASM extension output in parallel.
+    const [newLines, wasmLines] = await Promise.all([
+      invoke('get_output_lines').catch(() => []),
+      invoke('get_wasm_output_lines').catch(() => []),
+    ]);
+    // Convert WASM [channel, message] arrays to {channel, text} objects.
+    const wasmConverted = (wasmLines || [])
+      .filter(item => Array.isArray(item) && item.length >= 2)
+      .map(([channel, text]) => ({ channel, text: text + '\n' }));
+    const combined = [...(newLines || []), ...wasmConverted];
+    if (combined.length === 0) return;
+    outputAllLines.push(...combined);
     if (outputAllLines.length > 10000) outputAllLines.splice(0, outputAllLines.length - 10000);
     const channels = [...new Set(outputAllLines.map(l => l.channel))];
     if (!outputSelectedChannel && channels.length > 0) outputSelectedChannel = channels[0];
@@ -3231,6 +3279,33 @@ async function refreshDiagnostics() {
   if (!isPageVisible()) return;
   try {
     await fetchVisibleContent();
+    // Merge WASM diagnostics alongside Node.js diagnostics.
+    if (filePath) {
+      const langId = detectLanguage(filePath);
+      const uri = filePathToUri(filePath);
+      // Read the full content from the backend for diagnostic analysis.
+      const fullText = await invoke('get_text_range', {
+        startLine: 0, startCol: 0, endLine: totalLines, endCol: 0,
+      }).catch(() => '');
+      if (fullText) {
+        const wasmDiags = await invoke('wasm_diagnostics', {
+          langId, uri, content: fullText,
+        }).catch(() => []);
+        if (wasmDiags && wasmDiags.length > 0) {
+          // Convert WASM diagnostics to the same shape as Node.js diagnostics.
+          const converted = wasmDiags.map(d => ({
+            line: d.range?.start?.line ?? 0,
+            col_start: d.range?.start?.character ?? 0,
+            end_line: d.range?.end?.line ?? d.range?.start?.line ?? 0,
+            col_end: d.range?.end?.character ?? 0,
+            severity: d.severity ?? 'warning',
+            message: d.message ?? '',
+            source: d.source ?? 'wasm',
+          }));
+          diagnostics = [...diagnostics, ...converted];
+        }
+      }
+    }
     updateMetadataUI();
     requestRender();
   } catch (err) { /* Ignore */ }
@@ -3263,8 +3338,12 @@ const extHostInterval = setInterval(pollExtHostStatus, 3000);
 async function pollNotifications() {
   if (!isPageVisible()) return;
   try {
-    const notifications = await invoke('get_notifications');
+    const [notifications, wasmNotifs] = await Promise.all([
+      invoke('get_notifications').catch(() => []),
+      invoke('get_wasm_notifications').catch(() => []),
+    ]);
     for (const n of notifications) showToast(n.type, n.message);
+    for (const n of wasmNotifs) showToast(n.type, n.message);
   } catch (err) { /* Ignore */ }
 }
 
@@ -3463,12 +3542,28 @@ async function triggerAutocomplete(triggerChar) {
   const uri = getActiveUri();
   if (!uri) return;
   try {
-    const result = await invoke('lsp_completion', {
-      uri, line: cursorLine, character: cursorCol,
-      triggerKind: triggerChar ? 2 : 1, triggerCharacter: triggerChar || null,
-    });
-    if (!result || !result.items || result.items.length === 0) { closeAutocomplete(); return; }
-    acItems = result.items;
+    const langId = detectLanguage(filePath);
+    // Run Node.js LSP and WASM completions in parallel, merge results.
+    const [lspResult, wasmItems] = await Promise.all([
+      invoke('lsp_completion', {
+        uri, line: cursorLine, character: cursorCol,
+        triggerKind: triggerChar ? 2 : 1, triggerCharacter: triggerChar || null,
+      }).catch(() => null),
+      invoke('wasm_completions', {
+        langId, uri, line: cursorLine, character: cursorCol,
+        trigger: triggerChar || null,
+      }).catch(() => []),
+    ]);
+    const nodeItems = lspResult?.items ?? [];
+    // Normalise WASM items to the same shape as LSP items.
+    const wasmNorm = (wasmItems || []).map(w => ({
+      label: w.label, kind: w.kind, detail: w.detail,
+      documentation: w.documentation, insertText: w.insert_text ?? w.label,
+      filterText: w.filter_text ?? w.label,
+    }));
+    const allItems = [...nodeItems, ...wasmNorm];
+    if (allItems.length === 0) { closeAutocomplete(); return; }
+    acItems = allItems;
     acSelectedIdx = 0;
     acFilterText = '';
     acOpen = true;
@@ -3566,8 +3661,14 @@ async function requestHover(line, col) {
   const uri = getActiveUri();
   if (!uri) return;
   try {
-    const result = await invoke('lsp_hover', { uri, line, character: col });
-    if (!result || !result.contents) { closeHover(); return; }
+    const langId = detectLanguage(filePath);
+    // Run Node.js LSP and WASM hover in parallel.
+    const [lspResult, wasmResult] = await Promise.all([
+      invoke('lsp_hover', { uri, line, character: col }).catch(() => null),
+      invoke('wasm_hover', { langId, uri, line, character: col }).catch(() => null),
+    ]);
+    const result = (lspResult?.contents) ? lspResult : wasmResult;
+    if (!result || (!result.contents)) { closeHover(); return; }
     hoverContent.textContent = '';
     const text = typeof result.contents === 'string' ? result.contents
       : Array.isArray(result.contents) ? result.contents.map(c => typeof c === 'string' ? c : c.value || '').join('\n')
@@ -3613,7 +3714,13 @@ async function goToDefinition() {
   if (!uri) return;
   try {
     statusEl.textContent = 'Go to definition...';
-    const result = await invoke('lsp_definition', { uri, line: cursorLine, character: cursorCol });
+    const langId = detectLanguage(filePath);
+    const [lspResult, wasmResult] = await Promise.all([
+      invoke('lsp_definition', { uri, line: cursorLine, character: cursorCol }).catch(() => null),
+      invoke('wasm_definition', { langId, uri, line: cursorLine, character: cursorCol }).catch(() => null),
+    ]);
+    // Prefer LSP result; fall back to WASM
+    const result = (lspResult && (!Array.isArray(lspResult) || lspResult.length > 0)) ? lspResult : wasmResult;
     if (!result || (Array.isArray(result) && result.length === 0)) {
       statusEl.textContent = 'No definition found';
       setTimeout(() => { statusEl.textContent = ''; }, 2000);
@@ -3670,14 +3777,19 @@ async function findReferences() {
   if (!uri) return;
   try {
     statusEl.textContent = 'Finding references...';
-    const result = await invoke('lsp_references', { uri, line: cursorLine, character: cursorCol });
-    if (!result || (Array.isArray(result) && result.length === 0)) {
+    const langId = detectLanguage(filePath);
+    const [lspResult, wasmResult] = await Promise.all([
+      invoke('lsp_references', { uri, line: cursorLine, character: cursorCol }).catch(() => []),
+      invoke('wasm_references', { langId, uri, line: cursorLine, character: cursorCol, includeDecl: true }).catch(() => []),
+    ]);
+    const merged = [...(Array.isArray(lspResult) ? lspResult : []), ...(Array.isArray(wasmResult) ? wasmResult : [])];
+    if (merged.length === 0) {
       statusEl.textContent = 'No references found';
       setTimeout(() => { statusEl.textContent = ''; }, 2000);
       return;
     }
     statusEl.textContent = '';
-    showReferencesPanel(result);
+    showReferencesPanel(merged);
   } catch {
     statusEl.textContent = 'References unavailable';
     setTimeout(() => { statusEl.textContent = ''; }, 2000);
@@ -3725,13 +3837,26 @@ async function requestCodeActions() {
     startLine = sel.startLine; startChar = sel.startCol; endLine = sel.endLine; endChar = sel.endCol;
   }
   try {
-    const result = await invoke('lsp_code_action', { uri, startLine, startCharacter: startChar, endLine, endCharacter: endChar });
-    if (!result || (Array.isArray(result) && result.length === 0)) {
+    const langId = detectLanguage(filePath);
+    const range = { start: { line: startLine, character: startChar }, end: { line: endLine, character: endChar } };
+    const [lspResult, wasmResult] = await Promise.all([
+      invoke('lsp_code_action', { uri, startLine, startCharacter: startChar, endLine, endCharacter: endChar }).catch(() => []),
+      invoke('wasm_code_actions', { langId, uri, range, diagnostics: [] }).catch(() => []),
+    ]);
+    // Normalise WASM code actions to the same shape as LSP ones
+    const wasmNorm = (wasmResult || []).map(a => ({
+      title: a.title,
+      kind: a.kind || undefined,
+      isPreferred: false,
+      edit: a.edits && a.edits.length > 0 ? { changes: a.edits.map(e => ({ uri: e.uri || uri, range: e.range, newText: e['new-text'] || e.newText || e.new_text || '' })) } : undefined,
+    }));
+    const merged = [...(Array.isArray(lspResult) ? lspResult : []), ...wasmNorm];
+    if (merged.length === 0) {
       statusEl.textContent = 'No code actions available';
       setTimeout(() => { statusEl.textContent = ''; }, 2000);
       return;
     }
-    caItems = Array.isArray(result) ? result : [];
+    caItems = merged;
     caSelectedIdx = 0;
     codeActionsOpen = true;
     renderCodeActions();
@@ -3950,7 +4075,16 @@ async function formatDocument() {
   if (!uri) return;
   try {
     statusEl.textContent = 'Formatting...';
-    const result = await invoke('lsp_format', { uri, tabSize: 2, insertSpaces: true });
+    const langId = detectLanguage(filePath);
+    const fullText = await invoke('get_text_range', {
+      startLine: 0, startCol: 0, endLine: totalLines, endCol: 0,
+    }).catch(() => '');
+    const [lspResult, wasmResult] = await Promise.all([
+      invoke('lsp_format', { uri, tabSize: 2, insertSpaces: true }).catch(() => []),
+      invoke('wasm_format_document', { langId, uri, content: fullText }).catch(() => []),
+    ]);
+    // Prefer LSP edits; fall back to WASM edits
+    const result = (lspResult && lspResult.length > 0) ? lspResult : wasmResult;
     if (result && Array.isArray(result) && result.length > 0) {
       const edits = result.slice().sort((a, b) => {
         if (b.range.start.line !== a.range.start.line) return b.range.start.line - a.range.start.line;
@@ -3959,7 +4093,7 @@ async function formatDocument() {
       for (const edit of edits) {
         await invoke('edit_replace_range', {
           startLine: edit.range.start.line, startCol: edit.range.start.character,
-          endLine: edit.range.end.line, endCol: edit.range.end.character, text: edit.newText,
+          endLine: edit.range.end.line, endCol: edit.range.end.character, text: edit.newText || edit['new-text'] || edit.new_text || '',
         });
       }
       await fetchVisibleContent();
@@ -4394,7 +4528,6 @@ settingsSearchInput?.addEventListener('input', () => {
 // ─── M8: Updated Sidebar Toggle ───────────────────────────────
 
 // Override the original toggleSidebar to use the activity bar
-const _origToggleSidebar = toggleSidebar;
 toggleSidebar = function() {
   if (activePanel === 'explorer') {
     switchPanel('explorer'); // toggle off
@@ -4445,19 +4578,20 @@ function renderBreakpointsList() {
     debugBpListEl.textContent = '';
     return;
   }
-  debugBpListEl.innerHTML = items.map(({ fp, ln }) => {
+  for (const { fp, ln } of items) {
     const short = fp.split(/[\\/]/).pop();
-    return `<div class="debug-bp-entry" data-file="${encodeURIComponent(fp)}" data-line="${ln}">
-      <span style="color:#f38ba8">●</span> ${escapeHtml(short)}:${ln + 1}
-    </div>`;
-  }).join('');
-  debugBpListEl.querySelectorAll('.debug-bp-entry').forEach(el => {
-    el.addEventListener('click', () => {
-      const fp = decodeURIComponent(el.dataset.file);
-      const ln = parseInt(el.dataset.line, 10);
-      toggleBreakpoint(fp, ln);
-    });
-  });
+    const entry = document.createElement('div');
+    entry.className = 'debug-bp-entry';
+    entry.dataset.file = fp;
+    entry.dataset.line = ln;
+    const bullet = document.createElement('span');
+    bullet.style.color = '#f38ba8';
+    bullet.textContent = '●';
+    entry.appendChild(bullet);
+    entry.appendChild(document.createTextNode(` ${short}:${ln + 1}`));
+    entry.addEventListener('click', () => toggleBreakpoint(fp, ln));
+    debugBpListEl.appendChild(entry);
+  }
 }
 
 function appendDebugConsole(text, category) {
@@ -4496,31 +4630,31 @@ function updateDebugToolbar(running) {
   const btnStop = document.getElementById('debug-btn-stop');
 
   if (running) {
-    btnStart && (btnStart.style.display = 'none');
-    btnStop && (btnStop.style.display = '');
-    btnRestart && (btnRestart.style.display = '');
+    btnStart && btnStart.classList.add('debug-btn-hidden');
+    btnStop && btnStop.classList.remove('debug-btn-hidden');
+    btnRestart && btnRestart.classList.remove('debug-btn-hidden');
     if (debugStopped) {
-      btnContinue && (btnContinue.style.display = '');
-      btnPause && (btnPause.style.display = 'none');
-      btnStepOver && (btnStepOver.style.display = '');
-      btnStepIn && (btnStepIn.style.display = '');
-      btnStepOut && (btnStepOut.style.display = '');
+      btnContinue && btnContinue.classList.remove('debug-btn-hidden');
+      btnPause && btnPause.classList.add('debug-btn-hidden');
+      btnStepOver && btnStepOver.classList.remove('debug-btn-hidden');
+      btnStepIn && btnStepIn.classList.remove('debug-btn-hidden');
+      btnStepOut && btnStepOut.classList.remove('debug-btn-hidden');
     } else {
-      btnContinue && (btnContinue.style.display = 'none');
-      btnPause && (btnPause.style.display = '');
-      btnStepOver && (btnStepOver.style.display = 'none');
-      btnStepIn && (btnStepIn.style.display = 'none');
-      btnStepOut && (btnStepOut.style.display = 'none');
+      btnContinue && btnContinue.classList.add('debug-btn-hidden');
+      btnPause && btnPause.classList.remove('debug-btn-hidden');
+      btnStepOver && btnStepOver.classList.add('debug-btn-hidden');
+      btnStepIn && btnStepIn.classList.add('debug-btn-hidden');
+      btnStepOut && btnStepOut.classList.add('debug-btn-hidden');
     }
   } else {
-    btnStart && (btnStart.style.display = '');
-    btnContinue && (btnContinue.style.display = 'none');
-    btnPause && (btnPause.style.display = 'none');
-    btnStepOver && (btnStepOver.style.display = 'none');
-    btnStepIn && (btnStepIn.style.display = 'none');
-    btnStepOut && (btnStepOut.style.display = 'none');
-    btnRestart && (btnRestart.style.display = 'none');
-    btnStop && (btnStop.style.display = 'none');
+    btnStart && btnStart.classList.remove('debug-btn-hidden');
+    btnContinue && btnContinue.classList.add('debug-btn-hidden');
+    btnPause && btnPause.classList.add('debug-btn-hidden');
+    btnStepOver && btnStepOver.classList.add('debug-btn-hidden');
+    btnStepIn && btnStepIn.classList.add('debug-btn-hidden');
+    btnStepOut && btnStepOut.classList.add('debug-btn-hidden');
+    btnRestart && btnRestart.classList.add('debug-btn-hidden');
+    btnStop && btnStop.classList.add('debug-btn-hidden');
   }
 }
 
@@ -4850,7 +4984,7 @@ function registerTreeViewUI(viewId) {
   viewEl.id = `tv-view-${CSS.escape(viewId)}`;
   const headerEl = document.createElement('div');
   headerEl.className = 'tv-view-header';
-  headerEl.innerHTML = `<span>▾</span><span>${viewId}</span>`;
+  headerEl.innerHTML = `<span>▾</span><span>${escapeHtml(viewId)}</span>`;
   const bodyEl = document.createElement('div');
   bodyEl.className = 'tv-view-body';
   bodyEl.innerHTML = '<div style="padding:4px 8px;color:#888;font-size:12px;">Loading...</div>';
@@ -4868,6 +5002,7 @@ function registerTreeViewUI(viewId) {
 }
 
 async function pollTreeViewEvents() {
+  if (!isPageVisible()) return;
   try {
     const events = await invoke('get_tree_view_events');
     for (const evt of events) {
@@ -5126,7 +5261,7 @@ async function renderScmPanel() {
           const item = document.createElement('div');
           item.className = 'scm-item';
           const letter = res.decoration_letter || 'M';
-          item.innerHTML = `<span class="scm-item-letter ${letter}" title="${escapeHtml(res.decoration_tooltip || '')}">${letter}</span><span class="scm-item-path">${escapeHtml(res.uri)}</span>`;
+          item.innerHTML = `<span class="scm-item-letter ${escapeHtml(letter)}" title="${escapeHtml(res.decoration_tooltip || '')}">${escapeHtml(letter)}</span><span class="scm-item-path">${escapeHtml(res.uri)}</span>`;
           itemsEl.appendChild(item);
         }
         scmGroupsEl.appendChild(groupEl);

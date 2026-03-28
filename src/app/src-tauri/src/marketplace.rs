@@ -87,8 +87,8 @@ impl MarketplaceClient {
                 ("query", query),
                 ("offset", &offset.to_string()),
                 ("size", &limit.to_string()),
-                ("sortBy", &"downloadCount".to_string()),
-                ("sortOrder", &"desc".to_string()),
+                ("sortBy", "downloadCount"),
+                ("sortOrder", "desc"),
             ])
             .send()
             .await
@@ -182,6 +182,16 @@ impl MarketplaceClient {
             .send()
             .await
             .map_err(|e| format!("VSIX download failed: {e}"))?;
+
+        // Validate final URL after redirects — reqwest follows redirects automatically
+        // so the response may come from a different host than the initial request.
+        if let Some(final_host) = resp.url().host_str() {
+            if !ALLOWED_HOSTS.contains(&final_host) {
+                return Err(format!(
+                    "VSIX download redirected to untrusted host '{final_host}'"
+                ));
+            }
+        }
 
         if !resp.status().is_success() {
             return Err(format!(

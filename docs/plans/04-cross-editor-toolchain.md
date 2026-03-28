@@ -103,7 +103,10 @@ export async function activate(context) {
   ext = await instantiate(wasm, {
     // WIT imports implemented with vscode APIs
     workspace: {
-      readFile: (path) => {
+      readFile: async (path) => {
+        if (!vscode.workspace.workspaceFolders?.length) {
+          throw new Error('No workspace folder open');
+        }
         const uri = vscode.Uri.joinPath(
           vscode.workspace.workspaceFolders[0].uri, path
         );

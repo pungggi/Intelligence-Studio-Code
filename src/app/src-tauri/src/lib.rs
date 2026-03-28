@@ -27,7 +27,7 @@ struct AppState {
     ipc: IpcHandle,
     marketplace: marketplace::MarketplaceClient,
     extension_mgr: Mutex<extension_mgr::ExtensionManager>,
-    settings: Mutex<settings::SettingsStore>,
+    settings: Arc<Mutex<settings::SettingsStore>>,
     terminal_mgr: Mutex<terminal::TerminalManager>,
     debug_mgr: Arc<debug::DebugManager>,
     /// Count of open windows; extension host is killed when this reaches zero.
@@ -566,6 +566,167 @@ fn get_wasm_output_lines(state: tauri::State<AppState>) -> Vec<[String; 2]> {
         .collect()
 }
 
+/// Drain buffered notification toasts from all active WASM extensions.
+///
+/// Returns objects with `type` ("info"/"warning"/"error") and `message` fields,
+/// matching the same shape as `get_notifications` from the Node.js IPC bridge.
+#[tauri::command]
+fn get_wasm_notifications(state: tauri::State<AppState>) -> Vec<ipc_bridge::Notification> {
+    state
+        .wasm_host
+        .drain_all_notifications()
+        .into_iter()
+        .map(|(level, message)| ipc_bridge::Notification {
+            msg_type: level,
+            message,
+        })
+        .collect()
+}
+
+/// Collect status bar items from all active WASM extensions.
+///
+/// Returns objects matching the `StatusBarItem` shape used by the IPC bridge.
+#[tauri::command]
+fn get_wasm_status_bar_items(state: tauri::State<AppState>) -> Vec<ipc_bridge::StatusBarItem> {
+    state
+        .wasm_host
+        .get_all_status_items()
+        .into_iter()
+        .map(|(id, text, tooltip)| ipc_bridge::StatusBarItem {
+            id,
+            text,
+            tooltip,
+            command: None,
+            alignment: "left".to_string(),
+            priority: 0,
+        })
+        .collect()
+}
+
+// --- WASM Language Provider Commands ---
+
+#[tauri::command]
+fn wasm_completions(
+    state: tauri::State<AppState>,
+    lang_id: String,
+    uri: String,
+    line: u32,
+    character: u32,
+    trigger: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let items = state.wasm_host.completions_for_lang(
+        &lang_id, &uri, line, character, trigger.as_deref(),
+    );
+    serde_json::to_value(&items).map_err(|e| format!("serialization error: {e}"))
+}
+
+#[tauri::command]
+fn wasm_diagnostics(
+    state: tauri::State<AppState>,
+    lang_id: String,
+    uri: String,
+    content: String,
+) -> Result<serde_json::Value, String> {
+    let diags = state.wasm_host.diagnostics_for_lang(&lang_id, &uri, &content);
+    serde_json::to_value(&diags).map_err(|e| format!("serialization error: {e}"))
+}
+
+#[tauri::command]
+fn wasm_hover(
+    state: tauri::State<AppState>,
+    lang_id: String,
+    uri: String,
+    line: u32,
+    character: u32,
+) -> Result<serde_json::Value, String> {
+    let result = state.wasm_host.hover_for_lang(&lang_id, &uri, line, character);
+    serde_json::to_value(&result).map_err(|e| format!("serialization error: {e}"))
+}
+
+#[tauri::command]
+fn wasm_format_document(
+    state: tauri::State<AppState>,
+    lang_id: String,
+    uri: String,
+    content: String,
+) -> Result<serde_json::Value, String> {
+    let edits = state.wasm_host.format_document_for_lang(&lang_id, &uri, &content);
+    serde_json::to_value(&edits).map_err(|e| format!("serialization error: {e}"))
+}
+
+#[tauri::command]
+fn wasm_definition(
+    state: tauri::State<AppState>,
+    lang_id: String,
+    uri: String,
+    line: u32,
+    character: u32,
+) -> Result<serde_json::Value, String> {
+    let result = state.wasm_host.definition_for_lang(&lang_id, &uri, line, character);
+    serde_json::to_value(&result).map_err(|e| format!("serialization error: {e}"))
+}
+
+#[tauri::command]
+fn wasm_references(
+    state: tauri::State<AppState>,
+    lang_id: String,
+    uri: String,
+    line: u32,
+    character: u32,
+    include_decl: bool,
+) -> Result<serde_json::Value, String> {
+    let locs = state.wasm_host.references_for_lang(&lang_id, &uri, line, character, include_decl);
+    serde_json::to_value(&locs).map_err(|e| format!("serialization error: {e}"))
+}
+
+#[tauri::command]
+fn wasm_rename(
+    state: tauri::State<AppState>,
+    lang_id: String,
+    uri: String,
+    line: u32,
+    character: u32,
+    new_name: String,
+) -> Result<serde_json::Value, String> {
+    let edits = state.wasm_host.rename_for_lang(&lang_id, &uri, line, character, &new_name);
+    serde_json::to_value(&edits).map_err(|e| format!("serialization error: {e}"))
+}
+
+#[tauri::command]
+fn wasm_code_actions(
+    state: tauri::State<AppState>,
+    lang_id: String,
+    uri: String,
+    range: serde_json::Value,
+    diagnostics: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let r: wasm_host::Range = serde_json::from_value(range).map_err(|e| format!("bad range: {e}"))?;
+    let diags: Vec<wasm_host::Diagnostic> = serde_json::from_value(diagnostics).map_err(|e| format!("bad diagnostics: {e}"))?;
+    let actions = state.wasm_host.code_actions_for_lang(&lang_id, &uri, &r, &diags);
+    serde_json::to_value(&actions).map_err(|e| format!("serialization error: {e}"))
+}
+
+#[tauri::command]
+fn wasm_workspace_symbols(
+    state: tauri::State<AppState>,
+    lang_id: String,
+    query: String,
+) -> Result<serde_json::Value, String> {
+    let symbols = state.wasm_host.workspace_symbols_for_lang(&lang_id, &query);
+    serde_json::to_value(&symbols).map_err(|e| format!("serialization error: {e}"))
+}
+
+#[tauri::command]
+fn wasm_folding_ranges(
+    state: tauri::State<AppState>,
+    lang_id: String,
+    uri: String,
+    content: String,
+) -> Result<serde_json::Value, String> {
+    let ranges = state.wasm_host.folding_ranges_for_lang(&lang_id, &uri, &content);
+    serde_json::to_value(&ranges).map_err(|e| format!("serialization error: {e}"))
+}
+
 /// Notify Extension Host of text changes.
 fn notify_change(path_str: &str, version: u32, text: &str, ipc: &IpcHandle, workspace_id: &str) {
     ipc.send(OutgoingMessage::DidChange {
@@ -966,6 +1127,51 @@ fn get_setting_definitions(
 
 // --- M8b: Terminal Commands ---
 
+fn validate_shell_path(shell: &str) -> Result<(), String> {
+    if shell.contains("..") {
+        return Err("Invalid shell path: path traversal not allowed".to_string());
+    }
+
+    if !shell.contains('/') && !shell.contains('\\') {
+        return Ok(());
+    }
+
+    let path = std::path::Path::new(shell);
+
+    if path.is_absolute() {
+        let safe_shells = [
+            "bash", "zsh", "sh", "fish", "pwsh", "powershell", "dash",
+            "ksh", "csh", "tcsh", "cmd.exe", "powershell.exe", "pwsh.exe",
+        ];
+        let basename = path.file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        if safe_shells.iter().any(|s| *s == basename) {
+            return Ok(());
+        }
+
+        let home = dirs::home_dir().ok_or_else(|| {
+            "Invalid shell path: could not determine user home directory".to_string()
+        })?;
+        let canonical = std::fs::canonicalize(shell)
+            .map_err(|e| format!("Invalid shell path '{}': {}", shell, e))?;
+        let home_canonical = std::fs::canonicalize(&home).unwrap_or(home);
+        if !canonical.starts_with(&home_canonical) {
+            return Err(format!(
+                "Invalid shell path: '{}' is outside the user home directory and is not a recognized shell",
+                shell
+            ));
+        }
+        return Ok(());
+    }
+
+    Err(format!(
+        "Invalid shell path: relative paths with directory components are not allowed ('{}')",
+        shell
+    ))
+}
+
 #[tauri::command]
 fn terminal_create(
     app: AppHandle,
@@ -975,11 +1181,8 @@ fn terminal_create(
     rows: u32,
     state: tauri::State<AppState>,
 ) -> Result<String, String> {
-    // Reject shell paths that contain traversal sequences.
     if let Some(ref s) = shell {
-        if s.contains("..") {
-            return Err("Invalid shell path: path traversal not allowed".to_string());
-        }
+        validate_shell_path(s)?;
     }
     let mut mgr = state.terminal_mgr.lock().map_err(|e| e.to_string())?;
     mgr.create(
@@ -1110,36 +1313,47 @@ fn uri_to_path(uri: &str) -> String {
 
 /// Apply a list of text edits (in descending position order) to a plain string.
 /// Each edit replaces [start_line:start_col, end_line:end_col) with `new_text`.
-fn apply_text_edits_to_str(text: &str, edits: &[ipc_bridge::WorkspaceTextEdit]) -> String {
-    // Collect lines, preserving original line endings.
+fn apply_text_edits_to_str(text: &str, edits: &[ipc_bridge::WorkspaceTextEdit]) -> Result<String, String> {
     let mut lines: Vec<String> = text.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect();
     let has_trailing_newline = text.ends_with('\n') || text.ends_with("\r\n");
 
-    for edit in edits {
-        let sl = edit.start_line.min(lines.len().saturating_sub(1));
-        let el = edit.end_line.min(lines.len().saturating_sub(1));
+    for (i, edit) in edits.iter().enumerate() {
+        if edit.start_line >= lines.len() || edit.end_line >= lines.len() {
+            return Err(format!(
+                "Edit #{} references line {}-{} but file only has {} line(s)",
+                i, edit.start_line, edit.end_line, lines.len()
+            ));
+        }
 
-        let start_line_text = lines.get(sl).cloned().unwrap_or_default();
-        let end_line_text = lines.get(el).cloned().unwrap_or_default();
+        let start_line_text = lines.get(edit.start_line).cloned().unwrap_or_default();
+        let end_line_text = lines.get(edit.end_line).cloned().unwrap_or_default();
 
-        let sc = edit.start_col.min(start_line_text.len());
-        let ec = edit.end_col.min(end_line_text.len());
+        if edit.start_col > start_line_text.len() {
+            return Err(format!(
+                "Edit #{} start_col {} exceeds line {} length {}",
+                i, edit.start_col, edit.start_line, start_line_text.len()
+            ));
+        }
+        if edit.end_col > end_line_text.len() {
+            return Err(format!(
+                "Edit #{} end_col {} exceeds line {} length {}",
+                i, edit.end_col, edit.end_line, end_line_text.len()
+            ));
+        }
 
-        let prefix = start_line_text[..sc].to_string();
-        let suffix = end_line_text[ec..].to_string();
+        let prefix = start_line_text[..edit.start_col].to_string();
+        let suffix = end_line_text[edit.end_col..].to_string();
         let combined = prefix + &edit.new_text + &suffix;
 
         let new_lines: Vec<String> = combined.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect();
-        let new_len = new_lines.len();
-        lines.splice(sl..=el, new_lines);
-        let _ = new_len; // suppress warning
+        lines.splice(edit.start_line..=edit.end_line, new_lines);
     }
 
     let mut result = lines.join("\n");
     if has_trailing_newline && !result.ends_with('\n') {
         result.push('\n');
     }
-    result
+    Ok(result)
 }
 
 /// Drain pending workspace edit requests and return them to the frontend.
@@ -1169,9 +1383,10 @@ fn apply_workspace_edit(
         if file_edit.edits.is_empty() {
             continue;
         }
-        // Canonicalize and enforce home-dir confinement before any file I/O.
-        // Without this check a malicious extension could write to arbitrary paths
-        // (e.g. ~/.ssh/authorized_keys) by supplying a crafted file:// URI.
+        // Layer 1: canonicalize and enforce home-dir confinement.
+        // Layer 2 (below): for files not in an open buffer, further restrict
+        // to the workspace root so extensions cannot overwrite sensitive files
+        // such as ~/.ssh/authorized_keys or ~/.aws/credentials.
         let path_str = validate_path(&uri_to_path(&file_edit.uri))?;
         let path = std::path::PathBuf::from(&path_str);
 
@@ -1208,10 +1423,34 @@ fn apply_workspace_edit(
                 workspace_id: Some(wid.clone()),
             });
         } else {
+            // The target file is not open in the editor.  Restrict disk writes
+            // to the workspace root to prevent a malicious extension from
+            // overwriting sensitive files outside the project (e.g.
+            // ~/.ssh/authorized_keys, ~/.bashrc, ~/.aws/credentials).
+            match ws.workspace_root() {
+                Some(root) if path.starts_with(root) => {}
+                Some(root) => {
+                    return Err(format!(
+                        "Access denied: '{}' is outside the workspace root '{}'. \
+                         Workspace edits for files not open in the editor must \
+                         target files within the workspace folder.",
+                        path_str,
+                        root.display()
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "Access denied: '{}' is not open in the editor and no \
+                         workspace root is registered. Open a workspace folder \
+                         before applying edits to files outside the editor.",
+                        path_str
+                    ));
+                }
+            }
             // Apply to a file not currently open in the editor.
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read {}: {}", path_str, e))?;
-            let modified = apply_text_edits_to_str(&text, &edits);
+            let modified = apply_text_edits_to_str(&text, &edits)?;
             std::fs::write(&path, &modified)
                 .map_err(|e| format!("Failed to write {}: {}", path_str, e))?;
         }
@@ -1243,6 +1482,16 @@ fn validate_dir_path(path: &str) -> Result<String, String> {
         ));
     }
     Ok(canonical.to_string_lossy().to_string())
+}
+
+fn validate_relative_file_path(file_path: &str) -> Result<(), String> {
+    if file_path.contains("..") {
+        return Err("Invalid file path: path traversal not allowed".to_string());
+    }
+    if std::path::Path::new(file_path).is_absolute() {
+        return Err("Invalid file path: absolute paths not allowed".to_string());
+    }
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -1295,12 +1544,7 @@ fn git_diff_file(
     staged: bool,
 ) -> Result<String, String> {
     let dir = validate_dir_path(&workspace_path)?;
-    if file_path.contains("..") {
-        return Err("Invalid file path: path traversal not allowed".to_string());
-    }
-    if std::path::Path::new(&file_path).is_absolute() {
-        return Err("Invalid file path: absolute paths not allowed".to_string());
-    }
+    validate_relative_file_path(&file_path)?;
 
     let mut cmd = std::process::Command::new("git");
     cmd.arg("-C").arg(&dir);
@@ -1339,12 +1583,7 @@ fn git_diff_file(
 #[tauri::command]
 fn git_stage(workspace_path: String, file_path: String) -> Result<(), String> {
     let dir = validate_dir_path(&workspace_path)?;
-    if file_path.contains("..") {
-        return Err("Invalid file path".to_string());
-    }
-    if std::path::Path::new(&file_path).is_absolute() {
-        return Err("Invalid file path: absolute paths not allowed".to_string());
-    }
+    validate_relative_file_path(&file_path)?;
     let output = std::process::Command::new("git")
         .args(["-C", &dir, "add", "--", &file_path])
         .output()
@@ -1359,12 +1598,7 @@ fn git_stage(workspace_path: String, file_path: String) -> Result<(), String> {
 #[tauri::command]
 fn git_unstage(workspace_path: String, file_path: String) -> Result<(), String> {
     let dir = validate_dir_path(&workspace_path)?;
-    if file_path.contains("..") {
-        return Err("Invalid file path".to_string());
-    }
-    if std::path::Path::new(&file_path).is_absolute() {
-        return Err("Invalid file path: absolute paths not allowed".to_string());
-    }
+    validate_relative_file_path(&file_path)?;
     let output = std::process::Command::new("git")
         .args(["-C", &dir, "restore", "--staged", "--", &file_path])
         .output()
@@ -1379,12 +1613,7 @@ fn git_unstage(workspace_path: String, file_path: String) -> Result<(), String> 
 #[tauri::command]
 fn git_discard(workspace_path: String, file_path: String) -> Result<(), String> {
     let dir = validate_dir_path(&workspace_path)?;
-    if file_path.contains("..") {
-        return Err("Invalid file path".to_string());
-    }
-    if std::path::Path::new(&file_path).is_absolute() {
-        return Err("Invalid file path: absolute paths not allowed".to_string());
-    }
+    validate_relative_file_path(&file_path)?;
     let output = std::process::Command::new("git")
         .args(["-C", &dir, "restore", "--", &file_path])
         .output()
@@ -1468,7 +1697,7 @@ fn debug_poll_events(
     session_id: String,
     state: tauri::State<AppState>,
 ) -> Result<Vec<debug::DebugEvent>, String> {
-    Ok(state.debug_mgr.drain_events(&session_id))
+    state.debug_mgr.drain_events(&session_id)
 }
 
 /// Stop a debug session and kill the adapter process.
@@ -1495,10 +1724,11 @@ fn register_workspace(
 ) -> Result<(), String> {
     let wid = window.label().to_string();
     let dir = validate_dir_path(&root_path)?;
-    // Ensure workspace state entry exists for this window
+    // Ensure workspace state entry exists for this window and record the root.
     {
         let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-        guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+        let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+        ws.set_workspace_root(std::path::PathBuf::from(&dir));
     }
     // Inform WASM extensions so workspace_read calls resolve against the new root.
     state.wasm_host.notify_workspace_opened(std::path::PathBuf::from(&dir));
@@ -1604,11 +1834,13 @@ pub fn run() {
         .expect("Failed to create marketplace client");
     let ext_mgr = extension_mgr::ExtensionManager::new()
         .expect("Failed to create extension manager");
-    let settings_store = settings::SettingsStore::new()
-        .expect("Failed to create settings store");
+    let settings_store = Arc::new(Mutex::new(
+        settings::SettingsStore::new().expect("Failed to create settings store"),
+    ));
     let debug_manager = Arc::new(debug::DebugManager::new());
-    let wasm_host_mgr = wasm_host::WasmHostManager::new()
+    let mut wasm_host_mgr = wasm_host::WasmHostManager::new()
         .expect("Failed to initialise WASM extension host");
+    wasm_host_mgr.set_settings(settings_store.clone());
 
     // Get user extensions directory path for Extension Host
     let user_extensions_dir = ext_mgr.extensions_dir().to_string_lossy().to_string();
@@ -1622,7 +1854,7 @@ pub fn run() {
             ipc,
             marketplace: marketplace_client,
             extension_mgr: Mutex::new(ext_mgr),
-            settings: Mutex::new(settings_store),
+            settings: settings_store,
             terminal_mgr: Mutex::new(terminal::TerminalManager::new()),
             debug_mgr: debug_manager,
             window_count: Arc::new(Mutex::new(1)), // main window
@@ -1657,6 +1889,19 @@ pub fn run() {
             get_status_bar_items,
             get_output_lines,
             get_wasm_output_lines,
+            get_wasm_notifications,
+            get_wasm_status_bar_items,
+            // Phase 2: WASM language provider commands
+            wasm_completions,
+            wasm_diagnostics,
+            wasm_hover,
+            wasm_format_document,
+            wasm_definition,
+            wasm_references,
+            wasm_rename,
+            wasm_code_actions,
+            wasm_workspace_symbols,
+            wasm_folding_ranges,
             // M6: LSP commands
             lsp_inline_completion,
             lsp_inlay_hints,
@@ -1921,35 +2166,74 @@ mod tests {
     // ── git path validation ──────────────────────────────────────────────────
 
     #[test]
-    fn git_diff_file_rejects_dotdot() {
-        // The path traversal check is inside the tauri command, so we test
-        // the guard logic directly by simulating its condition.
-        let file_path = "../../../etc/passwd";
-        assert!(
-            file_path.contains(".."),
-            "test setup: path should contain dotdot"
-        );
+    fn validate_relative_file_path_rejects_dotdot() {
+        assert!(validate_relative_file_path("../../../etc/passwd").is_err());
+        assert!(validate_relative_file_path("foo/../bar").is_err());
+    }
+
+    #[test]
+    fn validate_relative_file_path_rejects_absolute() {
+        #[cfg(not(target_os = "windows"))]
+        let path = "/etc/passwd";
+        #[cfg(target_os = "windows")]
+        let path = "C:\\Windows\\System32\\hosts";
+        assert!(validate_relative_file_path(path).is_err());
+    }
+
+    #[test]
+    fn validate_relative_file_path_accepts_relative() {
+        assert!(validate_relative_file_path("src/main.rs").is_ok());
+        assert!(validate_relative_file_path("foo/bar.txt").is_ok());
     }
 
     #[test]
     fn git_commands_reject_absolute_paths() {
-        // Use a platform-appropriate absolute path.
         #[cfg(not(target_os = "windows"))]
         let file_path = "/etc/passwd";
         #[cfg(target_os = "windows")]
         let file_path = "C:\\Windows\\System32\\drivers\\etc\\hosts";
+        assert!(validate_relative_file_path(file_path).is_err());
+    }
 
-        assert!(
-            std::path::Path::new(file_path).is_absolute(),
-            "test setup: path should be absolute"
-        );
-        // The actual guard in git_diff_file / git_stage / git_unstage / git_discard
-        // calls is_absolute() and returns an error — verified here structurally.
-        let result: Result<(), String> = if std::path::Path::new(file_path).is_absolute() {
-            Err("Invalid file path: absolute paths not allowed".to_string())
-        } else {
-            Ok(())
+    // ── shell validation ─────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_shell_accepts_bare_names() {
+        assert!(validate_shell_path("bash").is_ok());
+        assert!(validate_shell_path("zsh").is_ok());
+        assert!(validate_shell_path("sh").is_ok());
+    }
+
+    #[test]
+    fn validate_shell_rejects_dotdot() {
+        assert!(validate_shell_path("../evil").is_err());
+    }
+
+    #[test]
+    fn validate_shell_rejects_relative_with_dir() {
+        assert!(validate_shell_path("./evil").is_err());
+        assert!(validate_shell_path("bin/shell").is_err());
+    }
+
+    // ── apply_text_edits_to_str bounds checking ──────────────────────────────
+
+    #[test]
+    fn apply_text_edits_to_str_rejects_out_of_bounds_line() {
+        let text = "line0\nline1\n";
+        let edit = ipc_bridge::WorkspaceTextEdit {
+            start_line: 5, start_col: 0, end_line: 6, end_col: 0,
+            new_text: "x".to_string(),
         };
-        assert!(result.is_err(), "absolute path should be rejected");
+        assert!(apply_text_edits_to_str(text, &[edit]).is_err());
+    }
+
+    #[test]
+    fn apply_text_edits_to_str_rejects_out_of_bounds_col() {
+        let text = "hi\n";
+        let edit = ipc_bridge::WorkspaceTextEdit {
+            start_line: 0, start_col: 0, end_line: 0, end_col: 99,
+            new_text: "x".to_string(),
+        };
+        assert!(apply_text_edits_to_str(text, &[edit]).is_err());
     }
 }

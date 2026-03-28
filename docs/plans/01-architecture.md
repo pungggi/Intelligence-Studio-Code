@@ -112,11 +112,18 @@ It provides:
 Capabilities declared in `corecode.toml` are checked at activation time:
 
 - `workspace_read = false` → host denies any file-read WIT call, returns `Err`
-- `network_fetch = false` → `http_fetch` import is not linked; calling it traps
+- `network_fetch = false` → `http_fetch` import is not linked; calling it causes a hard WASM trap
 - `webview_panels = false` → `webview_create` returns `Err("not declared")`
 
+**Rationale for the behavioral difference:** `network_fetch = false` causes a hard WASM trap
+(unlinked import) as a security measure — network access must be completely blocked at the
+runtime level so there is no code path that can accidentally or maliciously bypass it.
+In contrast, `workspace_read` and `webview_panels` return soft `Err` values because they are
+capability checks that extensions can detect and handle gracefully (e.g. degrade to read-only
+mode or skip opening a panel).
+
 This is implemented via conditional `wasmtime::Linker` binding at instance creation.
-Extensions that call a function they did not declare in capabilities are hard-trapped
+Extensions that call a network function they did not declare in capabilities are hard-trapped
 (WASM trap, not a soft error) so the failure is loud and auditable.
 
 ---
@@ -152,15 +159,23 @@ pub enum ExtensionKind {
     Wasm,     // has corecode.toml
 }
 
-fn detect_kind(ext_dir: &Path) -> Option<ExtensionKind> {
-    if ext_dir.join("corecode.toml").exists() {
-        Some(ExtensionKind::Wasm)
-    } else if ext_dir.join("package.json").exists() {
-        Some(ExtensionKind::NodeJs)
-    } else {
-        None
+pub fn detect_kind(ext_dir: &std::path::Path) -> Option<ExtensionKind> {
+    let has_toml = ext_dir.join("corecode.toml").exists();
+    let has_pkg  = ext_dir.join("package.json").exists();
+    match (has_toml, has_pkg) {
+        (true, true) => {
+            log::warn!(
+                "Extension '{}' has both corecode.toml and package.json; \
+                 treating as WASM extension",
+                ext_dir.display()
+            );
+            Some(ExtensionKind::Wasm)
+        }
+        (true, false)  => Some(ExtensionKind::Wasm),
+        (false, true)  => Some(ExtensionKind::NodeJs),
+        (false, false) => None,
     }
 }
 ```
 
-An extension directory containing both files is an error (logged and skipped).
+An extension directory containing both files logs a warning and is treated as a WASM extension.

@@ -73,11 +73,13 @@ use std::sync::Mutex;
 pub struct DynamicGrammar {
     pub language_id: String,
     pub file_types: Vec<String>,
-    /// The parsed tree-sitter Language, loaded via tree-sitter's WASM loader.
-    pub language: tree_sitter::Language,
+    /// The parsed tree-sitter Language, wrapped in Arc for safe sharing.
+    pub language: Arc<tree_sitter::Language>,
     pub highlights_query: String,
     pub injections_query: Option<String>,
     pub bracket_pairs: Vec<[String; 2]>,
+    /// Keeps the loaded shared library alive for the lifetime of the language.
+    pub _library: Option<libloading::Library>,
 }
 
 pub struct GrammarRegistry {
@@ -97,19 +99,29 @@ impl GrammarRegistry {
 
     /// Register a grammar loaded from a WASM extension.
     pub fn register(&self, grammar: DynamicGrammar) {
+        // Acquire both locks atomically to prevent TOCTOU races
         let mut ext_map = self.ext_map.lock().unwrap();
+        let mut dynamic = self.dynamic.lock().unwrap();
+
         for ft in &grammar.file_types {
+            if let Some(existing) = ext_map.get(ft) {
+                if existing != &grammar.language_id {
+                    log::warn!(
+                        "Grammar conflict for extension '.{}': '{}' overrides '{}'",
+                        ft, grammar.language_id, existing
+                    );
+                }
+            }
             ext_map.insert(ft.clone(), grammar.language_id.clone());
         }
-        self.dynamic.lock().unwrap()
-            .insert(grammar.language_id.clone(), grammar);
+        dynamic.insert(grammar.language_id.clone(), grammar);
     }
 
     /// Look up a grammar by file extension. Returns None if not registered dynamically.
-    pub fn by_extension(&self, ext: &str) -> Option<tree_sitter::Language> {
+    pub fn by_extension(&self, ext: &str) -> Option<Arc<tree_sitter::Language>> {
         let lang_id = self.ext_map.lock().unwrap().get(ext)?.clone();
         let map = self.dynamic.lock().unwrap();
-        Some(map.get(&lang_id)?.language.clone())
+        Some(Arc::clone(&map.get(&lang_id)?.language))
     }
 
     pub fn highlights_query(&self, lang_id: &str) -> Option<String> {
@@ -153,19 +165,33 @@ library rather than a WASM grammar. The host loads it with `libloading`:
 // In grammar_registry.rs
 
 pub fn load_from_dylib(
-    grammar: &DynamicGrammar,
+    language_id: &str,
     dylib_path: &std::path::Path,
-) -> Result<tree_sitter::Language, String> {
-    // Security: verify path is inside extension directory before loading
+) -> Result<(tree_sitter::Language, libloading::Library), String> {
+    // Validate language_id: only ASCII alphanumerics and hyphens are allowed.
+    // This prevents unsafe characters from leaking into the constructed symbol name.
+    if language_id.is_empty()
+        || !language_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(format!(
+            "Invalid language_id '{}': must be non-empty ASCII alphanumerics and hyphens only",
+            language_id,
+        ));
+    }
+
     let lib = unsafe { libloading::Library::new(dylib_path) }
         .map_err(|e| format!("Cannot load grammar dylib: {e}"))?;
 
-    let fn_name = format!("tree_sitter_{}", grammar.language_id.replace('-', "_"));
-    let lang_fn: libloading::Symbol<unsafe extern "C" fn() -> tree_sitter::Language> =
-        unsafe { lib.get(fn_name.as_bytes()) }
-            .map_err(|e| format!("Symbol '{}' not found: {e}", fn_name))?;
-
-    Ok(unsafe { lang_fn() })
+    let fn_name = format!("tree_sitter_{}", language_id.replace('-', "_"));
+    let lang = {
+        let lang_fn: libloading::Symbol<unsafe extern "C" fn() -> tree_sitter::Language> =
+            unsafe { lib.get(fn_name.as_bytes()) }
+                .map_err(|e| format!("Symbol '{}' not found: {e}", fn_name))?;
+        unsafe { lang_fn() }
+    };
+    Ok((lang, lib))
 }
 ```
 
@@ -205,16 +231,16 @@ pub fn load_grammar(
     config: &crate::wasm_host::manifest::GrammarConfig,
 ) -> Result<crate::grammar_registry::DynamicGrammar, String> {
     let highlights = self.highlights_query_fn.as_ref()
-        .map(|f| { /* call */ })
+        .map(|f| f.call(&mut self.store, ()))
         .transpose()?
         .unwrap_or_default();
 
     let injections = self.injections_query_fn.as_ref()
-        .map(|f| { /* call */ })
+        .map(|f| f.call(&mut self.store, ()))
         .transpose()?;
 
     let bracket_pairs_json = self.bracket_pairs_fn.as_ref()
-        .map(|f| { /* call */ })
+        .map(|f| f.call(&mut self.store, ()))
         .transpose()?
         .unwrap_or_else(|| "[]".to_string());
 
@@ -231,19 +257,19 @@ pub fn load_grammar(
         return Err("grammar dylib is outside extension directory".to_string());
     }
 
+    let (language, library) = crate::grammar_registry::load_from_dylib(
+        &config.language_id,
+        &canonical_dylib,
+    )?;
+
     let grammar = crate::grammar_registry::DynamicGrammar {
         language_id: config.language_id.clone(),
         file_types: config.file_types.clone(),
-        language: crate::grammar_registry::load_from_dylib(
-            &crate::grammar_registry::DynamicGrammar {
-                language_id: config.language_id.clone(),
-                ..Default::default()
-            },
-            &canonical_dylib
-        )?,
+        language: std::sync::Arc::new(language),
         highlights_query: highlights,
         injections_query: injections,
         bracket_pairs,
+        _library: Some(library),
     };
 
     Ok(grammar)
@@ -331,9 +357,13 @@ impl Guest for TomlGrammar {
 
 impl GrammarProvider for TomlGrammar {
     fn grammar_wasm() -> Vec<u8> {
-        // The dylib is shipped as a sidecar; return empty here.
-        // The host reads it via manifest.grammar.dylib, not this function.
-        vec![]
+        // Return the grammar dylib bytes embedded at build time.
+        // The host uses these bytes to write the dylib to a temp location and load it.
+        include_bytes!("../tree-sitter-toml.so").to_vec()
+        // Note: The host reads the bytes from `grammar-wasm()` and writes them to a
+        // temporary file before loading via `libloading`. Alternatively, if `dylib` is
+        // specified in `corecode.toml`, the host loads it directly from the extension
+        // directory. Both paths are supported.
     }
 
     fn highlights_query() -> String {
@@ -354,19 +384,69 @@ export!(TomlGrammar);
 
 ## 7. Tests
 
-```rust
-// grammar_registry.rs #[cfg(test)]
+Add a `#[cfg(test)]` constructor to `DynamicGrammar` that accepts a raw
+`tree_sitter::Language` so unit tests can inject any statically linked grammar
+(e.g. `tree_sitter_json`) without loading a dylib at runtime:
 
-#[test]
-fn by_extension_returns_none_for_unregistered() {
-    let registry = GrammarRegistry::new();
-    assert!(registry.by_extension("zig").is_none());
+```rust
+// grammar_registry.rs
+
+impl DynamicGrammar {
+    /// Test-only constructor: accepts a statically linked Language so tests
+    /// can exercise the registry without loading a dylib.
+    #[cfg(test)]
+    pub fn for_test(
+        language_id: &str,
+        file_types: &[&str],
+        language: tree_sitter::Language,
+    ) -> Self {
+        Self {
+            language_id: language_id.to_string(),
+            file_types: file_types.iter().map(|s| s.to_string()).collect(),
+            language: std::sync::Arc::new(language),
+            highlights_query: String::new(),
+            injections_query: None,
+            bracket_pairs: Vec::new(),
+            _library: None,
+        }
+    }
 }
 
-#[test]
-fn ext_map_populated_on_register() {
-    // Create a DynamicGrammar with a mock Language (skip dylib for unit test)
-    // Register it, then verify by_extension returns Some
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn by_extension_returns_none_for_unregistered() {
+        let registry = GrammarRegistry::new();
+        assert!(registry.by_extension("zig").is_none());
+    }
+
+    #[test]
+    fn ext_map_populated_on_register() {
+        let registry = GrammarRegistry::new();
+        // Use any statically linked grammar as a stand-in
+        let grammar = DynamicGrammar::for_test(
+            "json",
+            &["json", "jsonc"],
+            tree_sitter_json::language(),
+        );
+        registry.register(grammar);
+
+        assert!(registry.by_extension("json").is_some());
+        assert!(registry.by_extension("jsonc").is_some());
+        // Unrelated extensions remain unregistered
+        assert!(registry.by_extension("toml").is_none());
+    }
+
+    #[test]
+    fn load_from_dylib_rejects_invalid_language_id() {
+        let path = std::path::Path::new("/tmp/fake.so");
+        assert!(load_from_dylib("", path).is_err());
+        assert!(load_from_dylib("foo bar", path).is_err());
+        assert!(load_from_dylib("../escape", path).is_err());
+        assert!(load_from_dylib("zig", path).is_ok().not()); // file doesn't exist, but id is valid
+    }
 }
 ```
 

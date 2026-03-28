@@ -158,3 +158,4 @@ main().catch((err) => {
   console.error("[ExtensionHost] Fatal error:", err);
   process.exit(1);
 });
+

@@ -88,6 +88,10 @@ impl WebviewRegistry {
         WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::Html(injected_html))
             .title(title)
             .inner_size(800.0, 600.0)
+            // CSP: Set in tauri.conf.json under app.security.csp for this window,
+            // or use .initialization_script() to inject a meta CSP tag.
+            // Recommended: "default-src 'none'; script-src 'nonce-<random>'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'"
+            // See: https://tauri.app/v2/reference/webviewwindow-builder/
             .build()
             .map_err(|e| format!("Cannot create webview: {e}"))?;
 
@@ -106,9 +110,15 @@ impl WebviewRegistry {
         let window = app.get_webview_window(&label)
             .ok_or_else(|| format!("Window '{}' gone", label))?;
 
+        // Safely embed the JSON: serde_json::to_string ensures the value is
+        // a valid JSON literal that can be embedded in JS without injection risk.
+        let safe_json = serde_json::from_str::<serde_json::Value>(json)
+            .map_err(|e| format!("Invalid JSON payload: {e}"))?;
+        let canonical = serde_json::to_string(&safe_json)
+            .map_err(|e| format!("JSON serialization failed: {e}"))?;
         let script = format!(
             "window.dispatchEvent(new MessageEvent('message', {{ data: {} }}));",
-            json
+            canonical
         );
         window.eval(&script)
             .map_err(|e| format!("eval failed: {e}"))?;
@@ -193,17 +203,24 @@ Create `src/app/src-tauri/assets/corecode-bridge.js` (shipped inside the binary 
 
   // Expose a convenience helper for request/response patterns.
   // Usage: const result = await window.coreCode.request({ type: 'getData' });
-  window.coreCode.request = function (data) {
-    return new Promise(function (resolve) {
+  window.coreCode.request = function (data, timeoutMs) {
+    timeoutMs = timeoutMs ?? 10000;
+    return new Promise(function (resolve, reject) {
       const id = Math.random().toString(36).slice(2);
       const wrapped = Object.assign({}, data, { __requestId: id });
 
+      let timeoutHandle;
       const handler = function (event) {
         if (event.data && event.data.__requestId === id) {
+          clearTimeout(timeoutHandle);
           window.removeEventListener('message', handler);
           resolve(event.data);
         }
       };
+      timeoutHandle = setTimeout(function () {
+        window.removeEventListener('message', handler);
+        reject(new Error('coreCode.request timeout after ' + timeoutMs + 'ms'));
+      }, timeoutMs);
       window.addEventListener('message', handler);
       window.coreCode.postMessage(wrapped);
     });
@@ -225,9 +242,12 @@ async fn webview_message(
     panel_id: String,
     json: String,
 ) -> Result<(), String> {
-    // Validate panel_id — alphanumeric + hyphens + dots only
+    // Validate panel_id — alphanumeric + hyphens + dots only; max 64 chars
     if !panel_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '.') {
         return Err(format!("Invalid panel_id: '{panel_id}'"));
+    }
+    if panel_id.len() > 64 {
+        return Err(format!("panel_id too long (max 64 chars)"));
     }
 
     // Find which extension owns this panel
@@ -272,32 +292,39 @@ pub fn host_open_panel(
     title: String,
     _column: u8,
 ) -> Result<(), String> {
-    if ctx.app.is_none() {
-        return Err("no app handle in context".to_string());
+    // Validate inputs
+    if !panel_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '.') {
+        return Err(format!("Invalid panel_id: '{panel_id}'"));
     }
-    // HTML will be fetched from the extension's get-html export by the caller
-    // (manager.rs sets up the round-trip before calling open)
-    let app = ctx.app.as_ref().unwrap();
-    let registry = ctx.webview_registry.as_ref()
-        .ok_or("no webview registry")?;
-
-    // HTML is pushed in by manager.rs via an intermediate channel;
-    // see manager.rs §7 for the full open-panel flow.
-    let _ = (app, registry, panel_id, title);
+    if panel_id.len() > 64 {
+        return Err(format!("panel_id too long (max 64 chars): '{panel_id}'"));
+    }
+    // Register as pending; manager.rs completes the open after get-html is called
+    ctx.pending_panel_opens
+        .push((panel_id, title));
     Ok(())
 }
 ```
 
-> **Design note:** Because `get-html` is a WASM export and `open-panel` is a WASM import
+Update `HostContext` to include:
+
+```rust
+pub pending_panel_opens: Vec<(String, String)>,  // (panel_id, title)
+```
+
+> **Design note:** After the WASM activate() call returns, `manager.rs` processes
+> `ctx.pending_panel_opens`, calls `get-html` on each, and opens the Tauri WebviewWindow.
+> This avoids re-entrant WASM calls.
+>
+> Because `get-html` is a WASM export and `open-panel` is a WASM import
 > that triggers `get-html` to be called, the call order is:
 >
 > 1. Extension calls `webview-host::open-panel(panel_id, title, column)`
-> 2. Host's import handler receives this, calls back `webview-provider::get-html(panel_id, None)`
-> 3. Host renders the returned HTML with the bridge injected
+> 2. Host's import handler stores `(panel_id, title)` in `ctx.pending_panel_opens`
+> 3. After WASM returns, `manager.rs` calls `webview-provider::get-html(panel_id, None)`
+> 4. Host renders the returned HTML with the bridge injected and opens the window
 >
-> This re-entrant call is possible because `wasmtime` supports it when called from within
-> the same thread's Wasm execution, but it requires care with the `Store` borrow. The
-> simplest implementation: the import handler stores `(panel_id, title)` in the `HostContext`
+> The simplest implementation: the import handler stores `(panel_id, title)` in the `HostContext`
 > and returns immediately; after the WASM export call returns, `manager.rs` processes any
 > pending panel opens from the context.
 
@@ -329,6 +356,15 @@ pub fn webview_on_message(
         .ok_or_else(|| format!("Extension '{}' not loaded", ext_id))?;
     inst.webview_on_message(panel_id, json)
 }
+
+pub fn webview_on_close(&self, ext_id: &str, panel_id: &str) -> Result<(), String> {
+    let mut instances = self.instances.lock().unwrap();
+    if let Some(inst) = instances.get_mut(ext_id) {
+        inst.webview_on_close(panel_id);
+    }
+    self.panel_owners.lock().unwrap().remove(panel_id);
+    Ok(())
+}
 ```
 
 ---
@@ -355,9 +391,20 @@ app.on_window_event(move |window, event| {
     if let tauri::WindowEvent::CloseRequested { .. } = event {
         let label = window.label().to_string();
         if label.starts_with("ext-panel-") {
+            // Find panel_id from label (reverse of sanitise_label)
+            // and notify the owning extension
+            let panel_id = {
+                let map = registry_clone.panels.lock().unwrap();
+                map.iter()
+                    .find(|(_, l)| *l == &label)
+                    .map(|(id, _)| id.clone())
+            };
             registry_clone.on_closed(&label);
-            // Find which extension owned this panel and call on-close
-            // (look up in panel_owners by label, then call inst.webview_on_close)
+            if let Some(pid) = panel_id {
+                if let Some(ext_id) = wasm_host_clone.panel_owner(&pid) {
+                    let _ = wasm_host_clone.webview_on_close(&ext_id, &pid);
+                }
+            }
         }
     }
 });
@@ -413,7 +460,7 @@ impl WebviewProvider for Extension {
             _ => {}
         }
         let value = counter().load(Ordering::Relaxed);
-        Some(format!(r#"{{"type":"count","value":{}}}"#, value))
+        serde_json::to_string(&serde_json::json!({"type": "count", "value": value})).ok()
     }
 
     fn on_close(_panel_id: &str) {}
@@ -421,6 +468,13 @@ impl WebviewProvider for Extension {
 ```
 
 `webview/panel.html`:
+
+> **Asset delivery:** The `panel.js` file can be delivered in two ways: (1) **Inline** — use
+> `include_str!` to embed the script directly in the HTML returned by `get_html`, or
+> (2) **Sidecar** — ship `panel.js` alongside `extension.wasm` in the extension directory;
+> the host serves it via Tauri's asset protocol with path-traversal protection. The
+> webview-counter example uses option (1) — inline embedding — for simplicity:
+
 ```html
 <!DOCTYPE html>
 <html>
@@ -429,7 +483,10 @@ impl WebviewProvider for Extension {
   <h1 id="count">0</h1>
   <button id="inc">+</button>
   <button id="dec">−</button>
-  <script src="panel.js"></script>
+  <script>
+    /* Contents of panel.js inlined here, or use:
+       include_str!("panel.js") in get_html */
+  </script>
 </body>
 </html>
 ```

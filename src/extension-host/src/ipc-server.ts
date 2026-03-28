@@ -37,6 +37,7 @@ export class IpcServer {
   private bufferLength: number = 0;
   private host: string;
   private port: number;
+  private actualPort: number = 0;
   private authToken: string;
   private authenticated: boolean = false;
   private authTimer: ReturnType<typeof setTimeout> | null = null;
@@ -47,7 +48,7 @@ export class IpcServer {
     this.authToken = authToken ?? "";
   }
 
-  async start(): Promise<void> {
+  async start(): Promise<number> {
     return new Promise((resolve, reject) => {
       this.server = createServer((socket: Socket) => {
         console.log("[IPC] Frontend connected");
@@ -99,7 +100,11 @@ export class IpcServer {
       });
 
       this.server.listen(this.port, this.host, () => {
-        resolve();
+        const addr = this.server!.address();
+        if (addr && typeof addr === "object") {
+          this.actualPort = addr.port;
+        }
+        resolve(this.actualPort);
       });
 
       this.server.on("error", reject);
@@ -143,9 +148,15 @@ export class IpcServer {
       this.bufferChunks = remaining.length > 0 ? [remaining] : [];
       this.bufferLength = remaining.length;
 
+      let msg: IpcMessage;
       try {
-        const msg: IpcMessage = JSON.parse(payload.toString("utf-8"));
+        msg = JSON.parse(payload.toString("utf-8"));
+      } catch (err) {
+        console.error("[IPC] Failed to parse message:", err, "raw payload:", payload.toString("utf-8"));
+        continue;
+      }
 
+      try {
         // Gate on authentication: first message must be ipc/auth with correct token
         if (!this.authenticated) {
           if (msg.method === "ipc/auth" && this.authToken) {
@@ -179,7 +190,7 @@ export class IpcServer {
 
         this.messageHandler?.(msg);
       } catch (err) {
-        console.error("[IPC] Failed to parse message:", err);
+        console.error("[IPC] Runtime error handling message:", err);
       }
     }
 
@@ -217,6 +228,10 @@ export class IpcServer {
 
   isConnected(): boolean {
     return this.client !== null && !this.client.destroyed;
+  }
+
+  getPort(): number {
+    return this.actualPort;
   }
 
   async stop(): Promise<void> {

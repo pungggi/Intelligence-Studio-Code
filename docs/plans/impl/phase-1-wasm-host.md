@@ -344,14 +344,17 @@ impl WasmInstance {
 
         // Link host imports (ui + workspace)
         // These closures are called from inside the WASM sandbox.
+        // Note: In Phase 1, use manual func_wrap with wasmtime's component
+        // string ABI (encoded as (ptr, len) pairs in linear memory). In Phase 2,
+        // switch to wit-bindgen-generated host bindings to avoid internal types.
         linker.func_wrap(
             "corecode:extension/ui",
             "log",
             |mut caller: wasmtime::Caller<'_, InstanceState>,
-             channel: wasmtime::component::__internal::String,
-             message: wasmtime::component::__internal::String| {
+             channel: String,
+             message: String| {
                 let ctx = &mut caller.data_mut().host_ctx;
-                super::api_impl::host_log(ctx, channel.to_string(), message.to_string());
+                super::api_impl::host_log(ctx, channel, message);
                 Ok(())
             },
         ).map_err(|e| format!("Cannot link ui::log: {e}"))?;

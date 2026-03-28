@@ -165,7 +165,10 @@ interface http {
   fetch: func(request: http-request) -> result<http-response, string>;
 }
 
-// ── Host imports — Webview ──────────────────────────────────────────────────
+// ── Host imports — Webview (capability-gated) ───────────────────────────────
+// Requires `webview_panels = true` in corecode.toml. Functions will return a
+// runtime error if the capability is not granted. Callers are recommended to
+// guard capability checks before invoking them.
 
 interface webview-host {
   // Open a new webview panel. Returns an opaque panel-id.
@@ -176,7 +179,7 @@ interface webview-host {
   post-to-webview: func(panel-id: string, json: string) -> result<_, string>;
 
   // Close a panel programmatically.
-  close-panel: func(panel-id: string);
+  close-panel: func(panel-id: string) -> result<_, string>;
 }
 
 // ── Extension exports — lifecycle ───────────────────────────────────────────
@@ -190,6 +193,10 @@ interface lifecycle {
 }
 
 // ── Extension exports — language provider ───────────────────────────────────
+// Convention: Because WIT requires full interface exports, any function the
+// provider does not support MUST return the exact error string "not-implemented"
+// (rather than generic errors or empty results). This allows the host to safely
+// distinguish unsupported capabilities from genuine runtime failures.
 
 interface language-provider {
   use types.{
@@ -281,7 +288,7 @@ world corecode-extension {
   import workspace;
   import ui;
   import http;
-  import webview-host;
+  import webview-host;        // imported unconditionally, but capability-gated at runtime
 
   // Exports: what the host calls on the extension
   export lifecycle;

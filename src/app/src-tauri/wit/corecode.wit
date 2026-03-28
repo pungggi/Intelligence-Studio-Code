@@ -1,5 +1,64 @@
 package corecode:extension@0.1.0;
 
+// ── Shared types used by language providers ─────────────────────────────────
+
+interface types {
+  record position   { line: u32, character: u32 }
+  record range      { start: position, end: position }
+  record location   { uri: string, range: range }
+
+  record diagnostic {
+    range: range,
+    severity: severity,
+    message: string,
+    source: option<string>,
+    code: option<string>,
+  }
+  enum severity { error, warning, information, hint }
+
+  record completion-item {
+    label: string,
+    kind: option<completion-kind>,
+    detail: option<string>,
+    documentation: option<string>,
+    insert-text: string,
+    filter-text: option<string>,
+  }
+  enum completion-kind {
+    text, method, function, constructor, field, variable,
+    class, interface, module, property, unit, value, enum-member,
+    keyword, snippet, color, file, reference, folder,
+  }
+
+  record hover-result { contents: string, range: option<range> }
+
+  record text-edit {
+    range:    range,
+    new-text: string,
+  }
+
+  record code-action  { title: string, kind: option<string>, edits: list<text-edit> }
+
+  record symbol {
+    name: string,
+    kind: symbol-kind,
+    location: location,
+    container-name: option<string>,
+  }
+  enum symbol-kind {
+    file, module, namespace, package, class, method, property,
+    field, constructor, enum, interface, function, variable,
+    constant, string, number, boolean, array, object, key, null,
+    enum-member, struct, event, operator, type-parameter,
+  }
+
+  record folding-range {
+    start-line: u32,
+    end-line: u32,
+    kind: option<string>,
+  }
+}
+
 // ── Host imports — UI ───────────────────────────────────────────────────────
 
 interface ui {
@@ -38,6 +97,39 @@ interface lifecycle {
 
   /// Called when the host is shutting down. Return value is ignored.
   deactivate: func();
+}
+
+// ── Extension exports — language provider (optional) ────────────────────────
+
+interface language-provider {
+  use types.{
+    position, range, completion-item, hover-result,
+    diagnostic, text-edit, code-action, location,
+    symbol, folding-range,
+  };
+
+  completions:       func(uri: string, pos: position, trigger: option<string>)
+                       -> result<list<completion-item>, string>;
+  hover:             func(uri: string, pos: position)
+                       -> result<option<hover-result>, string>;
+  diagnostics:       func(uri: string, content: string)
+                       -> result<list<diagnostic>, string>;
+  format-document:   func(uri: string, content: string)
+                       -> result<list<text-edit>, string>;
+  format-range:      func(uri: string, content: string, range: range)
+                       -> result<list<text-edit>, string>;
+  definition:        func(uri: string, pos: position)
+                       -> result<option<location>, string>;
+  references:        func(uri: string, pos: position, include-decl: bool)
+                       -> result<list<location>, string>;
+  rename:            func(uri: string, pos: position, new-name: string)
+                       -> result<list<text-edit>, string>;
+  code-actions:      func(uri: string, range: range, diagnostics: list<diagnostic>)
+                       -> result<list<code-action>, string>;
+  workspace-symbols: func(query: string)
+                       -> result<list<symbol>, string>;
+  folding-ranges:    func(uri: string, content: string)
+                       -> result<list<folding-range>, string>;
 }
 
 // ── World ───────────────────────────────────────────────────────────────────
