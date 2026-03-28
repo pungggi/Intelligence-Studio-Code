@@ -11,11 +11,18 @@ use wasmtime::component::{Component, Linker};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
+/// Maximum size of a WASM binary that the host will load (50 MB).
+const MAX_WASM_SIZE: u64 = 50 * 1024 * 1024;
+
+/// Fuel budget per top-level extension call (~1 billion Wasm instructions).
+/// When exhausted, wasmtime traps with "all fuel consumed", preventing infinite loops.
+const FUEL_PER_CALL: u64 = 1_000_000_000;
+
 /// State stored inside each `wasmtime::Store`.
 pub(super) struct InstanceState {
     wasi: WasiCtx,
     table: ResourceTable,
-    pub host_ctx: HostContext,
+    pub(super) host_ctx: HostContext,
 }
 
 impl WasiView for InstanceState {
@@ -44,6 +51,18 @@ impl WasmInstance {
         host_ctx: HostContext,
     ) -> Result<Self, String> {
         let wasm_path = manifest.wasm_path(ext_dir);
+
+        // Reject oversized files before allocating memory.
+        let wasm_size = std::fs::metadata(&wasm_path)
+            .map_err(|e| format!("Cannot stat '{}': {e}", wasm_path.display()))?
+            .len();
+        if wasm_size > MAX_WASM_SIZE {
+            return Err(format!(
+                "'{}' is {wasm_size} bytes — exceeds the 50 MB WASM size limit",
+                wasm_path.display()
+            ));
+        }
+
         let wasm_bytes = std::fs::read(&wasm_path)
             .map_err(|e| format!("Cannot read '{}': {e}", wasm_path.display()))?;
 
@@ -185,6 +204,10 @@ impl WasmInstance {
 
     /// Call the extension's `lifecycle::activate` export.
     pub fn activate(&mut self) -> Result<(), String> {
+        self.store
+            .set_fuel(FUEL_PER_CALL)
+            .map_err(|e| format!("activate: set_fuel failed: {e}"))?;
+
         let mut results = vec![wasmtime::component::Val::Bool(false)];
         self.activate_fn
             .call(&mut self.store, &[], &mut results)
@@ -210,10 +233,18 @@ impl WasmInstance {
 
     /// Call the extension's `lifecycle::deactivate` export.
     pub fn deactivate(&mut self) {
+        let _ = self.store.set_fuel(FUEL_PER_CALL);
         if let Err(e) = self.deactivate_fn.call(&mut self.store, &[], &mut []) {
             log::warn!("[wasm-ext:{}] deactivate trap: {e}", self.id);
         }
         let _ = self.deactivate_fn.post_return(&mut self.store);
+    }
+
+    /// Update the workspace root pushed to this extension's host context.
+    ///
+    /// Called when the user opens a folder after the extension was already activated.
+    pub fn set_workspace_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.store.data_mut().host_ctx.workspace_root = root;
     }
 
     /// Read and drain the buffered output lines from this extension's context.

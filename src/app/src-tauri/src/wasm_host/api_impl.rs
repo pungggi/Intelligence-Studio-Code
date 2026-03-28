@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex};
 /// Cloned cheaply — the `output_lines` and `status_items` vecs are behind `Arc<Mutex<>>`.
 #[derive(Clone)]
 pub struct HostContext {
-    pub workspace_root: Option<PathBuf>,
-    pub workspace_read_allowed: bool,
-    /// Buffered output lines: (channel, message). Read by the `get_output_lines` Tauri command.
-    pub output_lines: Arc<Mutex<Vec<(String, String)>>>,
-    /// Status bar items: id → (text, tooltip). Read by `get_status_bar_items`.
-    pub status_items: Arc<Mutex<std::collections::HashMap<String, (String, Option<String>)>>>,
+    pub(crate) workspace_root: Option<PathBuf>,
+    pub(crate) workspace_read_allowed: bool,
+    /// Buffered output lines: (channel, message). Drained by `drain_all_output_lines`.
+    pub(crate) output_lines: Arc<Mutex<Vec<(String, String)>>>,
+    /// Status bar items: id → (text, tooltip).
+    pub(crate) status_items: Arc<Mutex<std::collections::HashMap<String, (String, Option<String>)>>>,
 }
 
 impl HostContext {
@@ -30,12 +30,19 @@ impl HostContext {
     }
 }
 
+/// Maximum number of output lines buffered per extension before messages are dropped.
+const MAX_OUTPUT_LINES: usize = 1_000;
+
 // ── ui::log ──────────────────────────────────────────────────────────────────
 
 pub fn host_log(ctx: &mut HostContext, channel: String, message: String) {
     log::info!("[wasm-ext:{}] {}", channel, message);
     if let Ok(mut lines) = ctx.output_lines.lock() {
-        lines.push((channel, message));
+        if lines.len() < MAX_OUTPUT_LINES {
+            lines.push((channel, message));
+        } else {
+            log::warn!("[wasm-ext:{}] output buffer full — dropping message", channel);
+        }
     }
 }
 

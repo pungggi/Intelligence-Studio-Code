@@ -6,6 +6,7 @@
 use super::api_impl::HostContext;
 use super::instance::WasmInstance;
 use super::manifest::CoreCodeManifest;
+use crate::extension_mgr::{detect_kind, ExtensionKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -17,10 +18,13 @@ pub struct WasmHostManager {
     instances: Mutex<HashMap<String, WasmInstance>>,
 }
 
-// `Engine` is `Send + Sync`. `Mutex<HashMap<String, WasmInstance>>` is `Send + Sync`
-// because `WasmInstance` is `Send` (Store<InstanceState> is Send when InstanceState is Send).
-unsafe impl Send for WasmHostManager {}
-unsafe impl Sync for WasmHostManager {}
+// `WasmHostManager` is `Send + Sync` because all its fields are:
+// • `Engine` — explicitly `Send + Sync` per wasmtime docs.
+// • `Mutex<HashMap<String, WasmInstance>>` — `Mutex<T>: Send + Sync` when `T: Send`.
+// • `WasmInstance` is `Send` because `Store<InstanceState>` is `Send` when `InstanceState`
+//   is `Send` (all its fields are `Arc<Mutex<_>>`, `WasiCtx`, and `ResourceTable`, all Send)
+//   and `wasmtime::component::Func` is `Send` (holds only store-internal indices).
+// No `unsafe impl` is required — the compiler derives these automatically.
 
 impl WasmHostManager {
     /// Create the shared WASM engine with component model support.
@@ -29,6 +33,9 @@ impl WasmHostManager {
         config.wasm_component_model(true);
         // Synchronous execution for Phase 1.
         config.async_support(false);
+        // Enable fuel-based execution limiting so extensions cannot loop forever.
+        // Each call gets a fresh budget; the engine traps when fuel is exhausted.
+        config.consume_fuel(true);
 
         let engine =
             Engine::new(&config).map_err(|e| format!("wasmtime Engine::new failed: {e}"))?;
@@ -67,9 +74,18 @@ impl WasmHostManager {
             if !ext_dir.is_dir() {
                 continue;
             }
-            // Only handle WASM extensions (corecode.toml present).
-            if !ext_dir.join("corecode.toml").exists() {
-                continue;
+            // Route by extension kind — only WASM extensions are handled here.
+            // Node.js extensions are started by the separate ext-host process.
+            match detect_kind(&ext_dir) {
+                Some(ExtensionKind::Wasm) => {}
+                Some(ExtensionKind::NodeJs) => {
+                    log::debug!(
+                        "Skipping Node.js extension '{}' (handled by ext-host)",
+                        ext_dir.display()
+                    );
+                    continue;
+                }
+                None => continue,
             }
 
             match self.activate_one(&ext_dir, workspace_root.clone()) {
@@ -123,6 +139,30 @@ impl WasmHostManager {
             instance.deactivate();
         }
         map.clear();
+    }
+
+    /// Notify all active WASM extensions that a workspace folder was opened.
+    ///
+    /// Extensions that declared `workspace_read` can now resolve files against
+    /// the new root; extensions without the capability ignore the value.
+    pub fn notify_workspace_opened(&self, root: PathBuf) {
+        let mut map = self.instances.lock().unwrap();
+        for (id, instance) in map.iter_mut() {
+            log::debug!("WASM ext '{}': workspace root set to '{}'", id, root.display());
+            instance.set_workspace_root(Some(root.clone()));
+        }
+    }
+
+    /// Drain buffered output lines from all active extensions.
+    ///
+    /// Returns `(extension_id_or_channel, message)` pairs.
+    pub fn drain_all_output_lines(&self) -> Vec<(String, String)> {
+        let mut all = Vec::new();
+        let mut map = self.instances.lock().unwrap();
+        for (_, instance) in map.iter_mut() {
+            all.extend(instance.drain_output_lines());
+        }
+        all
     }
 
     /// Return the number of currently active extensions.

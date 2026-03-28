@@ -552,6 +552,20 @@ fn get_output_lines(state: tauri::State<AppState>) -> Result<Vec<ipc_bridge::Out
     Ok(state.ipc.drain_output_lines())
 }
 
+/// Drain buffered log messages from all active WASM extensions.
+///
+/// Returns `[channel, message]` pairs. The frontend polls this at the same
+/// cadence as `get_output_lines` and appends to the Output panel.
+#[tauri::command]
+fn get_wasm_output_lines(state: tauri::State<AppState>) -> Vec<[String; 2]> {
+    state
+        .wasm_host
+        .drain_all_output_lines()
+        .into_iter()
+        .map(|(ch, msg)| [ch, msg])
+        .collect()
+}
+
 /// Notify Extension Host of text changes.
 fn notify_change(path_str: &str, version: u32, text: &str, ipc: &IpcHandle, workspace_id: &str) {
     ipc.send(OutgoingMessage::DidChange {
@@ -1486,6 +1500,9 @@ fn register_workspace(
         let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
         guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
     }
+    // Inform WASM extensions so workspace_read calls resolve against the new root.
+    state.wasm_host.notify_workspace_opened(std::path::PathBuf::from(&dir));
+
     state.ipc.send(OutgoingMessage::WorkspaceRegister {
         workspace_id: wid,
         root_path: dir,
@@ -1639,6 +1656,7 @@ pub fn run() {
             respond_ui_request,
             get_status_bar_items,
             get_output_lines,
+            get_wasm_output_lines,
             // M6: LSP commands
             lsp_inline_completion,
             lsp_inlay_hints,
