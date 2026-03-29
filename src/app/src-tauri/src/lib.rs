@@ -655,6 +655,25 @@ fn wasm_format_document(
 }
 
 #[tauri::command]
+fn wasm_format_range(
+    state: tauri::State<AppState>,
+    lang_id: String,
+    uri: String,
+    content: String,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+) -> Result<serde_json::Value, String> {
+    let range = crate::wasm_host::wit_types::Range {
+        start: crate::wasm_host::wit_types::Position { line: start_line, character: start_character },
+        end: crate::wasm_host::wit_types::Position { line: end_line, character: end_character },
+    };
+    let edits = state.wasm_host.format_range_for_lang(&lang_id, &uri, &content, &range);
+    serde_json::to_value(&edits).map_err(|e| format!("serialization error: {e}"))
+}
+
+#[tauri::command]
 fn wasm_definition(
     state: tauri::State<AppState>,
     lang_id: String,
@@ -1896,6 +1915,7 @@ pub fn run() {
             wasm_diagnostics,
             wasm_hover,
             wasm_format_document,
+            wasm_format_range,
             wasm_definition,
             wasm_references,
             wasm_rename,

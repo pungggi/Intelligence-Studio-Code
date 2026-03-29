@@ -1,0 +1,15 @@
+[extension]
+id      = "corecode.simple-lsp"
+name    = "Simple LSP (WASM)"
+version = "0.1.0"
+
+[entry]
+wasm = "simple-lsp.wasm"
+
+[capabilities]
+workspace_read = true
+network_fetch  = false
+webview_panels = false
+
+[languages]
+plaintext = true

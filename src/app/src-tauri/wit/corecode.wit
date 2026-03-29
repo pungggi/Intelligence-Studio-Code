@@ -142,3 +142,12 @@ world corecode-extension {
   /// Extension exports required by every extension.
   export lifecycle;
 }
+
+/// World for extensions that also provide language intelligence.
+world corecode-language-extension {
+  import ui;
+  import workspace;
+
+  export lifecycle;
+  export language-provider;
+}

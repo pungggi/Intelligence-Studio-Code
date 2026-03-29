@@ -87,6 +87,11 @@ const GHOST_TEXT_COLOR = 'rgba(205,214,244,0.35)';  // dimmed Catppuccin fg
 // Inlay hints state
 let inlayHints = new Map();  // lineIdx -> Array<{character, label, kind}>
 let inlayHintsUri = null;
+
+// Folding state
+let foldingRanges = [];      // Array<{startLine, endLine, kind?}> from WASM/heuristic
+let collapsedFolds = new Set(); // Set of startLine values that are collapsed
+let foldedLineSet = new Set();  // Set of buffer lines currently hidden (recomputed)
 let inlayHintsTimer = null;
 const INLAY_HINT_COLOR = 'rgba(166,173,200,0.55)';  // dimmed, semi-transparent
 
@@ -317,7 +322,8 @@ function resizeCanvases() {
 }
 
 function updateScrollSizer() {
-  const totalH = totalLines * lineHeight;
+  const effectiveLines = foldedLineSet.size > 0 ? (totalLines - foldedLineSet.size) : totalLines;
+  const totalH = effectiveLines * lineHeight;
   // Scroll sizer: total height minus the canvas height (canvas is sticky and in-flow)
   const sizerH = Math.max(0, totalH - editorEl.clientHeight);
   scrollSizer.style.height = sizerH + 'px';
@@ -392,8 +398,9 @@ function paintEditorCanvas() {
   // Draw text lines
   const fontSize = cachedFontSize;
   const visibleCount = Math.ceil((h / dpr) / lineHeight) + 2;
+  const hasFolds = foldedLineSet.size > 0;
   for (let vi = 0; vi < visibleCount; vi++) {
-    const lineIdx = first + vi;
+    const lineIdx = hasFolds ? displayToBuffer(first + vi) : (first + vi);
     if (lineIdx >= totalLines) break;
 
     const cacheOffset = lineIdx - cachedFirstLine;
@@ -476,8 +483,9 @@ function paintSelection(ctx, firstVisibleLine, subPixelOffset) {
   ctx.fillStyle = SELECTION_BG;
   const visibleCount = Math.ceil(editorCanvas.height / (window.devicePixelRatio || 1) / lineHeight) + 2;
 
+  const hasFolds = foldedLineSet.size > 0;
   for (let vi = 0; vi < visibleCount; vi++) {
-    const lineIdx = firstVisibleLine + vi;
+    const lineIdx = hasFolds ? displayToBuffer(firstVisibleLine + vi) : (firstVisibleLine + vi);
     if (lineIdx < sel.startLine || lineIdx > sel.endLine) continue;
     if (lineIdx >= totalLines) break;
 
@@ -510,7 +518,9 @@ function paintDecorations(ctx, firstVisibleLine, subPixelOffset) {
 
     for (const r of dec.ranges) {
       for (let lineIdx = r.start_line; lineIdx <= r.end_line; lineIdx++) {
-        const vi = lineIdx - firstVisibleLine;
+        if (foldedLineSet.has(lineIdx)) continue;
+        const displayLine = foldedLineSet.size > 0 ? bufferToDisplay(lineIdx) : lineIdx;
+        const vi = displayLine - firstVisibleLine;
         if (vi < -1 || vi >= visibleCount) continue;
         const y = vi * lineHeight + subPixelOffset;
 
@@ -556,7 +566,9 @@ function paintFindHighlights(ctx, firstVisibleLine, subPixelOffset) {
 
   for (let mi = 0; mi < findMatches.length; mi++) {
     const m = findMatches[mi];
-    const vi = m.line - firstVisibleLine;
+    if (foldedLineSet.has(m.line)) continue;
+    const displayLine = foldedLineSet.size > 0 ? bufferToDisplay(m.line) : m.line;
+    const vi = displayLine - firstVisibleLine;
     if (vi < -1 || vi > Math.ceil(editorCanvas.height / (window.devicePixelRatio || 1) / lineHeight) + 2) continue;
 
     const y = vi * lineHeight + subPixelOffset;
@@ -585,7 +597,9 @@ function paintDocumentHighlights(ctx, firstVisibleLine, subPixelOffset) {
   const visibleCount = Math.ceil(visH / lineHeight) + 2;
   for (const h of documentHighlights) {
     for (let li = h.start_line; li <= h.end_line; li++) {
-      const vi = li - firstVisibleLine;
+      if (foldedLineSet.has(li)) continue;
+      const displayLi = foldedLineSet.size > 0 ? bufferToDisplay(li) : li;
+      const vi = displayLi - firstVisibleLine;
       if (vi < 0 || vi >= visibleCount) continue;
       const y = vi * lineHeight + subPixelOffset;
       const colStart = (li === h.start_line) ? h.start_col : 0;
@@ -603,7 +617,9 @@ function paintDocumentHighlights(ctx, firstVisibleLine, subPixelOffset) {
 
 function paintCursor(ctx, firstVisibleLine, subPixelOffset) {
   if (!cursorVisible) return;
-  const vi = cursorLine - firstVisibleLine;
+  const displayCursorLine = foldedLineSet.size > 0 ? bufferToDisplay(cursorLine) : cursorLine;
+  if (displayCursorLine < 0) return; // cursor on a folded line
+  const vi = displayCursorLine - firstVisibleLine;
   const visH = editorCanvas.height / (window.devicePixelRatio || 1);
   if (vi < 0 || vi * lineHeight + subPixelOffset > visH) return;
 
@@ -719,8 +735,12 @@ function paintGutterCanvas() {
     if (!commentLineMap.has(t.start_line)) commentLineMap.set(t.start_line, t);
   }
 
+  // Build fold start set for O(1) lookup
+  const foldStartSet = new Set(foldingRanges.map(r => r.startLine));
+
   for (let vi = 0; vi < visibleCount; vi++) {
-    const lineIdx = first + vi;
+    // Map display line to buffer line when folding is active
+    const lineIdx = foldedLineSet.size > 0 ? displayToBuffer(first + vi) : (first + vi);
     if (lineIdx >= totalLines) break;
 
     const y = vi * lineHeight + subPixelOffset;
@@ -735,6 +755,16 @@ function paintGutterCanvas() {
     }
 
     ctx.fillText(String(lineIdx + 1), gutterTextX, textY);
+
+    // Fold indicator — ▼ (expanded) or ▶ (collapsed)
+    if (foldStartSet.has(lineIdx)) {
+      ctx.fillStyle = '#6c7086';
+      ctx.font = `${Math.max(8, cachedFontSize - 2)}px ${cachedFont.split('px ').slice(1).join('px ')}`;
+      ctx.textAlign = 'center';
+      ctx.fillText(collapsedFolds.has(lineIdx) ? '▶' : '▼', w - 4, textY);
+      ctx.textAlign = 'right';
+      ctx.font = cachedFont;
+    }
 
     // Breakpoint marker (red dot) — drawn on the left side of the gutter
     const bpSet = filePath ? breakpoints.get(filePath) : null;
@@ -771,8 +801,20 @@ function paintGutterCanvas() {
 
 async function fetchVisibleContent() {
   const { first, count } = getVisibleLineRange();
-  const fetchFirst = Math.max(0, first - BUFFER_LINES);
-  const fetchCount = count + BUFFER_LINES * 2;
+  const displayFirst = Math.max(0, first - BUFFER_LINES);
+  const displayCount = count + BUFFER_LINES * 2;
+
+  // When folding is active, map display range to buffer range
+  let fetchFirst, fetchCount;
+  if (foldedLineSet.size > 0) {
+    const bufFirst = displayToBuffer(displayFirst);
+    const bufLast = displayToBuffer(Math.min(displayFirst + displayCount - 1, totalLines - foldedLineSet.size - 1));
+    fetchFirst = bufFirst;
+    fetchCount = bufLast - bufFirst + 1;
+  } else {
+    fetchFirst = displayFirst;
+    fetchCount = displayCount;
+  }
 
   try {
     const vc = await invoke('get_visible_content', {
@@ -812,7 +854,7 @@ async function updateFromEditorContent(content) {
   totalLines = content.line_count;
   diagnostics = content.diagnostics || [];
   cachedLanguage = content.language;
-  // Reset inlay hints, document highlights, multi-cursor, and comment threads when file changes
+  // Reset inlay hints, document highlights, multi-cursor, comment threads, and folds when file changes
   inlayHints = new Map();
   inlayHintsUri = null;
   documentHighlights = [];
@@ -820,6 +862,9 @@ async function updateFromEditorContent(content) {
   extraCursors = [];
   ctrlDWord = null;
   commentThreads = [];
+  foldingRanges = [];
+  collapsedFolds.clear();
+  foldedLineSet.clear();
   closeCommentPopup();
 
   // Populate cache from full content (for the visible range)
@@ -836,6 +881,8 @@ async function updateFromEditorContent(content) {
   ensureCursorVisible();
   await fetchVisibleContent();
   requestRender();
+  // Fetch folding ranges in background after file loads
+  fetchFoldingRanges();
 }
 
 /**
@@ -884,7 +931,9 @@ function updateMetadataUI() {
 }
 
 function ensureCursorVisible() {
-  const cursorTop = cursorLine * lineHeight;
+  const displayLine = foldedLineSet.size > 0 ? bufferToDisplay(cursorLine) : cursorLine;
+  const effectiveLine = displayLine >= 0 ? displayLine : cursorLine;
+  const cursorTop = effectiveLine * lineHeight;
   const cursorBottom = cursorTop + lineHeight;
   if (cursorBottom > editorEl.scrollTop + editorEl.clientHeight) {
     editorEl.scrollTop = cursorBottom - editorEl.clientHeight;
@@ -1439,7 +1488,9 @@ function posFromMouse(e) {
   const y = e.clientY - rect.top + scrollTop;
   const x = e.clientX - rect.left - EDITOR_PADDING_LEFT + editorEl.scrollLeft;
 
-  const line = Math.max(0, Math.min(Math.floor(y / lineHeight), totalLines - 1));
+  const effectiveTotal = foldedLineSet.size > 0 ? (totalLines - foldedLineSet.size) : totalLines;
+  const displayLine = Math.max(0, Math.min(Math.floor(y / lineHeight), effectiveTotal - 1));
+  const line = foldedLineSet.size > 0 ? displayToBuffer(displayLine) : displayLine;
   const lineText = getLineText(line);
   const col = Math.max(0, Math.min(Math.round(x / cellWidth), lineText.length));
 
@@ -1905,11 +1956,14 @@ document.addEventListener('keydown', (e) => {
   }
 
   if (e.ctrlKey && e.shiftKey && e.key === 'O') { e.preventDefault(); openSymbolOutline(); return; }
-  if (e.ctrlKey && e.shiftKey && e.key === 'F') { e.preventDefault(); formatDocument(); return; }
+  if (e.ctrlKey && !e.shiftKey && e.key === 't') { e.preventDefault(); openWorkspaceSymbolSearch(); return; }
+  if (e.ctrlKey && e.shiftKey && e.key === 'F') { e.preventDefault(); if (hasSelection()) formatSelection(); else formatDocument(); return; }
   if (e.ctrlKey && e.key === ' ') { e.preventDefault(); triggerAutocomplete(null); return; }
   if (e.key === 'F12' && !e.shiftKey && !e.ctrlKey) { e.preventDefault(); goToDefinition(); return; }
   if (e.key === 'F12' && e.shiftKey && !e.ctrlKey) { e.preventDefault(); findReferences(); return; }
   if (e.ctrlKey && e.key === '.') { e.preventDefault(); requestCodeActions(); return; }
+  if (e.ctrlKey && e.shiftKey && e.key === '[') { e.preventDefault(); foldAtCursor(); return; }
+  if (e.ctrlKey && e.shiftKey && e.key === ']') { e.preventDefault(); unfoldAtCursor(); return; }
 
   // Find bar keys
   if (findOpen && (document.activeElement === findInputEl || document.activeElement === replaceInputEl)) {
@@ -3515,6 +3569,7 @@ let acOpen = false;
 let acItems = [];
 let acSelectedIdx = 0;
 let acFilterText = '';
+let completionSeq = 0;
 let hoverOpen = false;
 let hoverTimer = null;
 let sigHelpOpen = false;
@@ -3541,6 +3596,7 @@ function escapeHtml(text) {
 async function triggerAutocomplete(triggerChar) {
   const uri = getActiveUri();
   if (!uri) return;
+  const thisSeq = ++completionSeq;
   try {
     const langId = detectLanguage(filePath);
     // Run Node.js LSP and WASM completions in parallel, merge results.
@@ -3554,6 +3610,8 @@ async function triggerAutocomplete(triggerChar) {
         trigger: triggerChar || null,
       }).catch(() => []),
     ]);
+    // Discard stale response if a newer request was issued while awaiting.
+    if (thisSeq !== completionSeq) return;
     const nodeItems = lspResult?.items ?? [];
     // Normalise WASM items to the same shape as LSP items.
     const wasmNorm = (wasmItems || []).map(w => ({
@@ -3561,7 +3619,15 @@ async function triggerAutocomplete(triggerChar) {
       documentation: w.documentation, insertText: w.insert_text ?? w.label,
       filterText: w.filter_text ?? w.label,
     }));
-    const allItems = [...nodeItems, ...wasmNorm];
+    // Deduplicate by (label, insertText) — prevents identical suggestions
+    // when both Node.js and WASM providers return the same item.
+    const seen = new Set();
+    const allItems = [...nodeItems, ...wasmNorm].filter(item => {
+      const key = `${item.label}:${item.insertText || item.label}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
     if (allItems.length === 0) { closeAutocomplete(); return; }
     acItems = allItems;
     acSelectedIdx = 0;
@@ -4035,8 +4101,17 @@ function renderSymbolList(query) {
     name.textContent = sym.name;
     div.appendChild(name);
     if (sym.detail) { const detail = document.createElement('span'); detail.className = 'symbol-detail'; detail.textContent = sym.detail; div.appendChild(detail); }
-    div.addEventListener('click', () => {
+    div.addEventListener('click', async () => {
       closeSymbolOutline();
+      // If the symbol has a uri pointing to a different file, open it first.
+      if (sym.uri) {
+        let targetPath = sym.uri;
+        if (targetPath.startsWith('file:///')) targetPath = targetPath.slice(8);
+        else if (targetPath.startsWith('file://')) targetPath = targetPath.slice(7);
+        if (targetPath !== activeBufferPath) {
+          try { await openFileFromExplorer(targetPath); } catch { /* ignore */ }
+        }
+      }
       cursorLine = sym.line;
       cursorCol = sym.col;
       clearSelection();
@@ -4067,6 +4142,50 @@ function updateSymbolSelection() {
   items.forEach((el, i) => el.classList.toggle('selected', i === symbolSelectedIdx));
   if (items[symbolSelectedIdx]) items[symbolSelectedIdx].scrollIntoView({ block: 'nearest' });
 }
+
+// --- Workspace Symbols (Ctrl+T) ---
+
+let wsSymbolDebounce = null;
+
+async function openWorkspaceSymbolSearch() {
+  symbolItems = [];
+  symbolSelectedIdx = 0;
+  symbolsOpen = true;
+  renderSymbolList('');
+  symbolsPalette.classList.remove('palette-hidden');
+  symbolsInput.value = '#';
+  symbolsInput.focus();
+}
+
+async function searchWorkspaceSymbols(query) {
+  if (!query) { symbolItems = []; renderSymbolList(''); return; }
+  const langId = detectLanguage(filePath || '');
+  try {
+    const wasmResult = await invoke('wasm_workspace_symbols', { langId, query }).catch(() => []);
+    const items = (wasmResult || []).map(s => ({
+      name: s.container_name ? `${s.container_name}.${s.name}` : s.name,
+      detail: s.location?.uri || '',
+      kind: s.kind,
+      line: s.location?.range?.start?.line ?? 0,
+      col: s.location?.range?.start?.character ?? 0,
+      uri: s.location?.uri,
+    }));
+    symbolItems = items;
+    symbolSelectedIdx = 0;
+    renderSymbolList('');
+  } catch { /* ignore */ }
+}
+
+// Hook into the existing symbols input to detect '#' prefix for workspace search
+const _origSymbolInput = symbolsInput._inputHandler;
+symbolsInput.addEventListener('input', () => {
+  const val = symbolsInput.value;
+  if (val.startsWith('#')) {
+    const query = val.slice(1).trim();
+    clearTimeout(wsSymbolDebounce);
+    wsSymbolDebounce = setTimeout(() => searchWorkspaceSymbols(query), 200);
+  }
+});
 
 // --- Formatting ---
 
@@ -4108,6 +4227,172 @@ async function formatDocument() {
     statusEl.textContent = 'Formatting unavailable';
     setTimeout(() => { statusEl.textContent = ''; }, 2000);
   }
+}
+
+// --- Format Selection ---
+
+async function formatSelection() {
+  const uri = getActiveUri();
+  if (!uri) return;
+  const sel = getSelectionRange();
+  if (!sel) { formatDocument(); return; } // No selection — fall back to full format
+  try {
+    statusEl.textContent = 'Formatting selection...';
+    const langId = detectLanguage(filePath);
+    const fullText = await invoke('get_text_range', {
+      startLine: 0, startCol: 0, endLine: totalLines, endCol: 0,
+    }).catch(() => '');
+    const wasmResult = await invoke('wasm_format_range', {
+      langId, uri, content: fullText,
+      startLine: sel.startLine, startCharacter: sel.startCol,
+      endLine: sel.endLine, endCharacter: sel.endCol,
+    }).catch(() => []);
+    if (wasmResult && Array.isArray(wasmResult) && wasmResult.length > 0) {
+      const edits = wasmResult.slice().sort((a, b) => {
+        if (b.range.start.line !== a.range.start.line) return b.range.start.line - a.range.start.line;
+        return b.range.start.character - a.range.start.character;
+      });
+      for (const edit of edits) {
+        await invoke('edit_replace_range', {
+          startLine: edit.range.start.line, startCol: edit.range.start.character,
+          endLine: edit.range.end.line, endCol: edit.range.end.character,
+          text: edit.newText || edit['new-text'] || edit.new_text || '',
+        });
+      }
+      await fetchVisibleContent();
+      updateMetadataUI();
+      requestRender();
+      statusEl.textContent = 'Selection formatted';
+    } else {
+      statusEl.textContent = 'No formatting changes';
+    }
+    setTimeout(() => { statusEl.textContent = ''; }, 2000);
+  } catch {
+    statusEl.textContent = 'Format selection unavailable';
+    setTimeout(() => { statusEl.textContent = ''; }, 2000);
+  }
+}
+
+// --- Code Folding ---
+
+function recomputeFoldedLines() {
+  foldedLineSet.clear();
+  for (const range of foldingRanges) {
+    if (collapsedFolds.has(range.startLine)) {
+      for (let l = range.startLine + 1; l <= range.endLine; l++) {
+        foldedLineSet.add(l);
+      }
+    }
+  }
+}
+
+function getEffectiveLineCount() {
+  return totalLines - foldedLineSet.size;
+}
+
+function displayToBuffer(displayLine) {
+  let bufferLine = 0;
+  let display = 0;
+  while (bufferLine < totalLines) {
+    if (!foldedLineSet.has(bufferLine)) {
+      if (display === displayLine) return bufferLine;
+      display++;
+    }
+    bufferLine++;
+  }
+  return totalLines - 1;
+}
+
+function bufferToDisplay(bufferLine) {
+  if (foldedLineSet.has(bufferLine)) return -1;
+  let display = 0;
+  for (let l = 0; l < bufferLine; l++) {
+    if (!foldedLineSet.has(l)) display++;
+  }
+  return display;
+}
+
+function getFoldRangeAtLine(line) {
+  return foldingRanges.find(r => r.startLine === line) || null;
+}
+
+function getFoldRangeContaining(line) {
+  return foldingRanges.find(r => r.startLine <= line && r.endLine >= line) || null;
+}
+
+function toggleFoldAtLine(line) {
+  const range = getFoldRangeAtLine(line);
+  if (!range) return;
+  if (collapsedFolds.has(line)) {
+    collapsedFolds.delete(line);
+  } else {
+    collapsedFolds.add(line);
+  }
+  recomputeFoldedLines();
+  updateScrollSizer();
+  requestRender();
+}
+
+function foldAtCursor() {
+  const range = getFoldRangeAtLine(cursorLine) || getFoldRangeContaining(cursorLine);
+  if (!range) return;
+  collapsedFolds.add(range.startLine);
+  // Move cursor out of folded region if needed
+  if (cursorLine > range.startLine && cursorLine <= range.endLine) {
+    cursorLine = range.startLine;
+    cursorCol = 0;
+  }
+  recomputeFoldedLines();
+  updateScrollSizer();
+  requestRender();
+}
+
+function unfoldAtCursor() {
+  // If cursor is on a fold start line, unfold it
+  if (collapsedFolds.has(cursorLine)) {
+    collapsedFolds.delete(cursorLine);
+    recomputeFoldedLines();
+    updateScrollSizer();
+    requestRender();
+    return;
+  }
+  // If cursor is inside a folded range (shouldn't normally happen), unfold containing range
+  for (const range of foldingRanges) {
+    if (collapsedFolds.has(range.startLine) && cursorLine >= range.startLine && cursorLine <= range.endLine) {
+      collapsedFolds.delete(range.startLine);
+      recomputeFoldedLines();
+      updateScrollSizer();
+      requestRender();
+      return;
+    }
+  }
+}
+
+async function fetchFoldingRanges() {
+  if (!filePath) return;
+  const langId = detectLanguage(filePath);
+  const uri = getActiveUri();
+  if (!uri) return;
+  try {
+    const fullText = await invoke('get_text_range', {
+      startLine: 0, startCol: 0, endLine: totalLines, endCol: 0,
+    }).catch(() => '');
+    const wasmResult = await invoke('wasm_folding_ranges', {
+      langId, uri, content: fullText,
+    }).catch(() => []);
+    foldingRanges = (wasmResult || []).map(r => ({
+      startLine: r.start_line ?? r.startLine ?? 0,
+      endLine: r.end_line ?? r.endLine ?? 0,
+      kind: r.kind ?? null,
+    })).filter(r => r.endLine > r.startLine);
+    // Prune collapsed folds that no longer have valid ranges
+    const validStarts = new Set(foldingRanges.map(r => r.startLine));
+    for (const s of collapsedFolds) {
+      if (!validStarts.has(s)) collapsedFolds.delete(s);
+    }
+    recomputeFoldedLines();
+    requestRender();
+  } catch { /* ignore */ }
 }
 
 // --- Global close ---
@@ -5033,10 +5318,13 @@ document.getElementById('gutter')?.addEventListener('click', (e) => {
   const { first } = getVisibleLineRange();
   const scrollTop = editorEl.scrollTop;
   const subPixelOffset = -(scrollTop % lineHeight);
-  const lineIdx = first + Math.floor((y - subPixelOffset) / lineHeight);
+  const displayLine = first + Math.floor((y - subPixelOffset) / lineHeight);
+  const lineIdx = foldedLineSet.size > 0 ? displayToBuffer(displayLine) : displayLine;
   if (lineIdx >= 0 && lineIdx < totalLines) {
-    // Right 10px of gutter = comment indicator zone
+    // Right 10px of gutter = fold indicator / comment zone
     if (x >= rect.width - 10) {
+      // Check fold toggle first
+      if (getFoldRangeAtLine(lineIdx)) { toggleFoldAtLine(lineIdx); return; }
       const thread = commentThreads.find(t => t.start_line === lineIdx);
       if (thread) { showCommentPopup(thread, e.clientX, e.clientY); return; }
     }
