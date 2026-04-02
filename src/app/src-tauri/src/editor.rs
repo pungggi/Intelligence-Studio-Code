@@ -502,7 +502,15 @@ impl DocumentBuffer {
                 let line = self.rope.char_to_line(orig_char_pos);
                 let line_start = self.rope.line_to_char(line);
                 let col = orig_char_pos - line_start;
-                matches.push(FindMatch { line, col, length: query_char_len });
+                // Compute actual match length in the original text: the lowercased
+                // match may span a different number of original chars (e.g. "ß" ↔ "ss").
+                let lower_end_byte = lower_byte_pos + query_lower.len() - 1;
+                let orig_char_pos_end = lower_to_orig_char
+                    .get(lower_end_byte)
+                    .copied()
+                    .unwrap_or(orig_char_pos);
+                let length = orig_char_pos_end - orig_char_pos + 1;
+                matches.push(FindMatch { line, col, length });
                 start_lower = lower_byte_pos + query_lower.len();
             }
         }
@@ -541,6 +549,10 @@ impl DocumentBuffer {
         self.rope.len_lines()
     }
 
+    pub fn len_bytes(&self) -> usize {
+        self.rope.len_bytes()
+    }
+
     pub fn set_modified(&mut self, val: bool) {
         self.modified = val;
     }
@@ -554,7 +566,7 @@ impl DocumentBuffer {
         let lines: Vec<HighlightedLine> = (start..end)
             .map(|i| {
                 let line_text = self.rope.line(i).to_string();
-                let line_text_trimmed = line_text.trim_end_matches('\n').to_string();
+                let line_text_trimmed = line_text.trim_end_matches(&['\r', '\n'][..]).to_string();
                 let tokens = if let Some(tree) = &self.tree {
                     highlighting::highlight_line(tree, &self.rope, i)
                 } else {
@@ -586,7 +598,7 @@ impl DocumentBuffer {
         let lines: Vec<HighlightedLine> = (0..self.rope.len_lines())
             .map(|i| {
                 let line_text = self.rope.line(i).to_string();
-                let line_text_trimmed = line_text.trim_end_matches('\n').to_string();
+                let line_text_trimmed = line_text.trim_end_matches(&['\r', '\n'][..]).to_string();
 
                 let tokens = if let Some(tree) = &self.tree {
                     highlighting::highlight_line(tree, &self.rope, i)
@@ -624,6 +636,8 @@ pub struct WorkspaceState {
     parser: tree_sitter::Parser,
     /// Canonicalized root of the open workspace folder, if any.
     workspace_root: Option<PathBuf>,
+    /// Shared grammar registry for dynamic tree-sitter grammars (set after init).
+    grammar_registry: Option<std::sync::Arc<crate::grammar_registry::GrammarRegistry>>,
 }
 
 #[allow(dead_code)]
@@ -637,7 +651,13 @@ impl WorkspaceState {
             active_path: None,
             parser,
             workspace_root: None,
+            grammar_registry: None,
         }
+    }
+
+    /// Attach the shared grammar registry for dynamic tree-sitter grammar support.
+    pub fn set_grammar_registry(&mut self, registry: std::sync::Arc<crate::grammar_registry::GrammarRegistry>) {
+        self.grammar_registry = Some(registry);
     }
 
     /// Record the workspace root so that out-of-buffer write paths can be
@@ -678,7 +698,11 @@ impl WorkspaceState {
             .unwrap_or("")
             .to_string();
 
-        self.set_language_from_ext(&ext);
+        if let Some(ref reg) = self.grammar_registry {
+            self.set_language_from_ext_with_registry(&ext, &reg.clone());
+        } else {
+            self.set_language_from_ext(&ext);
+        }
         let tree = self.parser.parse(&content, None);
         if tree.is_none() {
             log::warn!("Tree-sitter parse returned None for {}", path);
@@ -775,7 +799,11 @@ impl WorkspaceState {
         // Set the correct language first (needs &mut self for parser)
         let lang = self.buffers.get(&path).and_then(|b| b.language.clone());
         if let Some(lang) = &lang {
-            self.set_language_from_ext(lang);
+            if let Some(ref reg) = self.grammar_registry {
+                self.set_language_from_ext_with_registry(lang, &reg.clone());
+            } else {
+                self.set_language_from_ext(lang);
+            }
         }
 
         // Now borrow the buffer mutably for reparsing
@@ -873,6 +901,32 @@ impl WorkspaceState {
             }
             _ => {
                 // Unknown language — no tree-sitter support
+            }
+        }
+    }
+
+    /// Extended language detection that falls through to the dynamic grammar
+    /// registry for file types not built in.
+    pub fn set_language_from_ext_with_registry(
+        &mut self,
+        ext: &str,
+        registry: &crate::grammar_registry::GrammarRegistry,
+    ) {
+        // Try built-in grammars first.
+        match ext {
+            "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "rs" | "py" | "pyw"
+            | "json" | "jsonc" | "html" | "htm" | "css" | "scss" | "md" | "markdown" => {
+                self.set_language_from_ext(ext);
+                return;
+            }
+            _ => {}
+        }
+
+        // Fall through to dynamic registry.
+        if let Some(lang) = registry.language_by_extension(ext) {
+            // `Arc<tree_sitter::Language>` — dereference to get the Language ref.
+            if let Err(e) = self.parser.set_language(&*lang) {
+                log::warn!("Failed to set dynamic tree-sitter language for '.{}': {e}", ext);
             }
         }
     }

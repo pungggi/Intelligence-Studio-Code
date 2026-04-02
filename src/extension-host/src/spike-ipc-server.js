@@ -156,11 +156,25 @@ server.listen(SOCKET_PATH, () => {
 // Cleanup on exit
 function gracefulShutdown() {
   console.log('\nShutting down...');
-  server.close();
-  if (fs.existsSync(SOCKET_PATH)) {
-    fs.unlinkSync(SOCKET_PATH);
+
+  if (!server) {
+    process.exit(0);
+    return;
   }
-  process.exit(0);
+
+  server.close((err) => {
+    if (err) {
+      console.error('Error closing server:', err.message);
+    }
+    if (fs.existsSync(SOCKET_PATH)) {
+      try {
+        fs.unlinkSync(SOCKET_PATH);
+      } catch (unlinkErr) {
+        console.error('Error removing socket file:', unlinkErr.message);
+      }
+    }
+    process.exit(err ? 1 : 0);
+  });
 }
 
 process.on('SIGINT', gracefulShutdown);

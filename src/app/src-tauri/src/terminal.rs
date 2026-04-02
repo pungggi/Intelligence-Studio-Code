@@ -62,6 +62,8 @@ struct PtySession {
     title: String,
     /// Signals the reader thread to stop when set to `true`.
     stop_flag: Arc<AtomicBool>,
+    /// Set to `true` by the reader thread just before it exits.
+    exited: Arc<AtomicBool>,
     /// Join handle for the PTY reader thread.
     reader_thread: Option<JoinHandle<()>>,
 }
@@ -116,7 +118,7 @@ impl TerminalManager {
             cmd.cwd(dir);
         }
 
-        let child = pair.slave.spawn_command(cmd).context("Failed to spawn shell")?;
+        let mut child = pair.slave.spawn_command(cmd).context("Failed to spawn shell")?;
         // Drop the slave — we only need the master side.
         drop(pair.slave);
 
@@ -128,12 +130,21 @@ impl TerminalManager {
         let handle = app_handle.clone();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_reader = Arc::clone(&stop_flag);
-        let reader_thread = thread::Builder::new()
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_reader = Arc::clone(&exited);
+        let reader_thread = match thread::Builder::new()
             .name(format!("pty-reader-{term_id}"))
             .spawn(move || {
-                pty_reader_thread(reader, term_id, handle, stop_flag_reader);
-            })
-            .context("Failed to spawn PTY reader thread")?;
+                pty_reader_thread(reader, term_id, handle, stop_flag_reader, exited_reader);
+            }) {
+            Ok(handle) => handle,
+            Err(e) => {
+                // Kill child process to prevent leak.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow::anyhow!("Failed to spawn PTY reader thread: {e}"));
+            }
+        };
 
         self.sessions.insert(
             id.clone(),
@@ -143,6 +154,7 @@ impl TerminalManager {
                 master: SendableMaster(pair.master),
                 title,
                 stop_flag,
+                exited,
                 reader_thread: Some(reader_thread),
             },
         );
@@ -186,15 +198,31 @@ impl TerminalManager {
             // Kill the child process if still running.
             let _ = session.child.kill();
             let _ = session.child.wait();
-            // Join the reader thread to ensure it has exited before we drop the session.
+            // Poll the exited flag with a bounded timeout so close() never hangs
+            // indefinitely if the reader thread is blocked on a slow read.
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(300);
+            while !session.exited.load(Ordering::Relaxed) {
+                if std::time::Instant::now() >= deadline {
+                    log::warn!(
+                        "[Terminal] Reader thread for {} did not exit in time, detaching",
+                        terminal_id
+                    );
+                    session.reader_thread.take(); // drop without joining
+                    log::info!("[Terminal] Closed terminal {}", terminal_id);
+                    return Ok(());
+                }
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
             if let Some(handle) = session.reader_thread.take() {
                 let _ = handle.join();
             }
             log::info!("[Terminal] Closed terminal {}", terminal_id);
+            Ok(())
         } else {
             log::warn!("[Terminal] close called for unknown terminal: {}", terminal_id);
+            Err(anyhow::anyhow!("unknown terminal: {}", terminal_id))
         }
-        Ok(())
     }
 
     /// List active terminals.
@@ -226,6 +254,7 @@ fn pty_reader_thread(
     terminal_id: String,
     app: AppHandle,
     stop: Arc<AtomicBool>,
+    exited: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; 4096];
     loop {
@@ -274,6 +303,8 @@ fn pty_reader_thread(
             }
         }
     }
+    // Signal close() that this thread has finished so it can join without blocking.
+    exited.store(true, Ordering::Relaxed);
 }
 
 /// Get the default shell for the current platform.

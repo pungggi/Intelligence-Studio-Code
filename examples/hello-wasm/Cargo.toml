@@ -15,3 +15,4 @@ opt-level     = "z"   # optimise for size (smallest binary)
 lto           = true  # enable link-time optimisation
 codegen-units = 1     # single codegen unit for maximum optimisation
 strip         = true  # strip debug symbols from the final binary
+panic         = "abort" # remove panic unwinding code for smaller WASM binaries

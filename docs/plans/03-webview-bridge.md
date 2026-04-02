@@ -117,9 +117,14 @@ for the bridge. The extension's `get-html` return value is wrapped at injection 
 
 ```js
 // corecode-bridge.js (injected by host, not shipped by extension)
+//
+// This is the CoreCode/Tauri-specific implementation. Other hosts
+// would replace the postMessage body with their own transport:
+//   - Electron: ipcRenderer.send('webview_message', ...)
+//   - Generic: window.postMessage(data, '*') with origin checks
 window.coreCode = {
   postMessage(data) {
-    // In CoreCode: uses Tauri's invoke IPC
+    // CoreCode/Tauri transport
     window.__TAURI__.invoke('webview_message', {
       panelId: window.__CORECODE_PANEL_ID__,
       json: JSON.stringify(data),
@@ -180,9 +185,11 @@ impl WebviewProvider for Extension {
 }
 ```
 
-For larger assets (e.g. a full React app), the build tool converts the compiled JS bundle
-to a `data:` URI embedded in the HTML, so the entire panel is self-contained in the WASM binary.
-No separate file serving is required.
+For larger assets (e.g. a full React app), the build tool embeds the compiled JS bundle
+directly in the HTML as an inline `<script>` block (not a `data:` URI, which conflicts with
+`script-src 'self'` CSP). The inline script is authorized via a per-load nonce
+(`script-src 'nonce-<random>'`) so the panel is self-contained in the WASM binary without
+weakening CSP. No separate file serving is required.
 
 Alternative: for extensions that ship assets as sidecar files alongside `extension.wasm`,
 the host serves them from the extension directory via a sandboxed file:// handler with
@@ -211,9 +218,10 @@ path traversal protection matching the existing `extension_mgr.rs` guards.
 - Extension assets served from the extension directory are path-traversal-checked with the same
   guard already in `extension_mgr.rs`.
 - Recommended CSP for extension webview windows:
-  `default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'`
-  Note: the injected bridge script uses an inline `<script>` block, so `script-src` must include `'nonce-<random>'`
-  or the bridge must be moved to an external file served as `'self'`. The `webview_message` invoke handler
-  is the only Tauri command exposed to the webview; all other commands remain inaccessible.
+  `default-src 'none'; script-src 'nonce-<random>' 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'`
+  The injected bridge script and any inline embedded bundles use the per-load nonce.
+  The host generates a fresh nonce for each `WebviewWindowBuilder` and sets it on both the
+  CSP meta tag and the injected `<script nonce="...">` blocks. The `webview_message` invoke
+  handler is the only Tauri command exposed to the webview; all other commands remain inaccessible.
   Extension assets served from the extension directory via the sidecar handler must still pass the
   existing path-traversal checks in `extension_mgr.rs`.

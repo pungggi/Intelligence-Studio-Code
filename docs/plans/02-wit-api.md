@@ -193,10 +193,18 @@ interface lifecycle {
 }
 
 // ── Extension exports — language provider ───────────────────────────────────
-// Convention: Because WIT requires full interface exports, any function the
-// provider does not support MUST return the exact error string "not-implemented"
-// (rather than generic errors or empty results). This allows the host to safely
-// distinguish unsupported capabilities from genuine runtime failures.
+// Convention: Functions the provider does not support should return an error
+// variant indicating "not implemented". We define a dedicated WIT error enum
+// so the host can distinguish unsupported capabilities from genuine failures
+// without relying on fragile string comparisons:
+//
+//   variant provider-error {
+//       not-implemented,
+//       runtime(string),
+//   }
+//
+// Providers return `err(provider-error::not-implemented)` for unimplemented
+// functions and `err(provider-error::runtime("details"))` for real errors.
 
 interface language-provider {
   use types.{
@@ -253,17 +261,18 @@ interface language-provider {
 // ── Extension exports — grammar provider ────────────────────────────────────
 
 interface grammar-provider {
-  // Return the tree-sitter grammar .wasm bytes for this language.
-  grammar-wasm: func() -> list<u8>;
+  // Return the tree-sitter grammar bytes for this language.
+  // Returns an error if the grammar data is missing or corrupt.
+  grammar-wasm: func() -> result<list<u8>, string>;
 
   // Return the tree-sitter highlights.scm query string.
-  highlights-query: func() -> string;
+  highlights-query: func() -> result<string, string>;
 
   // Return the injections.scm query string (optional).
-  injections-query: func() -> option<string>;
+  injections-query: func() -> result<option<string>, string>;
 
   // Return bracket pair definitions as JSON array of [open, close] pairs.
-  bracket-pairs: func() -> string;
+  bracket-pairs: func() -> result<string, string>;
 }
 
 // ── Extension exports — webview provider ────────────────────────────────────
@@ -288,7 +297,10 @@ world corecode-extension {
   import workspace;
   import ui;
   import http;
-  import webview-host;        // imported unconditionally, but capability-gated at runtime
+  import webview-host;        // NOTE: imported unconditionally because wasmtime requires
+                              // all imports to be linked. Runtime gating via the
+                              // webview_panels capability ensures non-capable extensions
+                              // receive Err("not declared") on any webview-host call.
 
   // Exports: what the host calls on the extension
   export lifecycle;

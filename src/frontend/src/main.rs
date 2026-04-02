@@ -12,15 +12,15 @@ use anyhow::Result;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    log::info!("CoreCode starting...");
+    tracing::info!("CoreCode starting...");
 
     let buffer = buffer::TextBuffer::new();
-    log::info!("Text buffer initialized ({} chars)", buffer.len_chars());
+    tracing::info!("Text buffer initialized ({} chars)", buffer.len_chars());
 
     // TODO M1: Initialize wgpu renderer
     // TODO M1: Connect to Extension Host via IPC
     // TODO M1: Start event loop
 
-    log::info!("CoreCode ready (scaffold mode)");
+    tracing::info!("CoreCode ready (scaffold mode)");
     Ok(())
 }

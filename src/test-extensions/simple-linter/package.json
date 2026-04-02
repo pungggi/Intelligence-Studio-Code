@@ -4,6 +4,22 @@
   "description": "A simple linter that checks JavaScript/TypeScript files for common issues",
   "version": "0.1.0",
   "publisher": "corecode-test",
+  "categories": [
+    "Linters",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "linter",
+    "javascript",
+    "typescript",
+    "diagnostics",
+    "code-quality"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pungggi/Intelligence-Studio-Code.git"
+  },
   "engines": {
     "vscode": "^1.80.0"
   },

@@ -8,36 +8,13 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { isAbsolute, normalize } from "node:path";
+import { createGitExtension, validateFilePath, validateRef, validateConfigKey, safeDate, repoContainsPath } from "./git-api.js";
 
-// ── Inline the pure logic under test ─────────────────────────────────────────
-// We re-implement the validation guards here so we can test them without
-// spawning real git processes or requiring a live repository.
+// ── Thin wrappers that call the real exported validators ──────────────────────
 
 function validateShowArgs(ref: string, filePath: string): void {
-  if (isAbsolute(filePath)) {
-    throw new Error(`show: filePath must be relative, got '${filePath}'`);
-  }
-  const normalized = normalize(filePath);
-  if (normalized.startsWith("..")) {
-    throw new Error(`show: filePath '${filePath}' traverses outside repository`);
-  }
-  if (ref.startsWith("-") || !/^[A-Za-z0-9_./:@^~\-{}]+$/.test(ref)) {
-    throw new Error(`show: unsafe ref '${ref}'`);
-  }
-}
-
-// Re-implement parseCommits date logic
-function parseCommitsDate(aDate: string | undefined): Date {
-  const d = new Date(aDate || 0);
-  return isNaN(d.getTime()) ? new Date(0) : d;
-}
-
-// Re-implement getRepository path check
-function repoContainsPath(rootPath: string, fsPath: string): boolean {
-  return fsPath === rootPath ||
-    fsPath.startsWith(rootPath + "/") ||
-    fsPath.startsWith(rootPath + "\\");
+  validateFilePath(filePath, "show");
+  validateRef(ref, "show");
 }
 
 // ── show() — path traversal ───────────────────────────────────────────────────
@@ -145,86 +122,67 @@ describe("git-api show() — ref validation", () => {
 
 // ── blame() — filePath validation ────────────────────────────────────────────
 
-function validateBlameArgs(filePath: string): void {
-  if (isAbsolute(filePath)) {
-    throw new Error(`blame: filePath must be relative, got '${filePath}'`);
-  }
-  const normalized = normalize(filePath);
-  if (normalized.startsWith("..")) {
-    throw new Error(`blame: filePath '${filePath}' traverses outside repository`);
-  }
-}
-
 describe("git-api blame() — filePath validation", () => {
   it("accepts a simple relative path", () => {
-    assert.doesNotThrow(() => validateBlameArgs("src/main.rs"));
+    assert.doesNotThrow(() => validateFilePath("src/main.rs", "blame"));
   });
 
   it("rejects an absolute path", () => {
-    assert.throws(() => validateBlameArgs("/etc/passwd"), /filePath must be relative/);
+    assert.throws(() => validateFilePath("/etc/passwd", "blame"), /filePath must be relative/);
   });
 
   it("rejects dotdot traversal", () => {
-    assert.throws(() => validateBlameArgs("../../.env"), /traverses outside repository/);
+    assert.throws(() => validateFilePath("../../.env", "blame"), /traverses outside repository/);
   });
 });
 
 // ── getCommit() / getBranch() / getConfig() — input validation ──────────────
 
-// Combined validation: leading-dash check + character allowlist (mirrors git-api.ts)
-function isUnsafeRef(value: string): boolean {
-  return value.startsWith("-") || !/^[A-Za-z0-9_./:@^~\-{}]+$/.test(value);
-}
-
-function isUnsafeConfigKey(key: string): boolean {
-  return !/^[a-zA-Z][a-zA-Z0-9._-]*$/.test(key);
-}
-
 describe("git-api getCommit() — hash validation", () => {
   it("accepts a hex hash", () => {
-    assert.ok(!isUnsafeRef("abc1234"));
+    assert.doesNotThrow(() => validateRef("abc1234", "getCommit"));
   });
 
   it("accepts HEAD~1", () => {
-    assert.ok(!isUnsafeRef("HEAD~1"));
+    assert.doesNotThrow(() => validateRef("HEAD~1", "getCommit"));
   });
 
   it("rejects --help flag injection", () => {
-    assert.ok(isUnsafeRef("--help"));
+    assert.throws(() => validateRef("--help", "getCommit"), /unsafe ref/);
   });
 
   it("rejects semicolons", () => {
-    assert.ok(isUnsafeRef("abc;rm -rf /"));
+    assert.throws(() => validateRef("abc;rm -rf /", "getCommit"), /unsafe ref/);
   });
 });
 
 describe("git-api getBranch() — name validation", () => {
   it("accepts a simple branch name", () => {
-    assert.ok(!isUnsafeRef("main"));
-    assert.ok(!isUnsafeRef("feature/my-branch"));
+    assert.doesNotThrow(() => validateRef("main", "getBranch"));
+    assert.doesNotThrow(() => validateRef("feature/my-branch", "getBranch"));
   });
 
   it("rejects --show-toplevel flag injection", () => {
-    assert.ok(isUnsafeRef("--show-toplevel"));
+    assert.throws(() => validateRef("--show-toplevel", "getBranch"), /unsafe ref/);
   });
 
   it("rejects --local-env-vars flag injection", () => {
-    assert.ok(isUnsafeRef("--local-env-vars"));
+    assert.throws(() => validateRef("--local-env-vars", "getBranch"), /unsafe ref/);
   });
 });
 
 describe("git-api getConfig() — key validation", () => {
   it("accepts a standard config key", () => {
-    assert.ok(!isUnsafeConfigKey("user.name"));
-    assert.ok(!isUnsafeConfigKey("remote.origin.url"));
+    assert.doesNotThrow(() => validateConfigKey("user.name"));
+    assert.doesNotThrow(() => validateConfigKey("remote.origin.url"));
   });
 
   it("rejects --list flag injection", () => {
-    assert.ok(isUnsafeConfigKey("--list"));
+    assert.throws(() => validateConfigKey("--list"), /unsafe key/);
   });
 
   it("rejects keys starting with a dash", () => {
-    assert.ok(isUnsafeConfigKey("-evil"));
+    assert.throws(() => validateConfigKey("-evil"), /unsafe key/);
   });
 });
 
@@ -232,25 +190,25 @@ describe("git-api getConfig() — key validation", () => {
 
 describe("parseCommits — date handling", () => {
   it("produces a valid Date for an ISO 8601 string", () => {
-    const d = parseCommitsDate("2024-01-15T12:00:00+00:00");
+    const d = safeDate("2024-01-15T12:00:00+00:00");
     assert.ok(!isNaN(d.getTime()), "expected valid Date");
     assert.equal(d.getUTCFullYear(), 2024);
   });
 
   it("produces epoch for an empty string (not Invalid Date)", () => {
-    const d = parseCommitsDate("");
+    const d = safeDate("");
     assert.ok(!isNaN(d.getTime()), "empty string must not produce Invalid Date");
     assert.equal(d.getTime(), 0);
   });
 
   it("produces epoch for undefined", () => {
-    const d = parseCommitsDate(undefined);
+    const d = safeDate(undefined);
     assert.ok(!isNaN(d.getTime()), "undefined must not produce Invalid Date");
     assert.equal(d.getTime(), 0);
   });
 
   it("produces epoch for an unparseable date string", () => {
-    const d = parseCommitsDate("not-a-date");
+    const d = safeDate("not-a-date");
     assert.ok(!isNaN(d.getTime()), "unparseable string must not produce Invalid Date");
     assert.equal(d.getTime(), 0);
   });
@@ -281,14 +239,17 @@ describe("getRepository — path separator check", () => {
   });
 });
 
-// ── onDidOpenRepository event stubs — callable ───────────────────────────────
+// ── onDidOpenRepository — real implementation ─────────────────────────────────
 
-describe("git extension event stubs are callable functions", () => {
-  it("onDidOpenRepository is a function that returns a disposable", () => {
-    const stub = (_l: unknown) => ({ dispose: () => {} });
-    assert.equal(typeof stub, "function");
-    const result = stub(() => {});
+describe("git extension onDidOpenRepository — real implementation", () => {
+  it("is a function that returns a disposable", () => {
+    const ext = createGitExtension("/tmp");
+    const api = ext.exports.getAPI(1);
+    const { onDidOpenRepository } = api;
+    assert.equal(typeof onDidOpenRepository, "function");
+    const result = onDidOpenRepository(() => {});
     assert.equal(typeof result.dispose, "function");
     assert.doesNotThrow(() => result.dispose());
+    ext.deactivate();
   });
 });

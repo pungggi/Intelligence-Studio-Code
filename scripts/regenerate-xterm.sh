@@ -20,9 +20,15 @@ fi
 echo "Regenerating xterm.js ($XTERM_VERSION) & xterm-addon-fit ($FIT_VERSION)..."
 
 # 1. Download official minified assets from unpkg (which serves npm package content)
-curl -L "https://unpkg.com/xterm@$XTERM_VERSION/lib/xterm.js" -o "$LIB_DIR/xterm.js"
-curl -L "https://unpkg.com/xterm@$XTERM_VERSION/css/xterm.css" -o "$LIB_DIR/xterm.css"
-curl -L "https://unpkg.com/xterm-addon-fit@$FIT_VERSION/lib/xterm-addon-fit.js" -o "$LIB_DIR/addon-fit.js"
+curl -fL "https://unpkg.com/xterm@$XTERM_VERSION/lib/xterm.js" -o "$LIB_DIR/xterm.js"
+curl -fL "https://unpkg.com/xterm@$XTERM_VERSION/lib/xterm.js.map" -o "$LIB_DIR/xterm.js.map"
+curl -fL "https://unpkg.com/xterm@$XTERM_VERSION/css/xterm.css" -o "$LIB_DIR/xterm.css"
+curl -fL "https://unpkg.com/xterm-addon-fit@$FIT_VERSION/lib/xterm-addon-fit.js" -o "$LIB_DIR/addon-fit.js"
+curl -fL "https://unpkg.com/xterm-addon-fit@$FIT_VERSION/lib/xterm-addon-fit.js.map" -o "$LIB_DIR/xterm-addon-fit.js.map"
+
+# Add version comment
+sed -i.bak "1s/^/\/\* xterm-addon-fit v$FIT_VERSION \*\/\n/" "$LIB_DIR/addon-fit.js"
+rm -f "$LIB_DIR/addon-fit.js.bak"
 
 # 2. Add xterm.js LICENSE/NOTICE
 cat <<EOF > "$LIB_DIR/NOTICE"
@@ -54,13 +60,22 @@ EOF
 {
   echo "UPSTREAM_VERSION_XTERM=$XTERM_VERSION"
   echo "UPSTREAM_VERSION_FIT=$FIT_VERSION"
-  echo "GENERATED_DATE=$(date -u)"
-  
+  echo "GENERATED_DATE=$(date -u +"%Y-%m-%d %H:%M:%SZ")"
+
   if command -v sha256sum >/dev/null 2>&1; then
     echo "--- SHA256 Checksums ---"
     sha256sum "$LIB_DIR/xterm.js" | sed 's|src/app/src/lib/xterm/||'
+    sha256sum "$LIB_DIR/xterm.js.map" | sed 's|src/app/src/lib/xterm/||'
     sha256sum "$LIB_DIR/xterm.css" | sed 's|src/app/src/lib/xterm/||'
     sha256sum "$LIB_DIR/addon-fit.js" | sed 's|src/app/src/lib/xterm/||'
+    sha256sum "$LIB_DIR/xterm-addon-fit.js.map" | sed 's|src/app/src/lib/xterm/||'
+  elif command -v shasum >/dev/null 2>&1; then
+    echo "--- SHA256 Checksums ---"
+    shasum -a 256 "$LIB_DIR/xterm.js" | sed 's|src/app/src/lib/xterm/||'
+    shasum -a 256 "$LIB_DIR/xterm.js.map" | sed 's|src/app/src/lib/xterm/||'
+    shasum -a 256 "$LIB_DIR/xterm.css" | sed 's|src/app/src/lib/xterm/||'
+    shasum -a 256 "$LIB_DIR/addon-fit.js" | sed 's|src/app/src/lib/xterm/||'
+    shasum -a 256 "$LIB_DIR/xterm-addon-fit.js.map" | sed 's|src/app/src/lib/xterm/||'
   fi
 } > "$LIB_DIR/VERSION"
 

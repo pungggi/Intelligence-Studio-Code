@@ -2,6 +2,20 @@
 //!
 //! Starts the Node.js Extension Host as a child process and manages
 //! its lifecycle (start, restart on crash, graceful shutdown).
+//!
+//! # Single-Extension-Host limitation
+//!
+//! The current implementation stores the Extension Host PID and shutdown flag
+//! in module-level statics (`EXT_HOST_PID`, `EXT_HOST_SHUTDOWN_REQUESTED`).
+//! This means **at most one** Extension Host process can be tracked at a time.
+//! If multiple `AppHandle` instances call `start_extension_host()` concurrently
+//! the second call will overwrite the first process's PID, leaving the earlier
+//! child process untracked and un-killable via `kill_extension_host()`.
+//!
+//! TODO: Refactor `EXT_HOST_PID` and `EXT_HOST_SHUTDOWN_REQUESTED` into
+//! per-`AppHandle` state (e.g. a `HashMap<AppHandleId, ExtHostState>` or
+//! state managed inside Tauri's managed app state) so that each `AppHandle`
+//! owns its own PID and shutdown flag independently.
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -10,10 +24,17 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
-/// Shared child process PID so it can be killed on app exit.
+/// PID of the **single** managed Extension Host child process (0 = none).
+///
+/// Limitation: this is a global — a second concurrent caller to
+/// `start_extension_host()` will clobber a previous PID.
+/// See the module-level "Single-Extension-Host limitation" docs.
 static EXT_HOST_PID: AtomicU32 = AtomicU32::new(0);
 
-/// Set to true by kill_extension_host() so the restart loop knows the exit was intentional.
+/// Flag set by `kill_extension_host()` so the restart loop in
+/// `start_extension_host()` knows the exit was intentional.
+///
+/// Same single-host limitation as `EXT_HOST_PID`.
 static EXT_HOST_SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -86,6 +107,7 @@ pub fn start_extension_host(
 
     loop {
         log::info!("Starting Extension Host: {}", host_script.display());
+        let spawn_time = std::time::Instant::now();
 
         let child = Command::new("node")
             .arg(&host_script)
@@ -140,6 +162,13 @@ pub fn start_extension_host(
                     e
                 ));
             }
+        }
+
+        // If the process ran for a reasonable time, it was probably a transient
+        // issue — reset the crash counter so future restarts get full attempts.
+        if spawn_time.elapsed() > Duration::from_secs(5) {
+            restarts = 0;
+            delay = Duration::from_secs(1);
         }
 
         restarts += 1;

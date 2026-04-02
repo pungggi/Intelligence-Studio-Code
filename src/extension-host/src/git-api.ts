@@ -9,7 +9,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { join, isAbsolute, normalize } from "node:path";
+import { join, isAbsolute, normalize, sep } from "node:path";
 
 // ─── Types (mirrors vscode.git public API v1) ─────────────────
 
@@ -51,6 +51,38 @@ export interface Change { uri: { fsPath: string }; status: number }
 export interface Commit { hash: string; message: string; authorName: string; authorEmail: string; authorDate: Date; commitDate: Date; parents: string[] }
 export interface BlameHunk { originalStartLineNumber: number; originalEndLineNumber: number; finalStartLineNumber: number; finalEndLineNumber: number; commit: Commit }
 export interface LogOptions { maxEntries?: number; path?: string; follow?: boolean; excludeMerges?: boolean }
+
+// ─── Input validation helpers ─────────────────────────────────
+
+export function validateFilePath(filePath: string, fnName: string): void {
+  if (isAbsolute(filePath)) {
+    throw new Error(`${fnName}: filePath must be relative, got '${filePath}'`);
+  }
+  // normalize() uses OS-native separators; unify to forward slashes so the
+  // ".." prefix check works correctly on Windows where normalize returns "..\\".
+  const normalized = normalize(filePath).split(sep).join('/');
+  if (normalized.startsWith('..')) {
+    throw new Error(`${fnName}: filePath '${filePath}' traverses outside repository`);
+  }
+}
+
+export function validateRef(ref: string, fnName: string): void {
+  if (ref.startsWith('-') || !/^[A-Za-z0-9_./:@^~\-{}]+$/.test(ref)) {
+    throw new Error(`${fnName}: unsafe ref '${ref}'`);
+  }
+}
+
+export function validateConfigKey(key: string): void {
+  if (!/^[a-zA-Z][a-zA-Z0-9._-]*$/.test(key)) {
+    throw new Error(`getConfig: unsafe key '${key}'`);
+  }
+}
+
+export function repoContainsPath(rootPath: string, fsPath: string): boolean {
+  return fsPath === rootPath ||
+    fsPath.startsWith(rootPath + '/') ||
+    fsPath.startsWith(rootPath + '\\');
+}
 
 // ─── git subprocess helper ────────────────────────────────────
 
@@ -106,7 +138,7 @@ function git(args: string[], cwd: string): Promise<string> {
 const LOG_SEP = '\x00';
 const LOG_FMT = `%H${LOG_SEP}%s${LOG_SEP}%an${LOG_SEP}%ae${LOG_SEP}%aI${LOG_SEP}%cI${LOG_SEP}%P`;
 
-function safeDate(value: string | undefined): Date {
+export function safeDate(value: string | undefined): Date {
   const d = new Date(value || 0);
   return isNaN(d.getTime()) ? new Date(0) : d;
 }
@@ -251,20 +283,12 @@ function makeRepository(root: string): Repository {
       return parseCommits(raw);
     },
     async getCommit(hash: string): Promise<Commit> {
-      if (hash.startsWith('-') || !/^[A-Za-z0-9_./:@^~\-{}]+$/.test(hash)) {
-        throw new Error(`getCommit: unsafe hash '${hash}'`);
-      }
+      validateRef(hash, 'getCommit');
       const raw = await git(['show', '-s', `--format=${LOG_FMT}`, '--', hash], root);
       return parseCommits(raw)[0] ?? { hash, message: '', authorName: '', authorEmail: '', authorDate: new Date(), commitDate: new Date(), parents: [] };
     },
     async blame(filePath: string): Promise<BlameHunk[]> {
-      if (isAbsolute(filePath)) {
-        throw new Error(`blame: filePath must be relative, got '${filePath}'`);
-      }
-      const normalized = normalize(filePath);
-      if (normalized.startsWith('..')) {
-        throw new Error(`blame: filePath '${filePath}' traverses outside repository`);
-      }
+      validateFilePath(filePath, 'blame');
       const raw = await git(['blame', '--porcelain', '--', filePath], root);
       return parseBlame(raw);
     },
@@ -274,31 +298,16 @@ function makeRepository(root: string): Repository {
       return git(args, root);
     },
     async show(ref: string, filePath: string): Promise<string> {
-      // Validate filePath: must be relative and must not traverse outside the repo root
-      if (isAbsolute(filePath)) {
-        throw new Error(`show: filePath must be relative, got '${filePath}'`);
-      }
-      const normalized = normalize(filePath);
-      if (normalized.startsWith('..')) {
-        throw new Error(`show: filePath '${filePath}' traverses outside repository`);
-      }
-      // Validate ref: only allow safe characters and reject leading dashes to prevent
-      // flag injection. Includes {} for stash refs (stash@{0}) and branch@{n} syntax.
-      if (ref.startsWith('-') || !/^[A-Za-z0-9_./:@^~\-{}]+$/.test(ref)) {
-        throw new Error(`show: unsafe ref '${ref}'`);
-      }
+      validateFilePath(filePath, 'show');
+      validateRef(ref, 'show');
       return git(['show', `${ref}:${filePath}`], root);
     },
     async getConfig(key: string): Promise<string> {
-      if (!/^[a-zA-Z][a-zA-Z0-9._-]*$/.test(key)) {
-        throw new Error(`getConfig: unsafe key '${key}'`);
-      }
+      validateConfigKey(key);
       return (await git(['config', '--get', '--', key], root)).trim();
     },
     async getBranch(name: string): Promise<Branch> {
-      if (name.startsWith('-') || !/^[A-Za-z0-9_./:@^~\-{}]+$/.test(name)) {
-        throw new Error(`getBranch: unsafe name '${name}'`);
-      }
+      validateRef(name, 'getBranch');
       const hash = (await git(['rev-parse', '--', name], root)).trim();
       return { name, commit: hash, type: name.includes('/') ? 1 : 0 };
     },
@@ -327,11 +336,7 @@ export function createGitExtension(workspaceRoot: string) {
           state: 'initialized' as const,
           repositories,
           getRepository(uri: { fsPath: string }) {
-            const fp = uri.fsPath;
-            return repositories.find(r => {
-              const rp = r.rootUri.fsPath;
-              return fp === rp || fp.startsWith(rp + '/') || fp.startsWith(rp + '\\');
-            }) ?? null;
+            return repositories.find(r => repoContainsPath(r.rootUri.fsPath, uri.fsPath)) ?? null;
           },
           onDidOpenRepository: (_l: unknown) => ({ dispose: () => { } }),
           onDidCloseRepository: (_l: unknown) => ({ dispose: () => { } }),

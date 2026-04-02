@@ -7,6 +7,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// A pending webview operation buffered during a WASM call.
+#[derive(Debug, Clone)]
+pub enum PendingWebviewOp {
+    Open { panel_id: String, title: String, column: u32 },
+    SetHtml { panel_id: String, html: String },
+    PostMessage { panel_id: String, message: String },
+    Close { panel_id: String },
+}
+
 /// Context threaded through every host import call for a single extension instance.
 ///
 /// Cloned cheaply — the `output_lines` and `status_items` vecs are behind `Arc<Mutex<>>`.
@@ -24,6 +33,10 @@ pub struct HostContext {
     pub(crate) extension_id: String,
     /// Shared settings store for `get-config` lookups.
     pub(crate) settings: Option<Arc<Mutex<crate::settings::SettingsStore>>>,
+    /// Buffered webview panel operations. Processed by manager after WASM calls return.
+    pub(crate) webview_ops: Arc<Mutex<Vec<PendingWebviewOp>>>,
+    /// Whether this extension declared `webview_panels = true`.
+    pub(crate) webview_panels_allowed: bool,
 }
 
 impl HostContext {
@@ -32,6 +45,7 @@ impl HostContext {
         workspace_read: bool,
         extension_id: String,
         settings: Option<Arc<Mutex<crate::settings::SettingsStore>>>,
+        webview_panels: bool,
     ) -> Self {
         Self {
             workspace_root,
@@ -41,6 +55,8 @@ impl HostContext {
             notifications: Arc::new(Mutex::new(Vec::new())),
             extension_id,
             settings,
+            webview_ops: Arc::new(Mutex::new(Vec::new())),
+            webview_panels_allowed: webview_panels,
         }
     }
 }
@@ -164,17 +180,83 @@ pub fn host_get_config(ctx: &mut HostContext, key: String) -> Option<String> {
         .get_string(&scoped_key)
 }
 
+// ── webview imports ───────────────────────────────────────────────────────────
+
+const MAX_PANEL_ID_LEN: usize = 64;
+const MAX_WEBVIEW_OPS: usize = 50;
+/// Maximum HTML payload size per set-html call (2 MB).
+const MAX_HTML_SIZE: usize = 2 * 1024 * 1024;
+
+fn validate_panel_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > MAX_PANEL_ID_LEN {
+        return Err(format!("panel_id must be 1-{MAX_PANEL_ID_LEN} characters"));
+    }
+    if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+        return Err("panel_id must contain only alphanumeric, hyphen, or dot".to_string());
+    }
+    Ok(())
+}
+
+fn push_webview_op(ctx: &mut HostContext, op: PendingWebviewOp) {
+    if let Ok(mut ops) = ctx.webview_ops.lock() {
+        if ops.len() < MAX_WEBVIEW_OPS {
+            ops.push(op);
+        } else {
+            log::warn!("[wasm-ext:{}] webview ops buffer full — dropping", ctx.extension_id);
+        }
+    }
+}
+
+pub fn host_open_panel(ctx: &mut HostContext, panel_id: String, title: String, column: u32) -> Result<(), String> {
+    if !ctx.webview_panels_allowed {
+        return Err("capability 'webview_panels' not declared in corecode.toml".to_string());
+    }
+    validate_panel_id(&panel_id)?;
+    push_webview_op(ctx, PendingWebviewOp::Open { panel_id, title, column });
+    Ok(())
+}
+
+pub fn host_set_html(ctx: &mut HostContext, panel_id: String, html: String) -> Result<(), String> {
+    if !ctx.webview_panels_allowed {
+        return Err("capability 'webview_panels' not declared in corecode.toml".to_string());
+    }
+    validate_panel_id(&panel_id)?;
+    if html.len() > MAX_HTML_SIZE {
+        return Err(format!("HTML payload exceeds {} MB limit", MAX_HTML_SIZE / (1024 * 1024)));
+    }
+    push_webview_op(ctx, PendingWebviewOp::SetHtml { panel_id, html });
+    Ok(())
+}
+
+pub fn host_post_to_webview(ctx: &mut HostContext, panel_id: String, message: String) -> Result<(), String> {
+    if !ctx.webview_panels_allowed {
+        return Err("capability 'webview_panels' not declared in corecode.toml".to_string());
+    }
+    validate_panel_id(&panel_id)?;
+    push_webview_op(ctx, PendingWebviewOp::PostMessage { panel_id, message });
+    Ok(())
+}
+
+pub fn host_close_panel(ctx: &mut HostContext, panel_id: String) -> Result<(), String> {
+    if !ctx.webview_panels_allowed {
+        return Err("capability 'webview_panels' not declared in corecode.toml".to_string());
+    }
+    validate_panel_id(&panel_id)?;
+    push_webview_op(ctx, PendingWebviewOp::Close { panel_id });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
     fn ctx_no_workspace() -> HostContext {
-        HostContext::new(None, false, "test.ext".to_string(), None)
+        HostContext::new(None, false, "test.ext".to_string(), None, false)
     }
 
     fn ctx_with_workspace(root: &std::path::Path, read: bool) -> HostContext {
-        HostContext::new(Some(root.to_path_buf()), read, "test.ext".to_string(), None)
+        HostContext::new(Some(root.to_path_buf()), read, "test.ext".to_string(), None, false)
     }
 
     #[test]

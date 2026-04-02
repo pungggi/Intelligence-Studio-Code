@@ -13,9 +13,29 @@ if (-Not (Test-Path $LIB_DIR)) {
 
 Write-Host "Regenerating xterm.js ($XTERM_VERSION) & xterm-addon-fit ($FIT_VERSION)..."
 
-Invoke-WebRequest -Uri "https://unpkg.com/xterm@$XTERM_VERSION/lib/xterm.js" -OutFile "$LIB_DIR/xterm.js"
-Invoke-WebRequest -Uri "https://unpkg.com/xterm@$XTERM_VERSION/css/xterm.css" -OutFile "$LIB_DIR/xterm.css"
-Invoke-WebRequest -Uri "https://unpkg.com/xterm-addon-fit@$FIT_VERSION/lib/xterm-addon-fit.js" -OutFile "$LIB_DIR/addon-fit.js"
+$Downloads = @(
+    @{ Uri = "https://unpkg.com/xterm@$XTERM_VERSION/lib/xterm.js";               Out = "$LIB_DIR/xterm.js" },
+    @{ Uri = "https://unpkg.com/xterm@$XTERM_VERSION/lib/xterm.js.map";            Out = "$LIB_DIR/xterm.js.map" },
+    @{ Uri = "https://unpkg.com/xterm@$XTERM_VERSION/css/xterm.css";               Out = "$LIB_DIR/xterm.css" },
+    @{ Uri = "https://unpkg.com/xterm-addon-fit@$FIT_VERSION/lib/xterm-addon-fit.js";     Out = "$LIB_DIR/addon-fit.js" },
+    @{ Uri = "https://unpkg.com/xterm-addon-fit@$FIT_VERSION/lib/xterm-addon-fit.js.map"; Out = "$LIB_DIR/xterm-addon-fit.js.map" }
+)
+
+try {
+    foreach ($dl in $Downloads) {
+        Invoke-WebRequest -Uri $dl.Uri -OutFile $dl.Out -ErrorAction Stop
+    }
+} catch {
+    Write-Error "Download failed for '$($dl.Uri)': $($_.Exception.Message)"
+    foreach ($dl in $Downloads) {
+        if (Test-Path $dl.Out) { Remove-Item $dl.Out -Force -ErrorAction SilentlyContinue }
+    }
+    exit 1
+}
+
+# Add version comment
+$FitContent = Get-Content -Path "$LIB_DIR/addon-fit.js" -Raw
+Set-Content -Path "$LIB_DIR/addon-fit.js" -Value "/* xterm-addon-fit v$FIT_VERSION */`n$FitContent"
 
 # Create NOTICE file
 $Notice = @"
@@ -48,6 +68,8 @@ $GeneratedDate = (Get-Date).ToUniversalTime().ToString("u")
 $XtermHash = (Get-FileHash "$LIB_DIR/xterm.js" -Algorithm SHA256).Hash
 $CssHash = (Get-FileHash "$LIB_DIR/xterm.css" -Algorithm SHA256).Hash
 $FitHash = (Get-FileHash "$LIB_DIR/addon-fit.js" -Algorithm SHA256).Hash
+$XtermMapHash = (Get-FileHash "$LIB_DIR/xterm.js.map" -Algorithm SHA256).Hash
+$FitMapHash = (Get-FileHash "$LIB_DIR/xterm-addon-fit.js.map" -Algorithm SHA256).Hash
 
 $VersionContent = @"
 UPSTREAM_VERSION_XTERM=$XTERM_VERSION
@@ -55,8 +77,10 @@ UPSTREAM_VERSION_FIT=$FIT_VERSION
 GENERATED_DATE=$GeneratedDate
 --- SHA256 Checksums ---
 $XtermHash xterm.js
+$XtermMapHash xterm.js.map
 $CssHash xterm.css
 $FitHash addon-fit.js
+$FitMapHash xterm-addon-fit.js.map
 "@
 
 $VersionContent | Out-File -FilePath "$LIB_DIR/VERSION" -Encoding UTF8

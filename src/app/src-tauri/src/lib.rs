@@ -2,6 +2,7 @@ mod debug;
 mod editor;
 mod ext_host;
 mod extension_mgr;
+mod grammar_registry;
 mod highlighting;
 mod ipc_bridge;
 mod marketplace;
@@ -19,6 +20,8 @@ use tauri::AppHandle;
 
 /// Maximum text insertion size (1 MB).
 const MAX_INSERT_SIZE: usize = 1024 * 1024;
+/// Maximum buffer size (50 MB) — matches MAX_FILE_SIZE in editor.rs.
+const MAX_BUFFER_SIZE: usize = 50 * 1024 * 1024;
 
 /// Shared app state accessible from Tauri commands.
 struct AppState {
@@ -34,6 +37,8 @@ struct AppState {
     window_count: Arc<Mutex<usize>>,
     /// WASM extension host — runs extensions compiled to wasm32-wasi in-process.
     wasm_host: wasm_host::WasmHostManager,
+    /// Dynamic grammar registry — tree-sitter grammars loaded from WASM extensions.
+    grammar_registry: Arc<grammar_registry::GrammarRegistry>,
 }
 
 
@@ -46,7 +51,7 @@ struct AppState {
 /// - Must not point to a directory.
 /// - Must be within the current user's home directory to prevent extensions
 ///   from reading arbitrary system files (e.g. `/etc/passwd`).
-///   If the home directory cannot be determined the restriction is skipped.
+///   If the home directory cannot be determined, access is denied (fail-closed).
 fn validate_path(path: &str) -> Result<String, String> {
     let canonical = std::fs::canonicalize(path)
         .map_err(|e| format!("Invalid path '{}': {}", path, e))?;
@@ -117,6 +122,20 @@ fn ext_to_language_id(ext: &str) -> String {
     }
 }
 
+/// Get (or create) the `WorkspaceState` for a window, attaching the shared grammar
+/// registry to newly-created instances so dynamic grammars work automatically.
+fn get_or_create_ws<'a>(
+    workspaces: &'a mut HashMap<String, WorkspaceState>,
+    wid: String,
+    grammar_registry: &Arc<grammar_registry::GrammarRegistry>,
+) -> &'a mut WorkspaceState {
+    workspaces.entry(wid).or_insert_with(|| {
+        let mut ws = WorkspaceState::new();
+        ws.set_grammar_registry(grammar_registry.clone());
+        ws
+    })
+}
+
 // --- Tauri Commands ---
 
 /// Open a file into a buffer (multi-document: doesn't close previous files).
@@ -125,7 +144,7 @@ fn open_file(path: String, state: tauri::State<AppState>, window: tauri::Webview
     let canonical = validate_path(&path)?;
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
 
     let is_new = ws.open_file(&canonical).map_err(|e| e.to_string())?;
 
@@ -163,7 +182,7 @@ fn open_file(path: String, state: tauri::State<AppState>, window: tauri::Webview
 fn close_buffer(path: String, state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Result<Option<EditorContent>, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let path_buf = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
 
     // Send didClose for this buffer
@@ -184,7 +203,7 @@ fn close_buffer(path: String, state: tauri::State<AppState>, window: tauri::Webv
 fn switch_buffer(path: String, state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Result<EditorContent, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid, &state.grammar_registry);
     let path_buf = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
 
     if !ws.switch_buffer(&path_buf) {
@@ -204,7 +223,7 @@ fn switch_buffer(path: String, state: tauri::State<AppState>, window: tauri::Web
 fn list_open_buffers(state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Result<Vec<editor::BufferInfo>, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid, &state.grammar_registry);
     Ok(ws.list_open_buffers())
 }
 
@@ -219,7 +238,7 @@ fn read_directory(path: String) -> Result<Vec<editor::DirEntry>, String> {
 fn save_file(state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Result<(), String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     ws.save_active().map_err(|e| e.to_string())?;
 
     // Notify Extension Host that the document was saved
@@ -237,7 +256,7 @@ fn save_file(state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Res
 fn get_content(state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Result<EditorContent, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid, &state.grammar_registry);
     match ws.active() {
         Some(buf) => Ok(buf.get_content(&state.ipc)),
         None => Ok(EditorContent {
@@ -265,7 +284,7 @@ fn get_visible_content(
 ) -> Result<VisibleContent, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid, &state.grammar_registry);
     match ws.active() {
         Some(buf) => Ok(buf.get_visible_content(first_line, line_count, &state.ipc)),
         None => Ok(VisibleContent {
@@ -315,8 +334,15 @@ fn edit_insert(
     }
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let buf = ws.active_mut().ok_or("No active buffer")?;
+    // Check before mutating — once inserted the rope cannot be cheaply undone.
+    if buf.len_bytes().saturating_add(text.len()) > MAX_BUFFER_SIZE {
+        return Err(format!(
+            "Insertion would exceed {} MB buffer limit",
+            MAX_BUFFER_SIZE / (1024 * 1024)
+        ));
+    }
     buf.insert(line, col, &text).map_err(|e| e.to_string())?;
     do_edit(ws, &state.ipc, &wid)
 }
@@ -331,7 +357,7 @@ fn edit_delete(
 ) -> Result<EditResult, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.delete(line, col, len).map_err(|e| e.to_string())?;
     do_edit(ws, &state.ipc, &wid)
@@ -346,7 +372,7 @@ fn edit_newline(
 ) -> Result<EditResult, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.insert(line, col, "\n").map_err(|e| e.to_string())?;
     do_edit(ws, &state.ipc, &wid)
@@ -361,7 +387,7 @@ fn edit_backspace(
 ) -> Result<EditResult, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.backspace(line, col).map_err(|e| e.to_string())?;
     do_edit(ws, &state.ipc, &wid)
@@ -371,7 +397,7 @@ fn edit_backspace(
 fn edit_undo(state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Result<EditResult, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.undo();
     do_edit(ws, &state.ipc, &wid)
@@ -381,7 +407,7 @@ fn edit_undo(state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Res
 fn edit_redo(state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Result<EditResult, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.redo();
     do_edit(ws, &state.ipc, &wid)
@@ -406,8 +432,16 @@ fn edit_replace_range(
     }
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let buf = ws.active_mut().ok_or("No active buffer")?;
+    // Conservatively check before mutating — replacement text may be larger than
+    // the range it replaces, so use the full addition as an upper bound.
+    if buf.len_bytes().saturating_add(text.len()) > MAX_BUFFER_SIZE {
+        return Err(format!(
+            "Replacement would exceed {} MB buffer limit",
+            MAX_BUFFER_SIZE / (1024 * 1024)
+        ));
+    }
     buf.replace_range(start_line, start_col, end_line, end_col, &text)
         .map_err(|e| e.to_string())?;
     do_edit(ws, &state.ipc, &wid)
@@ -424,7 +458,7 @@ fn get_text_range(
 ) -> Result<String, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid, &state.grammar_registry);
     let buf = ws.active().ok_or("No active buffer")?;
     Ok(buf.get_text_range(start_line, start_col, end_line, end_col))
 }
@@ -438,7 +472,7 @@ fn find_in_file(
 ) -> Result<Vec<editor::FindMatch>, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid, &state.grammar_registry);
     let buf = ws.active().ok_or("No active buffer")?;
     Ok(buf.find_all(&query, case_sensitive))
 }
@@ -454,7 +488,7 @@ fn replace_in_file(
 ) -> Result<ReplaceResult, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let buf = ws.active_mut().ok_or("No active buffer")?;
     let matches = buf.find_all(&query, case_sensitive);
 
@@ -1284,27 +1318,53 @@ fn get_decorations(uri: String, state: tauri::State<AppState>) -> Result<Vec<ipc
 // --- M8b: WebView Commands ---
 
 /// Drain all pending webview panel events (create, setHtml, postMessage, reveal, close).
+///
+/// Merges events from both the Node.js extension host (via IPC) and WASM
+/// extensions (in-process). The frontend is agnostic to the event source.
 #[tauri::command]
 fn get_webview_events(state: tauri::State<AppState>) -> Result<Vec<ipc_bridge::WebviewPanelEvent>, String> {
-    Ok(state.ipc.drain_webview_events())
+    let mut events = state.ipc.drain_webview_events();
+    events.extend(state.wasm_host.drain_webview_events());
+    Ok(events)
 }
 
-/// Forward a message from a webview iframe to the Extension Host.
+/// Forward a message from a webview iframe to the owning extension.
+///
+/// Tries the WASM host first; if the panel is not owned by a WASM extension,
+/// falls back to forwarding via IPC to the Node.js extension host.
 #[tauri::command]
 fn webview_post_message(
     panel_id: String,
     message: serde_json::Value,
     state: tauri::State<AppState>,
 ) -> Result<(), String> {
-    state.ipc.send(OutgoingMessage::WebviewMessageFromWebview { panel_id, message });
-    Ok(())
+    // WASM extensions receive the message as a JSON string (WIT uses `string`);
+    // Node.js extensions receive the original serde_json::Value via IPC.
+    let msg_str = message.to_string();
+    match state.wasm_host.route_webview_message(&panel_id, &msg_str) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Not a WASM panel — forward to Node.js extension host
+            state.ipc.send(OutgoingMessage::WebviewMessageFromWebview { panel_id, message });
+            Ok(())
+        }
+    }
 }
 
-/// Notify Extension Host that the user closed a webview panel.
+/// Notify the owning extension that the user closed a webview panel.
+///
+/// Tries the WASM host first; if the panel is not owned by a WASM extension,
+/// falls back to notifying the Node.js extension host via IPC.
 #[tauri::command]
 fn webview_close_by_user(panel_id: String, state: tauri::State<AppState>) -> Result<(), String> {
-    state.ipc.send(OutgoingMessage::WebviewClosedByUser { panel_id });
-    Ok(())
+    match state.wasm_host.route_webview_close(&panel_id) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Not a WASM panel — forward to Node.js extension host
+            state.ipc.send(OutgoingMessage::WebviewClosedByUser { panel_id });
+            Ok(())
+        }
+    }
 }
 
 // --- workspace.applyEdit ---
@@ -1395,7 +1455,7 @@ fn apply_workspace_edit(
 ) -> Result<(), String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let original_active = ws.active_path().cloned();
 
     for file_edit in &changes {
@@ -1403,11 +1463,38 @@ fn apply_workspace_edit(
             continue;
         }
         // Layer 1: canonicalize and enforce home-dir confinement.
-        // Layer 2 (below): for files not in an open buffer, further restrict
-        // to the workspace root so extensions cannot overwrite sensitive files
-        // such as ~/.ssh/authorized_keys or ~/.aws/credentials.
         let path_str = validate_path(&uri_to_path(&file_edit.uri))?;
         let path = std::path::PathBuf::from(&path_str);
+
+        // Layer 2: restrict workspace edits to the workspace root.
+        // Exception: files already open in a buffer are allowed even without a
+        // workspace root, because the user has explicitly opened them for editing.
+        // This supports the common "open single file, let extension format it"
+        // workflow where no folder is registered.
+        let in_buffer = ws.has_buffer(&path);
+        match ws.workspace_root() {
+            Some(root) if path.starts_with(root) => {}
+            Some(root) => {
+                return Err(format!(
+                    "Access denied: '{}' is outside the workspace root '{}'. \
+                     Workspace edits must target files within the workspace folder.",
+                    path_str,
+                    root.display()
+                ));
+            }
+            None if in_buffer => {
+                // No workspace root but file is open — allow; already home-dir
+                // restricted by Layer 1.
+            }
+            None => {
+                return Err(format!(
+                    "Access denied: '{}' — no workspace root is registered and \
+                     the file is not open in the editor. Open a workspace folder \
+                     before applying edits to files outside the editor.",
+                    path_str
+                ));
+            }
+        }
 
         // Sort edits in reverse position order so that applying each one does not
         // shift the positions of later edits.
@@ -1442,30 +1529,6 @@ fn apply_workspace_edit(
                 workspace_id: Some(wid.clone()),
             });
         } else {
-            // The target file is not open in the editor.  Restrict disk writes
-            // to the workspace root to prevent a malicious extension from
-            // overwriting sensitive files outside the project (e.g.
-            // ~/.ssh/authorized_keys, ~/.bashrc, ~/.aws/credentials).
-            match ws.workspace_root() {
-                Some(root) if path.starts_with(root) => {}
-                Some(root) => {
-                    return Err(format!(
-                        "Access denied: '{}' is outside the workspace root '{}'. \
-                         Workspace edits for files not open in the editor must \
-                         target files within the workspace folder.",
-                        path_str,
-                        root.display()
-                    ));
-                }
-                None => {
-                    return Err(format!(
-                        "Access denied: '{}' is not open in the editor and no \
-                         workspace root is registered. Open a workspace folder \
-                         before applying edits to files outside the editor.",
-                        path_str
-                    ));
-                }
-            }
             // Apply to a file not currently open in the editor.
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read {}: {}", path_str, e))?;
@@ -1746,7 +1809,7 @@ fn register_workspace(
     // Ensure workspace state entry exists for this window and record the root.
     {
         let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-        let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+        let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
         ws.set_workspace_root(std::path::PathBuf::from(&dir));
     }
     // Inform WASM extensions so workspace_read calls resolve against the new root.
@@ -1804,7 +1867,7 @@ pub struct HighlightedLine {
 pub struct Token {
     pub start: usize,
     pub end: usize,
-    pub kind: String,
+    pub kind: &'static str,
 }
 
 #[derive(serde::Serialize)]
@@ -1860,6 +1923,28 @@ pub fn run() {
     let mut wasm_host_mgr = wasm_host::WasmHostManager::new()
         .expect("Failed to initialise WASM extension host");
     wasm_host_mgr.set_settings(settings_store.clone());
+    let grammar_reg = Arc::new(grammar_registry::GrammarRegistry::new());
+    wasm_host_mgr.set_grammar_registry(grammar_reg.clone());
+
+    // Populate the native grammar dylib allowlist from user settings.
+    // Native dylibs execute code outside the WASM sandbox, so only
+    // explicitly trusted extension IDs may load them.
+    {
+        let allowlist_val = settings_store.lock().unwrap()
+            .get("security.nativeGrammarAllowlist");
+        let mut ids = std::collections::HashSet::new();
+        if let serde_json::Value::Array(arr) = allowlist_val {
+            for v in arr {
+                if let serde_json::Value::String(s) = v {
+                    ids.insert(s);
+                }
+            }
+        }
+        if !ids.is_empty() {
+            log::info!("Native grammar allowlist: {:?}", ids);
+        }
+        wasm_host_mgr.set_native_grammar_allowlist(ids);
+    }
 
     // Get user extensions directory path for Extension Host
     let user_extensions_dir = ext_mgr.extensions_dir().to_string_lossy().to_string();
@@ -1878,6 +1963,7 @@ pub fn run() {
             debug_mgr: debug_manager,
             window_count: Arc::new(Mutex::new(1)), // main window
             wasm_host: wasm_host_mgr,
+            grammar_registry: grammar_reg,
         })
         .invoke_handler(tauri::generate_handler![
             open_file,

@@ -418,6 +418,11 @@ function startIpcServer(apiShim) {
     });
   });
 
+  server.on('error', (err) => {
+    console.error(`[IPC] Failed to listen on ${SOCKET_PATH}:`, err.message);
+    process.exit(1);
+  });
+
   server.listen(SOCKET_PATH, () => {
     console.log(`[IPC] Listening on ${SOCKET_PATH}`);
   });

@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Instant;
 
-const SOCKET_PATH: &str = "127.0.0.1:17533";
+const TCP_ADDRESS: &str = "127.0.0.1:17533";
 
 // --- Protocol: length-prefixed JSON ---
 
@@ -40,6 +40,10 @@ struct ErrorInfo {
 }
 
 fn send_request(stream: &mut TcpStream, req: &Request) -> Result<Response> {
+    const DEFAULT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    stream.set_write_timeout(Some(DEFAULT_IO_TIMEOUT))?;
+    stream.set_read_timeout(Some(DEFAULT_IO_TIMEOUT))?;
+
     let json = serde_json::to_vec(req)?;
     let request_id = req.id;
 
@@ -52,6 +56,11 @@ fn send_request(stream: &mut TcpStream, req: &Request) -> Result<Response> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let resp_len = u32::from_le_bytes(len_buf) as usize;
+
+    const MAX_RESP_LEN: usize = 10 * 1024 * 1024;
+    if resp_len == 0 || resp_len > MAX_RESP_LEN {
+        return Err(anyhow::anyhow!("Invalid response length: {}", resp_len));
+    }
 
     let mut resp_buf = vec![0u8; resp_len];
     stream.read_exact(&mut resp_buf)?;
@@ -84,8 +93,8 @@ fn main() -> Result<()> {
     let mut args_ok = false;
     let mut data_roundtrip_ok = false;
 
-    println!("Connecting to Extension Host at {SOCKET_PATH}...");
-    let mut stream = TcpStream::connect(SOCKET_PATH)?;
+    println!("Connecting to Extension Host at {TCP_ADDRESS}...");
+    let mut stream = TcpStream::connect(TCP_ADDRESS)?;
     println!("Connected!\n");
 
     // --- Test 1: Get extension info ---
@@ -133,7 +142,11 @@ fn main() -> Result<()> {
     for cmd in &commands {
         println!("  - {}", cmd);
     }
-    println!("[Test 2] PASS: {} commands listed", commands.len());
+    if commands.is_empty() {
+        println!("[Test 2] FAIL: 0 commands listed");
+    } else {
+        println!("[Test 2] PASS: {} commands listed", commands.len());
+    }
 
     // --- Test 3: Execute corecode.helloWorld ---
     println!("\n--- Test 3: Execute corecode.helloWorld ---");

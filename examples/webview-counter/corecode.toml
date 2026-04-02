@@ -1,0 +1,12 @@
+[extension]
+id      = "corecode.webview-counter"
+name    = "Webview Counter"
+version = "0.1.0"
+
+[entry]
+wasm = "webview-counter.wasm"
+
+[capabilities]
+workspace_read = false
+network_fetch  = false
+webview_panels = true

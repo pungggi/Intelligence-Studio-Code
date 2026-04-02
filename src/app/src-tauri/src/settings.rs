@@ -1,7 +1,9 @@
- use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
+use std::io::ErrorKind;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct SettingDefinition {
     pub key: String,
     pub type_name: String,
@@ -14,6 +16,9 @@ pub struct SettingDefinition {
 
 pub struct SettingsStore {
     file_path: PathBuf,
+    /// Serializes read-modify-write cycles in `update` and `reset`
+    /// to prevent concurrent writers from clobbering each other's changes.
+    write_lock: std::sync::Mutex<()>,
 }
 
 impl SettingsStore {
@@ -26,6 +31,7 @@ impl SettingsStore {
 
         Ok(Self {
             file_path: config_dir.join("settings.json"),
+            write_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -41,7 +47,16 @@ impl SettingsStore {
                     serde_json::Value::Object(Default::default())
                 }
             },
-            Err(_) => serde_json::Value::Object(Default::default()),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                serde_json::Value::Object(Default::default())
+            }
+            Err(e) => {
+                log::error!(
+                    "Failed to read settings file '{}': {e}; falling back to empty settings",
+                    self.file_path.display()
+                );
+                serde_json::Value::Object(Default::default())
+            }
         }
     }
 
@@ -60,6 +75,7 @@ impl SettingsStore {
     }
 
     pub fn update(&self, key: &str, value: serde_json::Value) -> Result<(), String> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut all = match self.read_all() {
             serde_json::Value::Object(map) => map,
             _ => serde_json::Map::new(),
@@ -75,19 +91,13 @@ impl SettingsStore {
                 if i == parts.len() - 1 {
                     current.insert(part.to_string(), value.clone());
                 } else {
-                    if !current.contains_key(*part)
-                        || !current[*part].is_object()
-                    {
+                    if !current.contains_key(*part) || !current[*part].is_object() {
                         current.insert(
                             part.to_string(),
                             serde_json::Value::Object(serde_json::Map::new()),
                         );
                     }
-                    current = current
-                        .get_mut(*part)
-                        .unwrap()
-                        .as_object_mut()
-                        .unwrap();
+                    current = current.get_mut(*part).unwrap().as_object_mut().unwrap();
                 }
             }
         }
@@ -119,29 +129,38 @@ impl SettingsStore {
     }
 
     pub fn reset(&self, key: &str) -> Result<(), String> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut all = match self.read_all() {
             serde_json::Value::Object(map) => map,
             _ => return Ok(()),
         };
 
         let parts: Vec<&str> = key.split('.').collect();
-        if parts.len() == 1 {
-            all.remove(key);
+        let removed = if parts.len() == 1 {
+            all.remove(key).is_some()
         } else {
-            // Navigate to parent, remove final key
             let mut current = &mut all;
+            let mut found = true;
             for (i, part) in parts.iter().enumerate() {
                 if i == parts.len() - 1 {
-                    current.remove(*part);
+                    found = current.remove(*part).is_some();
                 } else {
                     match current.get_mut(*part) {
                         Some(v) if v.is_object() => {
                             current = v.as_object_mut().unwrap();
                         }
-                        _ => return Ok(()),
+                        _ => {
+                            found = false;
+                            break;
+                        }
                     }
                 }
             }
+            found
+        };
+
+        if !removed {
+            return Ok(());
         }
 
         let json = serde_json::to_string_pretty(&all)
@@ -156,15 +175,19 @@ impl SettingsStore {
     fn write_atomic(&self, json: &str) -> Result<(), String> {
         use std::io::Write as _;
 
-        let parent = self.file_path.parent()
+        let parent = self
+            .file_path
+            .parent()
             .ok_or_else(|| "Cannot determine settings directory".to_string())?;
         let tmp_path = parent.join("settings.json.tmp");
 
         let mut tmp_file = std::fs::File::create(&tmp_path)
             .map_err(|e| format!("Failed to create temp settings file: {e}"))?;
-        tmp_file.write_all(json.as_bytes())
+        tmp_file
+            .write_all(json.as_bytes())
             .map_err(|e| format!("Failed to write temp settings file: {e}"))?;
-        tmp_file.sync_all()
+        tmp_file
+            .sync_all()
             .map_err(|e| format!("Failed to sync temp settings file: {e}"))?;
         drop(tmp_file);
 
@@ -191,6 +214,7 @@ mod tests {
     fn store_in(dir: &std::path::Path) -> SettingsStore {
         SettingsStore {
             file_path: dir.join("settings.json"),
+            write_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -208,7 +232,8 @@ mod tests {
         std::fs::write(
             dir.path().join("settings.json"),
             r#"{"my":{"ext":{"tabSize":"4"}}}"#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(store.get_string("my.ext.tabSize"), Some("4".to_string()));
     }
 
@@ -219,7 +244,8 @@ mod tests {
         std::fs::write(
             dir.path().join("settings.json"),
             r#"{"my":{"ext":{"tabSize":4}}}"#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(store.get_string("my.ext.tabSize"), Some("4".to_string()));
     }
 
@@ -230,7 +256,8 @@ mod tests {
         std::fs::write(
             dir.path().join("settings.json"),
             r#"{"my":{"ext":{"enabled":true}}}"#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(store.get_string("my.ext.enabled"), Some("true".to_string()));
     }
 
@@ -241,7 +268,8 @@ mod tests {
         std::fs::write(
             dir.path().join("settings.json"),
             r#"{"my":{"ext":{"nested":{}}}}"#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(store.get_string("my.ext.nested"), None);
     }
 }

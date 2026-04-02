@@ -13,9 +13,10 @@ Add to `wit/corecode.wit`:
 
 ```wit
 interface grammar-provider {
-  // Return the compiled tree-sitter grammar as WASM bytes.
-  // The grammar itself is a separate .wasm, not the extension .wasm.
-  grammar-wasm: func() -> list<u8>;
+  // Return the compiled tree-sitter grammar as native shared library bytes
+  // (.so on Linux, .dylib on macOS, .dll on Windows).
+  // The host writes these bytes to a temp file and loads via libloading.
+  grammar-wasm: func() -> result<list<u8>, string>;
 
   // Return the highlights.scm query string.
   highlights-query: func() -> string;
@@ -99,7 +100,8 @@ impl GrammarRegistry {
 
     /// Register a grammar loaded from a WASM extension.
     pub fn register(&self, grammar: DynamicGrammar) {
-        // Acquire both locks atomically to prevent TOCTOU races
+        // Acquire both locks sequentially — not atomic, but ordered consistently
+        // (ext_map before dynamic) to prevent deadlocks.
         let mut ext_map = self.ext_map.lock().unwrap();
         let mut dynamic = self.dynamic.lock().unwrap();
 
@@ -285,24 +287,24 @@ match a static grammar, fall through to the registry:
 
 ```rust
 fn get_language_for_file(path: &str, grammar_registry: &GrammarRegistry)
-    -> Option<tree_sitter::Language>
+    -> Option<Arc<tree_sitter::Language>>
 {
-    // Existing static matches:
+    // Existing static matches (wrapped in Arc for uniform return type):
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())?;
 
     match ext {
-        "js" | "mjs" | "cjs" => Some(tree_sitter_javascript::language()),
-        "rs"                  => Some(tree_sitter_rust::language()),
-        "py"                  => Some(tree_sitter_python::language()),
-        "json"                => Some(tree_sitter_json::language()),
-        "ts" | "tsx"          => Some(tree_sitter_typescript::language_typescript()),
-        "html"                => Some(tree_sitter_html::language()),
-        "css"                 => Some(tree_sitter_css::language()),
-        "md"                  => Some(tree_sitter_md::language()),
+        "js" | "mjs" | "cjs" => Some(Arc::new(tree_sitter_javascript::language())),
+        "rs"                  => Some(Arc::new(tree_sitter_rust::language())),
+        "py"                  => Some(Arc::new(tree_sitter_python::language())),
+        "json"                => Some(Arc::new(tree_sitter_json::language())),
+        "ts" | "tsx"          => Some(Arc::new(tree_sitter_typescript::language_typescript())),
+        "html"                => Some(Arc::new(tree_sitter_html::language())),
+        "css"                 => Some(Arc::new(tree_sitter_css::language())),
+        "md"                  => Some(Arc::new(tree_sitter_md::language())),
 
-        // New: fall through to dynamic registry
+        // Fall through to dynamic registry (already returns Arc<Language>)
         _ => grammar_registry.by_extension(ext),
     }
 }
@@ -338,7 +340,7 @@ wasm = "grammar_toml.wasm"
 [grammar]
 language-id  = "toml"
 file-types   = ["toml"]
-dylib        = "tree-sitter-toml.so"
+dylib        = "tree-sitter-toml"   # base name; host appends platform suffix (.so/.dylib/.dll)
 
 [capabilities]
 workspace_read = false
@@ -356,14 +358,18 @@ impl Guest for TomlGrammar {
 }
 
 impl GrammarProvider for TomlGrammar {
-    fn grammar_wasm() -> Vec<u8> {
+    fn grammar_wasm() -> Result<Vec<u8>, String> {
         // Return the grammar dylib bytes embedded at build time.
-        // The host uses these bytes to write the dylib to a temp location and load it.
-        include_bytes!("../tree-sitter-toml.so").to_vec()
-        // Note: The host reads the bytes from `grammar-wasm()` and writes them to a
-        // temporary file before loading via `libloading`. Alternatively, if `dylib` is
-        // specified in `corecode.toml`, the host loads it directly from the extension
-        // directory. Both paths are supported.
+        // The host writes these to a temp file and loads via libloading.
+        // Primary source: embedded bytes. Fallback: dylib path in corecode.toml.
+        #[cfg(target_os = "linux")]
+        const GRAMMAR_BYTES: &[u8] = include_bytes!("../tree-sitter-toml.so");
+        #[cfg(target_os = "macos")]
+        const GRAMMAR_BYTES: &[u8] = include_bytes!("../tree-sitter-toml.dylib");
+        #[cfg(target_os = "windows")]
+        const GRAMMAR_BYTES: &[u8] = include_bytes!("../tree-sitter-toml.dll");
+
+        Ok(GRAMMAR_BYTES.to_vec())
     }
 
     fn highlights_query() -> String {
@@ -445,7 +451,7 @@ mod tests {
         assert!(load_from_dylib("", path).is_err());
         assert!(load_from_dylib("foo bar", path).is_err());
         assert!(load_from_dylib("../escape", path).is_err());
-        assert!(load_from_dylib("zig", path).is_ok().not()); // file doesn't exist, but id is valid
+        assert!(load_from_dylib("zig", path).is_err()); // file doesn't exist, but id is valid
     }
 }
 ```

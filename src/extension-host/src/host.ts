@@ -89,7 +89,11 @@ async function main(): Promise<void> {
       const p = msg.params as { id: string };
       if (p?.id) {
         console.log(`[ExtensionHost] Deactivating extension: ${p.id}`);
-        await extensionLoader.deactivateExtension(p.id);
+        try {
+          await extensionLoader.deactivateExtension(p.id);
+        } catch (err) {
+          console.error(`[ExtensionHost] Failed to deactivate extension: ${p.id}`, err);
+        }
       }
       return;
     }
@@ -127,7 +131,11 @@ async function main(): Promise<void> {
 
   for (const dir of extensionDirs) {
     console.log(`[ExtensionHost] Scanning extensions in: ${dir}`);
-    await extensionLoader.scanAndActivate(dir);
+    try {
+      await extensionLoader.scanAndActivate(dir);
+    } catch (err) {
+      console.error(`[ExtensionHost] Error scanning extensions in: ${dir}`, err);
+    }
   }
 
   const active = extensionLoader.getActiveExtensions();
@@ -146,8 +154,9 @@ async function main(): Promise<void> {
       await ipcServer.stop();
     } catch (err) {
       console.error("[ExtensionHost] Error during shutdown cleanup:", err);
+      process.exitCode = 1;
     } finally {
-      process.exit(0);
+      process.exit(process.exitCode || 0);
     }
   };
   process.on("SIGTERM", shutdown);

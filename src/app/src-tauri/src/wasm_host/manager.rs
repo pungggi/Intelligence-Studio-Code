@@ -3,14 +3,16 @@
 //! `WasmHostManager` owns the shared `wasmtime::Engine` and all loaded extension
 //! instances. It is stored in `AppState` and is therefore `Send + Sync`.
 
-use crate::wasm_host::api_impl::HostContext;
+use crate::ipc_bridge::WebviewPanelEvent;
+use crate::wasm_host::api_impl::{HostContext, PendingWebviewOp};
 use crate::wasm_host::instance::WasmInstance;
 use crate::wasm_host::manifest::CoreCodeManifest;
 use crate::wasm_host::wit_types::*;
 use crate::extension_mgr::{detect_kind, ExtensionKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use wasmtime::{Config, Engine};
 
 pub struct WasmHostManager {
@@ -19,8 +21,26 @@ pub struct WasmHostManager {
     instances: Mutex<HashMap<String, WasmInstance>>,
     /// Map from language-id (e.g. "rust") to the extension ids that claim it.
     language_registry: Mutex<HashMap<String, Vec<String>>>,
+    /// IDs currently being loaded — prevents TOCTOU double-activation.
+    loading: Mutex<HashSet<String>>,
     /// Shared settings store — threaded to each extension's HostContext.
     settings: Option<std::sync::Arc<Mutex<crate::settings::SettingsStore>>>,
+    /// Shared grammar registry for dynamic tree-sitter grammars.
+    grammar_registry: Option<std::sync::Arc<crate::grammar_registry::GrammarRegistry>>,
+    /// Webview panel ownership: panel_id → extension_id.
+    panel_owners: Mutex<HashMap<String, String>>,
+    /// Buffered webview events ready for the frontend to consume.
+    wasm_webview_events: Mutex<Vec<WebviewPanelEvent>>,
+    /// Extension IDs explicitly allowed to load native grammar dylibs.
+    ///
+    /// Loading a native shared library executes arbitrary code outside the WASM
+    /// sandbox (DLL constructors run on load). Only extensions on this allowlist
+    /// may use the `grammar-dylib` feature. All others have their dylib silently
+    /// skipped with a warning — the WASM extension still activates, just without
+    /// the native grammar.
+    native_grammar_allowlist: Mutex<HashSet<String>>,
+    /// Shutdown flag for the epoch ticker thread.
+    epoch_ticker_shutdown: Arc<AtomicBool>,
 }
 
 // `WasmHostManager` is `Send + Sync` because all its fields are:
@@ -41,21 +61,64 @@ impl WasmHostManager {
         // Enable fuel-based execution limiting so extensions cannot loop forever.
         // Each call gets a fresh budget; the engine traps when fuel is exhausted.
         config.consume_fuel(true);
+        // Enable epoch-based interruption as a wall-clock timeout defense-in-depth.
+        // Fuel limits CPU instructions, but memory-intensive loops with low instruction
+        // counts could still stall. The epoch ticker runs every second; stores get a
+        // deadline of EPOCH_DEADLINE_TICKS ticks (~30 s).
+        config.epoch_interruption(true);
 
         let engine =
             Engine::new(&config).map_err(|e| format!("wasmtime Engine::new failed: {e}"))?;
+
+        // Spawn a background thread that increments the epoch every second.
+        // The thread checks `shutdown` each iteration and exits cleanly when set.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        {
+            let engine_clone = engine.clone();
+            let shutdown_clone = shutdown.clone();
+            std::thread::Builder::new()
+                .name("wasm-epoch-ticker".into())
+                .spawn(move || {
+                    while !shutdown_clone.load(Ordering::Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        engine_clone.increment_epoch();
+                    }
+                })
+                .map_err(|e| format!("Failed to spawn epoch ticker thread: {e}"))?;
+        }
 
         Ok(Self {
             engine,
             instances: Mutex::new(HashMap::new()),
             language_registry: Mutex::new(HashMap::new()),
+            loading: Mutex::new(HashSet::new()),
             settings: None,
+            grammar_registry: None,
+            panel_owners: Mutex::new(HashMap::new()),
+            wasm_webview_events: Mutex::new(Vec::new()),
+            native_grammar_allowlist: Mutex::new(HashSet::new()),
+            epoch_ticker_shutdown: shutdown,
         })
     }
 
     /// Attach the shared settings store so extensions can use `get-config`.
     pub fn set_settings(&mut self, settings: std::sync::Arc<Mutex<crate::settings::SettingsStore>>) {
         self.settings = Some(settings);
+    }
+
+    /// Attach the shared grammar registry for dynamic tree-sitter grammar loading.
+    pub fn set_grammar_registry(&mut self, registry: std::sync::Arc<crate::grammar_registry::GrammarRegistry>) {
+        self.grammar_registry = Some(registry);
+    }
+
+    /// Set the list of extension IDs allowed to load native grammar dylibs.
+    ///
+    /// Native dylibs execute arbitrary code outside the WASM sandbox, so only
+    /// explicitly trusted extensions should be permitted to use this feature.
+    /// Extensions not on this list that declare `grammar-dylib` will still
+    /// activate — their dylib is simply skipped with a warning log.
+    pub fn set_native_grammar_allowlist(&self, ids: HashSet<String>) {
+        *self.native_grammar_allowlist.lock().unwrap() = ids;
     }
 
     /// Scan `extensions_dir` and activate all WASM extensions found there.
@@ -121,23 +184,51 @@ impl WasmHostManager {
         let manifest = CoreCodeManifest::load(ext_dir)?;
         let id = manifest.extension.id.clone();
 
-        // Prevent double-activation.
+        // Prevent double-activation: check both loaded instances and in-flight loads
+        // to close the TOCTOU window between the check and the final insert.
         {
             let instances = self.instances.lock().unwrap();
             if instances.contains_key(&id) {
                 return Err(format!("Extension '{}' is already loaded", id));
             }
+            let mut loading = self.loading.lock().unwrap();
+            if !loading.insert(id.clone()) {
+                return Err(format!("Extension '{}' is already being loaded", id));
+            }
         }
+
+        // RAII guard: removes `id` from `loading` on drop (covers all error paths,
+        // including panics between activate() and the final instances.insert()).
+        struct LoadingGuard<'a> {
+            loading: &'a Mutex<HashSet<String>>,
+            id: String,
+            committed: bool,
+        }
+        impl Drop for LoadingGuard<'_> {
+            fn drop(&mut self) {
+                if !self.committed {
+                    if let Ok(mut set) = self.loading.lock() {
+                        set.remove(&self.id);
+                    }
+                }
+            }
+        }
+        let mut guard = LoadingGuard {
+            loading: &self.loading,
+            id: id.clone(),
+            committed: false,
+        };
 
         let host_ctx = HostContext::new(
             workspace_root,
             manifest.capabilities.workspace_read,
             id.clone(),
             self.settings.clone(),
+            manifest.capabilities.webview_panels,
         );
 
-        let mut instance =
-            WasmInstance::load(&self.engine, ext_dir, &manifest, host_ctx)?;
+        let mut instance = WasmInstance::load(&self.engine, ext_dir, &manifest, host_ctx)
+            .map_err(|e| e)?;
 
         instance.activate()?;
 
@@ -159,8 +250,123 @@ impl WasmHostManager {
             );
         }
 
+        // If the manifest declares [grammar] with a grammar-dylib, load the
+        // pre-packaged native grammar and register it in the shared registry.
+        // Query strings (highlights, injections, bracket-pairs) come from the
+        // WASM extension's grammar-provider exports (safe — text only).
+        //
+        // SECURITY: Native dylibs execute arbitrary code outside the WASM sandbox
+        // (DLL constructors run on load). Only extensions on the allowlist may
+        // load native dylibs. Others are skipped with a warning.
+        if let Some(ref grammar_config) = manifest.grammar {
+            if grammar_config.grammar_dylib.is_some() {
+                let allowed = self.native_grammar_allowlist.lock().unwrap().contains(&id);
+                if !allowed {
+                    log::warn!(
+                        "WASM ext '{}': grammar-dylib declared but extension is NOT on the \
+                         native_grammar_allowlist — skipping native dylib load. \
+                         Native dylibs execute code outside the WASM sandbox. \
+                         Add '{}' to the allowlist in settings if you trust this extension.",
+                        id, id,
+                    );
+                } else {
+                    match self.load_grammar_from_manifest(&mut instance, ext_dir, grammar_config) {
+                        Ok(()) => log::info!(
+                            "WASM ext '{}': grammar registered for '{}'",
+                            id, grammar_config.language_id,
+                        ),
+                        Err(e) => log::warn!(
+                            "WASM ext '{}': grammar load failed: {e}",
+                            id,
+                        ),
+                    }
+                }
+            }
+        }
+
+        // Process any webview ops the activate() call may have buffered.
+        self.process_webview_ops(&id, &mut instance);
+
         self.instances.lock().unwrap().insert(id.clone(), instance);
+        // Disarm the drop guard — the extension is fully committed to `instances`.
+        guard.committed = true;
+        self.loading.lock().unwrap().remove(&id);
         Ok(id)
+    }
+
+    /// Load a tree-sitter grammar from a pre-packaged native dylib referenced in
+    /// the extension manifest, then register it in the shared grammar registry.
+    ///
+    /// SECURITY: Loading a native shared library executes code outside the WASM
+    /// sandbox (DLL constructors / `__attribute__((constructor))` run on load).
+    /// Callers MUST gate access behind `native_grammar_allowlist` — only
+    /// extensions explicitly trusted by the user should reach this function.
+    /// The dylib path is validated to stay within the extension directory
+    /// (defense-in-depth against path traversal), but the extension author
+    /// controls the dylib contents, so the allowlist is the primary defense.
+    fn load_grammar_from_manifest(
+        &self,
+        instance: &mut WasmInstance,
+        ext_dir: &Path,
+        config: &crate::wasm_host::manifest::GrammarConfig,
+    ) -> Result<(), String> {
+        let registry = self.grammar_registry.as_ref()
+            .ok_or_else(|| "Grammar registry not attached".to_string())?;
+
+        let dylib_rel = config.grammar_dylib.as_deref()
+            .ok_or_else(|| "grammar.grammar-dylib not set in corecode.toml".to_string())?;
+
+        let dylib_path = ext_dir.join(dylib_rel);
+
+        // Validate the resolved path stays inside ext_dir (defense in depth).
+        let canonical_dylib = std::fs::canonicalize(&dylib_path)
+            .map_err(|e| format!("Cannot resolve grammar dylib '{}': {e}", dylib_path.display()))?;
+        let canonical_ext = std::fs::canonicalize(ext_dir)
+            .map_err(|e| format!("Cannot resolve ext dir: {e}"))?;
+        if !canonical_dylib.starts_with(&canonical_ext) {
+            return Err("Grammar dylib path escapes extension directory".to_string());
+        }
+
+        // Load the pre-packaged dylib.
+        let (language, library) = crate::grammar_registry::load_from_dylib(
+            &config.language_id,
+            &canonical_dylib,
+        )?;
+
+        // Get highlights/injections/bracket-pairs from the WASM extension (safe — strings only).
+        let highlights_query = instance.highlights_query().unwrap_or_else(|e| {
+            log::warn!("[wasm-ext:{}] highlights-query failed, using empty: {e}", instance.id);
+            String::new()
+        });
+        let injections_query = instance.injections_query().unwrap_or_else(|e| {
+            log::warn!("[wasm-ext:{}] injections-query failed: {e}", instance.id);
+            None
+        });
+        let bracket_pairs_json = instance.bracket_pairs().unwrap_or_else(|e| {
+            log::warn!("[wasm-ext:{}] bracket-pairs failed, using empty: {e}", instance.id);
+            "[]".to_string()
+        });
+        let bracket_pairs: Vec<[String; 2]> = serde_json::from_str(&bracket_pairs_json)
+            .unwrap_or_else(|e| {
+                log::warn!(
+                    "[wasm-ext:{}] bracket-pairs JSON invalid, using empty: {e}",
+                    instance.id
+                );
+                Vec::new()
+            });
+
+        let grammar = crate::grammar_registry::DynamicGrammar {
+            language_id: config.language_id.clone(),
+            file_types: config.file_types.clone(),
+            language: std::sync::Arc::new(language),
+            highlights_query,
+            injections_query,
+            bracket_pairs,
+            _library: Some(library),
+        };
+
+        registry.register(grammar);
+        Ok(())
     }
 
     /// Remove an extension's language claims from the registry.
@@ -179,6 +385,7 @@ impl WasmHostManager {
     /// in the opposite order).
     pub fn deactivate_all(&self) {
         self.language_registry.lock().unwrap().clear();
+        self.panel_owners.lock().unwrap().clear();
 
         let mut map = self.instances.lock().unwrap();
         for (id, instance) in map.iter_mut() {
@@ -186,6 +393,175 @@ impl WasmHostManager {
             instance.deactivate();
         }
         map.clear();
+
+        // Signal the epoch ticker thread to exit.
+        self.epoch_ticker_shutdown.store(true, Ordering::Relaxed);
+    }
+
+    // ── Webview panel management ───────────────────────────────────────────
+    //
+    // Lock ordering: callers hold `instances` (or have a &mut WasmInstance),
+    // then this code acquires `wasm_webview_events`, then `panel_owners`.
+    // Never acquire `instances` while holding either webview lock.
+
+    /// Process buffered webview operations from a single extension instance.
+    ///
+    /// For `Open` ops, calls the extension's `get-html` export to obtain initial
+    /// HTML, then emits a "create" + "setHtml" event pair. Other ops map 1:1
+    /// to `WebviewPanelEvent`s.
+    ///
+    /// Must be called while `instances` lock is held and the instance is available.
+    fn process_webview_ops(&self, ext_id: &str, instance: &mut WasmInstance) {
+        let ops = instance.drain_webview_ops();
+        if ops.is_empty() {
+            return;
+        }
+
+        let mut events = self.wasm_webview_events.lock().unwrap();
+        let mut owners = self.panel_owners.lock().unwrap();
+
+        for op in ops {
+            match op {
+                PendingWebviewOp::Open { panel_id, title, column } => {
+                    // Get initial HTML from the extension's webview-provider export.
+                    // If the call traps (fuel/epoch), skip the panel entirely —
+                    // emitting a "create" with no content would show a blank panel.
+                    let html = if instance.has_webview_provider() {
+                        match instance.get_html(&panel_id, "") {
+                            Ok(h) => Some(h),
+                            Err(e) => {
+                                log::warn!(
+                                    "[wasm-ext:{ext_id}] get-html for panel '{panel_id}' \
+                                     failed — skipping panel creation: {e}"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Register ownership only after successful get-html
+                    owners.insert(panel_id.clone(), ext_id.to_string());
+
+                    // Emit "create" event
+                    events.push(WebviewPanelEvent {
+                        kind: "create".to_string(),
+                        panel_id: panel_id.clone(),
+                        title: Some(title),
+                        view_type: Some(format!("wasm.{ext_id}")),
+                        column: Some(column),
+                        enable_scripts: Some(true),
+                        html: None,
+                        message: None,
+                    });
+
+                    // Emit "setHtml" if we got initial content
+                    if let Some(h) = html {
+                        events.push(WebviewPanelEvent {
+                            kind: "setHtml".to_string(),
+                            panel_id,
+                            title: None,
+                            view_type: None,
+                            column: None,
+                            enable_scripts: None,
+                            html: Some(h),
+                            message: None,
+                        });
+                    }
+                }
+                PendingWebviewOp::SetHtml { panel_id, html } => {
+                    events.push(WebviewPanelEvent {
+                        kind: "setHtml".to_string(),
+                        panel_id,
+                        title: None,
+                        view_type: None,
+                        column: None,
+                        enable_scripts: None,
+                        html: Some(html),
+                        message: None,
+                    });
+                }
+                PendingWebviewOp::PostMessage { panel_id, message } => {
+                    events.push(WebviewPanelEvent {
+                        kind: "postMessage".to_string(),
+                        panel_id,
+                        title: None,
+                        view_type: None,
+                        column: None,
+                        enable_scripts: None,
+                        html: None,
+                        message: Some(serde_json::Value::String(message)),
+                    });
+                }
+                PendingWebviewOp::Close { panel_id } => {
+                    owners.remove(&panel_id);
+                    events.push(WebviewPanelEvent {
+                        kind: "close".to_string(),
+                        panel_id,
+                        title: None,
+                        view_type: None,
+                        column: None,
+                        enable_scripts: None,
+                        html: None,
+                        message: None,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Drain buffered webview events from WASM extensions.
+    ///
+    /// The frontend polls this alongside `ipc_bridge::drain_webview_events` and
+    /// merges both sources — it is agnostic to whether events came from Node.js
+    /// or WASM extensions.
+    pub fn drain_webview_events(&self) -> Vec<WebviewPanelEvent> {
+        let mut events = self.wasm_webview_events.lock().unwrap();
+        std::mem::take(&mut *events)
+    }
+
+    /// Route a message from the frontend webview back to the owning WASM extension.
+    ///
+    /// Returns `Err` if the panel is not owned by any WASM extension.
+    pub fn route_webview_message(&self, panel_id: &str, message: &str) -> Result<(), String> {
+        let ext_id = {
+            let owners = self.panel_owners.lock().unwrap();
+            owners.get(panel_id).cloned()
+                .ok_or_else(|| format!("No WASM extension owns panel '{panel_id}'"))?
+        };
+
+        let mut instances = self.instances.lock().unwrap();
+        let instance = instances.get_mut(&ext_id)
+            .ok_or_else(|| format!("Extension '{ext_id}' not loaded"))?;
+
+        instance.webview_on_message(panel_id, message)?;
+
+        // Process any ops the on-message handler may have buffered
+        let ext_id_clone = ext_id.clone();
+        self.process_webview_ops(&ext_id_clone, instance);
+        Ok(())
+    }
+
+    /// Notify the owning WASM extension that a webview panel was closed by the user.
+    ///
+    /// Removes ownership tracking. Returns `Err` if the panel is not owned by
+    /// any WASM extension (the caller can silently ignore this for Node.js panels).
+    pub fn route_webview_close(&self, panel_id: &str) -> Result<(), String> {
+        let ext_id = {
+            let mut owners = self.panel_owners.lock().unwrap();
+            owners.remove(panel_id)
+                .ok_or_else(|| format!("No WASM extension owns panel '{panel_id}'"))?
+        };
+
+        let mut instances = self.instances.lock().unwrap();
+        if let Some(instance) = instances.get_mut(&ext_id) {
+            if let Err(e) = instance.webview_on_close(panel_id) {
+                log::warn!("[wasm-ext:{ext_id}] on-close for panel '{panel_id}' failed: {e}");
+            }
+            self.process_webview_ops(&ext_id, instance);
+        }
+        Ok(())
     }
 
     /// Notify all active WASM extensions that a workspace folder was opened.
@@ -655,6 +1031,54 @@ mod tests {
         assert_eq!(providers.len(), 2);
         assert!(providers.contains(&"ext.a".to_string()));
         assert!(providers.contains(&"ext.b".to_string()));
+    }
+
+    #[test]
+    fn drain_webview_events_empty_initially() {
+        let mgr = make_manager();
+        assert!(mgr.drain_webview_events().is_empty());
+    }
+
+    #[test]
+    fn route_message_to_unknown_panel_returns_err() {
+        let mgr = make_manager();
+        let result = mgr.route_webview_message("nonexistent", "{}");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No WASM extension owns panel"));
+    }
+
+    #[test]
+    fn route_close_to_unknown_panel_returns_err() {
+        let mgr = make_manager();
+        let result = mgr.route_webview_close("nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn panel_owners_cleared_on_deactivate_all() {
+        let mgr = make_manager();
+        mgr.panel_owners.lock().unwrap().insert("test-panel".to_string(), "test.ext".to_string());
+        mgr.deactivate_all();
+        assert!(mgr.panel_owners.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_grammar_allowlist_empty_by_default() {
+        let mgr = make_manager();
+        assert!(mgr.native_grammar_allowlist.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_native_grammar_allowlist_stores_ids() {
+        let mgr = make_manager();
+        let mut ids = HashSet::new();
+        ids.insert("trusted.grammar-ext".to_string());
+        ids.insert("another.grammar-ext".to_string());
+        mgr.set_native_grammar_allowlist(ids);
+        let stored = mgr.native_grammar_allowlist.lock().unwrap();
+        assert_eq!(stored.len(), 2);
+        assert!(stored.contains("trusted.grammar-ext"));
+        assert!(stored.contains("another.grammar-ext"));
     }
 
     #[test]

@@ -19,6 +19,10 @@ const MAX_WASM_SIZE: u64 = 50 * 1024 * 1024;
 /// When exhausted, wasmtime traps with "all fuel consumed", preventing infinite loops.
 const FUEL_PER_CALL: u64 = 1_000_000_000;
 
+/// Epoch deadline in ticks. The epoch ticker thread increments once per second,
+/// so 30 ticks ≈ 30 seconds wall-clock timeout per call as defense-in-depth.
+const EPOCH_DEADLINE_TICKS: u64 = 30;
+
 /// State stored inside each `wasmtime::Store`.
 pub(super) struct InstanceState {
     wasi: WasiCtx,
@@ -53,6 +57,17 @@ pub struct WasmInstance {
     code_actions_fn: Option<Func>,
     workspace_symbols_fn: Option<Func>,
     folding_ranges_fn: Option<Func>,
+    // Optional grammar-provider exports — None if not exported by the extension.
+    // NOTE: grammar-wasm was intentionally removed — native dylibs are loaded
+    // from pre-packaged files referenced in corecode.toml, not from bytes
+    // returned by WASM code, to prevent sandbox escapes.
+    highlights_query_fn: Option<Func>,
+    injections_query_fn: Option<Func>,
+    bracket_pairs_fn: Option<Func>,
+    // Optional webview-provider exports.
+    get_html_fn: Option<Func>,
+    on_message_fn: Option<Func>,
+    on_close_fn: Option<Func>,
 }
 
 impl WasmInstance {
@@ -85,8 +100,14 @@ impl WasmInstance {
         // Minimal WASI context — no filesystem, no networking, no env vars.
         let wasi = WasiCtxBuilder::new().build();
         let table = ResourceTable::new();
-        let state = InstanceState { wasi, table, host_ctx };
+        let state = InstanceState {
+            wasi,
+            table,
+            host_ctx,
+        };
         let mut store = Store::new(engine, state);
+        // Set epoch deadline so the store traps after ~30 seconds wall-clock time.
+        store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
 
         // Build the component linker.
         let mut linker: Linker<InstanceState> = Linker::new(engine);
@@ -115,11 +136,7 @@ impl WasmInstance {
                 "show-message",
                 |mut cx: wasmtime::StoreContextMut<'_, InstanceState>,
                  (level, message): (String, String)| {
-                    super::api_impl::host_show_message(
-                        &mut cx.data_mut().host_ctx,
-                        level,
-                        message,
-                    );
+                    super::api_impl::host_show_message(&mut cx.data_mut().host_ctx, level, message);
                     Ok(())
                 },
             )
@@ -159,8 +176,7 @@ impl WasmInstance {
             ws.func_wrap(
                 "read-file",
                 |mut cx: wasmtime::StoreContextMut<'_, InstanceState>, (path,): (String,)| {
-                    let result =
-                        super::api_impl::host_read_file(&mut cx.data_mut().host_ctx, path);
+                    let result = super::api_impl::host_read_file(&mut cx.data_mut().host_ctx, path);
                     Ok((result,))
                 },
             )
@@ -179,12 +195,68 @@ impl WasmInstance {
             ws.func_wrap(
                 "get-config",
                 |mut cx: wasmtime::StoreContextMut<'_, InstanceState>, (key,): (String,)| {
-                    let val =
-                        super::api_impl::host_get_config(&mut cx.data_mut().host_ctx, key);
+                    let val = super::api_impl::host_get_config(&mut cx.data_mut().host_ctx, key);
                     Ok((val,))
                 },
             )
             .map_err(|e| format!("Failed to link workspace::get-config: {e}"))?;
+        }
+
+        // Link corecode:extension/webview imports.
+        {
+            let mut wv = linker
+                .instance("corecode:extension/webview")
+                .map_err(|e| format!("Failed to define webview instance: {e}"))?;
+
+            wv.func_wrap(
+                "open-panel",
+                |mut cx: wasmtime::StoreContextMut<'_, InstanceState>,
+                 (panel_id, title, column): (String, String, u32)| {
+                    let result = super::api_impl::host_open_panel(
+                        &mut cx.data_mut().host_ctx,
+                        panel_id,
+                        title,
+                        column,
+                    );
+                    Ok((result,))
+                },
+            )
+            .map_err(|e| format!("Failed to link webview::open-panel: {e}"))?;
+
+            wv.func_wrap(
+                "set-html",
+                |mut cx: wasmtime::StoreContextMut<'_, InstanceState>,
+                 (panel_id, html): (String, String)| {
+                    let result =
+                        super::api_impl::host_set_html(&mut cx.data_mut().host_ctx, panel_id, html);
+                    Ok((result,))
+                },
+            )
+            .map_err(|e| format!("Failed to link webview::set-html: {e}"))?;
+
+            wv.func_wrap(
+                "post-message",
+                |mut cx: wasmtime::StoreContextMut<'_, InstanceState>,
+                 (panel_id, message): (String, String)| {
+                    let result = super::api_impl::host_post_to_webview(
+                        &mut cx.data_mut().host_ctx,
+                        panel_id,
+                        message,
+                    );
+                    Ok((result,))
+                },
+            )
+            .map_err(|e| format!("Failed to link webview::post-message: {e}"))?;
+
+            wv.func_wrap(
+                "close-panel",
+                |mut cx: wasmtime::StoreContextMut<'_, InstanceState>, (panel_id,): (String,)| {
+                    let result =
+                        super::api_impl::host_close_panel(&mut cx.data_mut().host_ctx, panel_id);
+                    Ok((result,))
+                },
+            )
+            .map_err(|e| format!("Failed to link webview::close-panel: {e}"))?;
         }
 
         // Instantiate the component.
@@ -227,9 +299,58 @@ impl WasmInstance {
         let workspace_symbols_fn = lp("workspace-symbols");
         let folding_ranges_fn = lp("folding-ranges");
 
-        if completions_fn.is_some() || diagnostics_fn.is_some() || hover_fn.is_some() {
+        if completions_fn.is_some()
+            || hover_fn.is_some()
+            || diagnostics_fn.is_some()
+            || format_document_fn.is_some()
+            || format_range_fn.is_some()
+            || definition_fn.is_some()
+            || references_fn.is_some()
+            || rename_fn.is_some()
+            || code_actions_fn.is_some()
+            || workspace_symbols_fn.is_some()
+            || folding_ranges_fn.is_some()
+        {
             log::info!(
                 "WASM ext '{}': language-provider exports detected",
+                manifest.extension.id,
+            );
+        }
+
+        // Retrieve optional grammar-provider exports.
+        let mut gp = |name: &str| -> Option<Func> {
+            instance.get_func(
+                &mut store,
+                &format!("corecode:extension/grammar-provider#{name}"),
+            )
+        };
+
+        let highlights_query_fn = gp("highlights-query");
+        let injections_query_fn = gp("injections-query");
+        let bracket_pairs_fn = gp("bracket-pairs");
+
+        if highlights_query_fn.is_some() {
+            log::info!(
+                "WASM ext '{}': grammar-provider exports detected",
+                manifest.extension.id,
+            );
+        }
+
+        // Retrieve optional webview-provider exports.
+        let mut wp = |name: &str| -> Option<Func> {
+            instance.get_func(
+                &mut store,
+                &format!("corecode:extension/webview-provider#{name}"),
+            )
+        };
+
+        let get_html_fn = wp("get-html");
+        let on_message_fn = wp("on-message");
+        let on_close_fn = wp("on-close");
+
+        if get_html_fn.is_some() {
+            log::info!(
+                "WASM ext '{}': webview-provider exports detected",
                 manifest.extension.id,
             );
         }
@@ -250,6 +371,12 @@ impl WasmInstance {
             code_actions_fn,
             workspace_symbols_fn,
             folding_ranges_fn,
+            highlights_query_fn,
+            injections_query_fn,
+            bracket_pairs_fn,
+            get_html_fn,
+            on_message_fn,
+            on_close_fn,
         })
     }
 
@@ -258,6 +385,7 @@ impl WasmInstance {
         self.store
             .set_fuel(FUEL_PER_CALL)
             .map_err(|e| format!("activate: set_fuel failed: {e}"))?;
+        self.store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
 
         let mut results = vec![Val::Bool(false)];
         self.activate_fn
@@ -287,6 +415,7 @@ impl WasmInstance {
         if let Err(e) = self.store.set_fuel(FUEL_PER_CALL) {
             log::warn!("[wasm-ext:{}] deactivate: set_fuel failed: {e}", self.id);
         }
+        self.store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
         if let Err(e) = self.deactivate_fn.call(&mut self.store, &[], &mut []) {
             log::warn!("[wasm-ext:{}] deactivate trap: {e}", self.id);
         }
@@ -302,24 +431,30 @@ impl WasmInstance {
 
     /// Read and drain the buffered output lines from this extension's context.
     pub fn drain_output_lines(&mut self) -> Vec<(String, String)> {
-        self.store
-            .data_mut()
-            .host_ctx
-            .output_lines
-            .lock()
-            .map(|mut v| std::mem::take(&mut *v))
-            .unwrap_or_default()
+        match self.store.data_mut().host_ctx.output_lines.lock() {
+            Ok(mut v) => std::mem::take(&mut *v),
+            Err(e) => {
+                log::error!(
+                    "drain_output_lines: mutex poisoned for ext '{}', recovering: {e}",
+                    self.id,
+                );
+                std::mem::take(&mut *e.into_inner())
+            }
+        }
     }
 
     /// Read and drain buffered notification toasts from this extension.
     pub fn drain_notifications(&mut self) -> Vec<(String, String)> {
-        self.store
-            .data_mut()
-            .host_ctx
-            .notifications
-            .lock()
-            .map(|mut v| std::mem::take(&mut *v))
-            .unwrap_or_default()
+        match self.store.data_mut().host_ctx.notifications.lock() {
+            Ok(mut v) => std::mem::take(&mut *v),
+            Err(e) => {
+                log::error!(
+                    "drain_notifications: mutex poisoned for ext '{}', recovering: {e}",
+                    self.id,
+                );
+                std::mem::take(&mut *e.into_inner())
+            }
+        }
     }
 
     /// Read the current status bar items (not drained — items persist until removed).
@@ -367,6 +502,8 @@ impl WasmInstance {
         self.store
             .set_fuel(FUEL_PER_CALL)
             .map_err(|e| format!("{name}: set_fuel failed: {e}"))?;
+        // Reset wall-clock deadline for this call.
+        self.store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
         func.call(&mut self.store, args, results)
             .map_err(|e| format!("{name} trap: {e}"))?;
         Ok(())
@@ -432,11 +569,7 @@ impl WasmInstance {
     }
 
     /// Call language-provider#diagnostics if exported.
-    pub fn diagnostics(
-        &mut self,
-        uri: &str,
-        content: &str,
-    ) -> Result<Vec<Diagnostic>, String> {
+    pub fn diagnostics(&mut self, uri: &str, content: &str) -> Result<Vec<Diagnostic>, String> {
         let func = match &self.diagnostics_fn {
             Some(f) => f.clone(),
             None => return Ok(vec![]),
@@ -444,7 +577,10 @@ impl WasmInstance {
         let mut results = vec![Val::Bool(false)];
         self.call_export(
             &func,
-            &[Val::String(uri.to_string()), Val::String(content.to_string())],
+            &[
+                Val::String(uri.to_string()),
+                Val::String(content.to_string()),
+            ],
             &mut results,
             "diagnostics",
         )?;
@@ -454,11 +590,7 @@ impl WasmInstance {
     }
 
     /// Call language-provider#format-document if exported.
-    pub fn format_document(
-        &mut self,
-        uri: &str,
-        content: &str,
-    ) -> Result<Vec<TextEdit>, String> {
+    pub fn format_document(&mut self, uri: &str, content: &str) -> Result<Vec<TextEdit>, String> {
         let func = match &self.format_document_fn {
             Some(f) => f.clone(),
             None => return Ok(vec![]),
@@ -466,7 +598,10 @@ impl WasmInstance {
         let mut results = vec![Val::Bool(false)];
         self.call_export(
             &func,
-            &[Val::String(uri.to_string()), Val::String(content.to_string())],
+            &[
+                Val::String(uri.to_string()),
+                Val::String(content.to_string()),
+            ],
             &mut results,
             "format-document",
         )?;
@@ -542,7 +677,11 @@ impl WasmInstance {
         let mut results = vec![Val::Bool(false)];
         self.call_export(
             &func,
-            &[Val::String(uri.to_string()), pos.to_val(), Val::Bool(include_decl)],
+            &[
+                Val::String(uri.to_string()),
+                pos.to_val(),
+                Val::Bool(include_decl),
+            ],
             &mut results,
             "references",
         )?;
@@ -609,10 +748,7 @@ impl WasmInstance {
     }
 
     /// Call language-provider#workspace-symbols if exported.
-    pub fn workspace_symbols(
-        &mut self,
-        query: &str,
-    ) -> Result<Vec<Symbol>, String> {
+    pub fn workspace_symbols(&mut self, query: &str) -> Result<Vec<Symbol>, String> {
         let func = match &self.workspace_symbols_fn {
             Some(f) => f.clone(),
             None => return Ok(vec![]),
@@ -642,12 +778,139 @@ impl WasmInstance {
         let mut results = vec![Val::Bool(false)];
         self.call_export(
             &func,
-            &[Val::String(uri.to_string()), Val::String(content.to_string())],
+            &[
+                Val::String(uri.to_string()),
+                Val::String(content.to_string()),
+            ],
             &mut results,
             "folding-ranges",
         )?;
         let outcome = wit_types::unwrap_result_list(&results[0], FoldingRange::from_val);
         self.post_return_export(&func, "folding-ranges")?;
         outcome
+    }
+
+    // ── Grammar provider dispatch methods ──────────────────────────────────
+
+    /// Whether this extension exports any grammar-provider functions.
+    pub fn has_grammar_provider(&self) -> bool {
+        self.highlights_query_fn.is_some()
+            || self.injections_query_fn.is_some()
+            || self.bracket_pairs_fn.is_some()
+    }
+
+    /// Call grammar-provider#highlights-query if exported.
+    pub fn highlights_query(&mut self) -> Result<String, String> {
+        let func = match &self.highlights_query_fn {
+            Some(f) => f.clone(),
+            None => return Ok(String::new()),
+        };
+        let mut results = vec![Val::Bool(false)];
+        self.call_export(&func, &[], &mut results, "highlights-query")?;
+        let outcome = match &results[0] {
+            Val::String(s) => Ok(s.to_string()),
+            other => Err(format!("highlights-query: unexpected return: {other:?}")),
+        };
+        self.post_return_export(&func, "highlights-query")?;
+        outcome
+    }
+
+    /// Call grammar-provider#injections-query if exported.
+    pub fn injections_query(&mut self) -> Result<Option<String>, String> {
+        let func = match &self.injections_query_fn {
+            Some(f) => f.clone(),
+            None => return Ok(None),
+        };
+        let mut results = vec![Val::Bool(false)];
+        self.call_export(&func, &[], &mut results, "injections-query")?;
+        let outcome = match &results[0] {
+            Val::Option(Some(boxed)) => match boxed.as_ref() {
+                Val::String(s) => Ok(Some(s.to_string())),
+                other => Err(format!("injections-query: unexpected inner: {other:?}")),
+            },
+            Val::Option(None) => Ok(None),
+            other => Err(format!("injections-query: unexpected return: {other:?}")),
+        };
+        self.post_return_export(&func, "injections-query")?;
+        outcome
+    }
+
+    /// Call grammar-provider#bracket-pairs if exported.
+    pub fn bracket_pairs(&mut self) -> Result<String, String> {
+        let func = match &self.bracket_pairs_fn {
+            Some(f) => f.clone(),
+            None => return Ok("[]".to_string()),
+        };
+        let mut results = vec![Val::Bool(false)];
+        self.call_export(&func, &[], &mut results, "bracket-pairs")?;
+        let outcome = match &results[0] {
+            Val::String(s) => Ok(s.to_string()),
+            other => Err(format!("bracket-pairs: unexpected return: {other:?}")),
+        };
+        self.post_return_export(&func, "bracket-pairs")?;
+        outcome
+    }
+
+    // ── Webview provider dispatch methods ──────────────────────────────────────
+
+    pub fn has_webview_provider(&self) -> bool {
+        self.get_html_fn.is_some()
+    }
+
+    /// Call webview-provider#get-html if exported.
+    pub fn get_html(&mut self, panel_id: &str, state: &str) -> Result<String, String> {
+        let func = match &self.get_html_fn {
+            Some(f) => f.clone(),
+            None => return Ok(String::new()),
+        };
+        let mut results = vec![Val::Bool(false)];
+        self.call_export(
+            &func,
+            &[Val::String(panel_id.into()), Val::String(state.into())],
+            &mut results,
+            "get-html",
+        )?;
+        let outcome = match &results[0] {
+            Val::String(s) => Ok(s.to_string()),
+            other => Err(format!("get-html: unexpected return: {other:?}")),
+        };
+        self.post_return_export(&func, "get-html")?;
+        outcome
+    }
+
+    /// Call webview-provider#on-message if exported.
+    pub fn webview_on_message(&mut self, panel_id: &str, message: &str) -> Result<(), String> {
+        let func = match &self.on_message_fn {
+            Some(f) => f.clone(),
+            None => return Ok(()),
+        };
+        self.call_export(
+            &func,
+            &[Val::String(panel_id.into()), Val::String(message.into())],
+            &mut [],
+            "on-message",
+        )?;
+        self.post_return_export(&func, "on-message")
+    }
+
+    /// Call webview-provider#on-close if exported.
+    pub fn webview_on_close(&mut self, panel_id: &str) -> Result<(), String> {
+        let func = match &self.on_close_fn {
+            Some(f) => f.clone(),
+            None => return Ok(()),
+        };
+        self.call_export(&func, &[Val::String(panel_id.into())], &mut [], "on-close")?;
+        self.post_return_export(&func, "on-close")
+    }
+
+    /// Drain any buffered webview operations from this instance's HostContext.
+    pub fn drain_webview_ops(&mut self) -> Vec<super::api_impl::PendingWebviewOp> {
+        self.store
+            .data_mut()
+            .host_ctx
+            .webview_ops
+            .lock()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default()
     }
 }

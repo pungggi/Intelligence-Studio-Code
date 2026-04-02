@@ -9,7 +9,7 @@
  */
 
 import { readFileSync, readdirSync, existsSync, realpathSync } from "fs";
-import { join, resolve, relative, isAbsolute } from "path";
+import { join, resolve, relative, isAbsolute, sep } from "path";
 import { VscodeApiShim } from "./vscode-api-shim.js";
 import { LanguageClient } from "./language-client.js";
 
@@ -163,8 +163,9 @@ export class ExtensionLoader {
       ? realpathSync(mainPathJs)
       : mainPath;
 
-    // Check for path traversal: resolved main must be inside extension dir
-    const rel = relative(realExtPath, resolvedMain);
+    // Check for path traversal: resolved main must be inside extension dir.
+    // Normalize separators so ".." check works on Windows (where relative() returns backslashes).
+    const rel = relative(realExtPath, resolvedMain).split(sep).join("/");
     if (rel.startsWith("..") || isAbsolute(rel)) {
       throw new Error(
         `[ExtLoader] ${extensionId}: main entry '${ext.manifest.main}' escapes extension directory`
@@ -284,7 +285,11 @@ export class ExtensionLoader {
       // Dispose all subscriptions registered by the extension
       if (ext.context) {
         for (const sub of ext.context.subscriptions) {
-          try { sub.dispose(); } catch { /* ignore */ }
+          try {
+            sub.dispose();
+          } catch (err) {
+            console.warn(`[ExtLoader] Error disposing subscription in ${id}:`, err);
+          }
         }
       }
       ext.isActive = false;
@@ -355,7 +360,11 @@ export class ExtensionLoader {
     // Dispose all subscriptions registered by the extension
     if (ext.context) {
       for (const sub of ext.context.subscriptions) {
-        try { sub.dispose(); } catch { /* ignore */ }
+        try {
+          sub.dispose();
+        } catch (err) {
+          console.warn(`[ExtLoader] Error disposing subscription in ${extensionId}:`, err);
+        }
       }
     }
 
@@ -369,6 +378,12 @@ export class ExtensionLoader {
   /**
    * Validates an extension manifest for required fields and correct data types.
    * Throws if critical fields are missing.
+   *
+   * Note: this method also **sanitizes** the manifest in-place:
+   * - `manifest.activationEvents` is replaced with a filtered array (non-string entries dropped),
+   *   or reset to `[]` if it is not an array.
+   * - `manifest.contributes.commands` is replaced with a filtered array (entries missing a string
+   *   `command` or `title` are dropped), or reset to `[]` if it is not an array.
    */
   private validateExtensionManifest(id: string, manifest: ExtensionManifest): void {
     if (!manifest.name || typeof manifest.name !== "string") {

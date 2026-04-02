@@ -78,25 +78,38 @@ impl WebviewRegistry {
         title: &str,
         html: String,
     ) -> Result<(), String> {
-        if self.panels.lock().unwrap().contains_key(panel_id) {
-            return Err(format!("Panel '{}' already open", panel_id));
+        // Hold the lock for the entire check-and-insert to prevent TOCTOU races.
+        let label = format!("ext-panel-{}", sanitise_label(panel_id));
+        {
+            let mut panels = self.panels.lock().unwrap();
+            if panels.contains_key(panel_id) {
+                return Err(format!("Panel '{}' already open", panel_id));
+            }
+            // Reserve the slot before expensive window creation.
+            panels.insert(panel_id.to_string(), label.clone());
         }
 
-        let label = format!("ext-panel-{}", sanitise_label(panel_id));
-        let injected_html = inject_bridge(&html, panel_id);
+        // Generate a per-load nonce for CSP
+        let nonce = generate_nonce();
+        let injected_html = inject_bridge(&html, panel_id, &nonce);
 
-        WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::Html(injected_html))
+        let build_result = WebviewWindowBuilder::new(
+                app, &label, tauri::WebviewUrl::Html(injected_html),
+            )
             .title(title)
             .inner_size(800.0, 600.0)
-            // CSP: Set in tauri.conf.json under app.security.csp for this window,
-            // or use .initialization_script() to inject a meta CSP tag.
-            // Recommended: "default-src 'none'; script-src 'nonce-<random>'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'"
-            // See: https://tauri.app/v2/reference/webviewwindow-builder/
-            .build()
-            .map_err(|e| format!("Cannot create webview: {e}"))?;
+            .initialization_script(&format!(
+                "<meta http-equiv=\"Content-Security-Policy\" \
+                 content=\"default-src 'none'; script-src 'nonce-{nonce}' 'self'; \
+                 style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'\">"
+            ))
+            .build();
 
-        self.panels.lock().unwrap()
-            .insert(panel_id.to_string(), label);
+        if let Err(e) = build_result {
+            // Rollback reservation on failure.
+            self.panels.lock().unwrap().remove(panel_id);
+            return Err(format!("Cannot create webview: {e}"));
+        }
 
         Ok(())
     }
@@ -156,7 +169,7 @@ fn inject_bridge(html: &str, panel_id: &str) -> String {
     );
 
     // Insert just before </head> if present, otherwise prepend.
-    if let Some(pos) = html.to_ascii_lowercase().find("</head>") {
+    if let Some(pos) = html.to_lowercase().find("</head>") {
         let mut result = html.to_string();
         result.insert_str(pos, &injection);
         result
@@ -166,11 +179,17 @@ fn inject_bridge(html: &str, panel_id: &str) -> String {
 }
 
 /// Produce a Tauri-safe window label from a panel-id.
-/// Labels must be alphanumeric + hyphens.
+/// Labels must be alphanumeric + hyphens. A short hash suffix ensures
+/// different panel_ids that sanitise to the same string remain unique.
 fn sanitise_label(panel_id: &str) -> String {
-    panel_id.chars()
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let sanitised: String = panel_id.chars()
         .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
-        .collect()
+        .collect();
+    let mut hasher = DefaultHasher::new();
+    panel_id.hash(&mut hasher);
+    format!("{}-{:08x}", sanitised, hasher.finish() as u32)
 }
 ```
 
@@ -309,7 +328,44 @@ pub fn host_open_panel(
 Update `HostContext` to include:
 
 ```rust
-pub pending_panel_opens: Vec<(String, String)>,  // (panel_id, title)
+pub pending_panel_opens: Vec<(String, String)>,        // (panel_id, title)
+pub pending_post_messages: Vec<(String, String)>,      // (panel_id, message)
+pub pending_panel_closes: Vec<String>,                  // panel_id
+```
+
+Implement the two remaining imports following the same pattern:
+
+```rust
+// webview_host::post_to_webview
+pub fn host_post_to_webview(
+    ctx: &mut HostContext,
+    panel_id: String,
+    message: String,
+) -> Result<(), String> {
+    if !panel_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '.') {
+        return Err(format!("Invalid panel_id: '{panel_id}'"));
+    }
+    if panel_id.len() > 64 {
+        return Err(format!("panel_id too long (max 64 chars): '{panel_id}'"));
+    }
+    ctx.pending_post_messages.push((panel_id, message));
+    Ok(())
+}
+
+// webview_host::close_panel
+pub fn host_close_panel(
+    ctx: &mut HostContext,
+    panel_id: String,
+) -> Result<(), String> {
+    if !panel_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '.') {
+        return Err(format!("Invalid panel_id: '{panel_id}'"));
+    }
+    if panel_id.len() > 64 {
+        return Err(format!("panel_id too long (max 64 chars): '{panel_id}'"));
+    }
+    ctx.pending_panel_closes.push(panel_id);
+    Ok(())
+}
 ```
 
 > **Design note:** After the WASM activate() call returns, `manager.rs` processes
@@ -514,7 +570,9 @@ document.getElementById('dec').addEventListener('click', async () => {
 - [ ] `webview_message` command validates `panel_id` before any store access
 - [ ] `inject_bridge` does not trust extension HTML for script injection; only inserts before `</head>`
 - [ ] Sidecar asset serving (if used) applies the existing path traversal guard from `extension_mgr.rs`
-- [ ] Webview cannot call arbitrary Tauri commands — only `webview_message` is exposed
+- [ ] Webview cannot call arbitrary Tauri commands — only `webview_message` is exposed;
+      enforced via a custom invoke handler that checks `webview.label()` against registered
+      extension panels and rejects commands other than `webview_message`
 
 ---
 

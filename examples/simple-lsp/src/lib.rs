@@ -1,8 +1,8 @@
 //! Simple LSP — minimal CoreCode WASM extension demonstrating the language-provider API.
 //!
 //! Claims the "plaintext" language and returns:
-//! - One hard-coded completion item ("hello")
-//! - One diagnostic for any line containing "TODO"
+//! - Two hard-coded completion items ("hello" and "world")
+//! - One diagnostic for each occurrence of "TODO" in a line
 //! - A hover result showing "Plain text file"
 //!
 //! Build:
@@ -73,11 +73,12 @@ impl exports::corecode::extension::language_provider::Guest for SimpleLsp {
         use exports::corecode::extension::language_provider::{Diagnostic, Position, Range, Severity};
         let mut diags = Vec::new();
         for (line_idx, line) in content.lines().enumerate() {
-            if let Some(col) = line.find("TODO") {
+            if let Some(byte_col) = line.find("TODO") {
+                let char_col = line[..byte_col].chars().count() as u32;
                 diags.push(Diagnostic {
                     range: Range {
-                        start: Position { line: line_idx as u32, character: col as u32 },
-                        end: Position { line: line_idx as u32, character: (col + 4) as u32 },
+                        start: Position { line: line_idx as u32, character: char_col },
+                        end: Position { line: line_idx as u32, character: char_col + 4 },
                     },
                     severity: Severity::Warning,
                     message: "TODO found — consider resolving this item.".to_string(),

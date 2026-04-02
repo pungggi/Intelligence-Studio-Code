@@ -11,6 +11,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
+        "label": "main",
         "title": "CoreCode",
         "width": 1280,
         "height": 800,
@@ -21,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'"
     }
   },
   "bundle": {
@@ -31,7 +32,7 @@
   },
   "plugins": {
     "shell": {
-      "open": true
+      "open": false
     }
   }
 }

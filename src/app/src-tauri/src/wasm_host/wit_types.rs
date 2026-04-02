@@ -9,19 +9,19 @@ use wasmtime::component::Val;
 
 // ── Primitive types ───────────���──────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Position {
     pub line: u32,
     pub character: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Range {
     pub start: Position,
     pub end: Position,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Location {
     pub uri: String,
     pub range: Range,
@@ -29,7 +29,7 @@ pub struct Location {
 
 // ── Severity enum ──────────────���─────────────────────────��───────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Error,
@@ -40,7 +40,7 @@ pub enum Severity {
 
 // ── Diagnostic ────────────────────────────────────���──────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub range: Range,
     pub severity: Severity,
@@ -51,15 +51,31 @@ pub struct Diagnostic {
 
 // ── Completion ───────────��───────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CompletionKind {
-    Text, Method, Function, Constructor, Field, Variable,
-    Class, Interface, Module, Property, Unit, Value, EnumMember,
-    Keyword, Snippet, Color, File, Reference, Folder,
+    Text,
+    Method,
+    Function,
+    Constructor,
+    Field,
+    Variable,
+    Class,
+    Interface,
+    Module,
+    Property,
+    Unit,
+    Value,
+    EnumMember,
+    Keyword,
+    Snippet,
+    Color,
+    File,
+    Reference,
+    Folder,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionItem {
     pub label: String,
     pub kind: Option<CompletionKind>,
@@ -71,7 +87,7 @@ pub struct CompletionItem {
 
 // ── Hover ────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HoverResult {
     pub contents: String,
     pub range: Option<Range>,
@@ -79,7 +95,7 @@ pub struct HoverResult {
 
 // ── Text edit ──────────���───────────────────────────────���─────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextEdit {
     pub range: Range,
     pub new_text: String,
@@ -87,7 +103,7 @@ pub struct TextEdit {
 
 // ── Code action ──────────���───────────────────────────���───────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeAction {
     pub title: String,
     pub kind: Option<String>,
@@ -96,16 +112,38 @@ pub struct CodeAction {
 
 // ── Symbol ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SymbolKind {
-    File, Module, Namespace, Package, Class, Method, Property,
-    Field, Constructor, Enum, Interface, Function, Variable,
-    Constant, String, Number, Boolean, Array, Object, Key, Null,
-    EnumMember, Struct, Event, Operator, TypeParameter,
+    File,
+    Module,
+    Namespace,
+    Package,
+    Class,
+    Method,
+    Property,
+    Field,
+    Constructor,
+    Enum,
+    Interface,
+    Function,
+    Variable,
+    Constant,
+    String,
+    Number,
+    Boolean,
+    Array,
+    Object,
+    Key,
+    Null,
+    EnumMember,
+    Struct,
+    Event,
+    Operator,
+    TypeParameter,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Symbol {
     pub name: String,
     pub kind: SymbolKind,
@@ -115,7 +153,7 @@ pub struct Symbol {
 
 // ── Folding range ───────────────────────��────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FoldingRange {
     pub start_line: u32,
     pub end_line: u32,
@@ -126,7 +164,8 @@ pub struct FoldingRange {
 
 /// Extract a string field from a WIT record Val.
 fn get_str(record: &[(String, Val)], name: &str) -> String {
-    record.iter()
+    record
+        .iter()
         .find(|(k, _)| k == name)
         .and_then(|(_, v)| match v {
             Val::String(s) => Some(s.to_string()),
@@ -137,7 +176,8 @@ fn get_str(record: &[(String, Val)], name: &str) -> String {
 
 /// Extract an optional string field from a WIT record Val.
 fn get_opt_str(record: &[(String, Val)], name: &str) -> Option<String> {
-    record.iter()
+    record
+        .iter()
         .find(|(k, _)| k == name)
         .and_then(|(_, v)| match v {
             Val::Option(opt) => match opt.as_deref() {
@@ -151,7 +191,8 @@ fn get_opt_str(record: &[(String, Val)], name: &str) -> Option<String> {
 
 /// Extract a u32 field from a WIT record Val.
 fn get_u32(record: &[(String, Val)], name: &str) -> u32 {
-    record.iter()
+    record
+        .iter()
         .find(|(k, _)| k == name)
         .and_then(|(_, v)| match v {
             Val::U32(n) => Some(*n),
@@ -188,9 +229,13 @@ impl Position {
 impl Range {
     pub fn from_val(val: &Val) -> Option<Self> {
         let fields = as_record(val)?;
-        let start = fields.iter().find(|(k, _)| k == "start")
+        let start = fields
+            .iter()
+            .find(|(k, _)| k == "start")
             .and_then(|(_, v)| Position::from_val(v))?;
-        let end = fields.iter().find(|(k, _)| k == "end")
+        let end = fields
+            .iter()
+            .find(|(k, _)| k == "end")
             .and_then(|(_, v)| Position::from_val(v))?;
         Some(Range { start, end })
     }
@@ -207,7 +252,9 @@ impl Location {
     pub fn from_val(val: &Val) -> Option<Self> {
         let fields = as_record(val)?;
         let uri = get_str(fields, "uri");
-        let range = fields.iter().find(|(k, _)| k == "range")
+        let range = fields
+            .iter()
+            .find(|(k, _)| k == "range")
             .and_then(|(_, v)| Range::from_val(v))?;
         Some(Location { uri, range })
     }
@@ -231,9 +278,13 @@ impl Severity {
 impl Diagnostic {
     pub fn from_val(val: &Val) -> Option<Self> {
         let fields = as_record(val)?;
-        let range = fields.iter().find(|(k, _)| k == "range")
+        let range = fields
+            .iter()
+            .find(|(k, _)| k == "range")
             .and_then(|(_, v)| Range::from_val(v))?;
-        let severity = fields.iter().find(|(k, _)| k == "severity")
+        let severity = fields
+            .iter()
+            .find(|(k, _)| k == "severity")
             .map(|(_, v)| Severity::from_val(v))
             .unwrap_or(Severity::Information);
         Some(Diagnostic {
@@ -256,8 +307,18 @@ impl Diagnostic {
             ("range".to_string(), self.range.to_val()),
             ("severity".to_string(), Val::Enum(severity_name.to_string())),
             ("message".to_string(), Val::String(self.message.clone())),
-            ("source".to_string(), Val::Option(self.source.as_ref().map(|s| Box::new(Val::String(s.clone()))))),
-            ("code".to_string(), Val::Option(self.code.as_ref().map(|s| Box::new(Val::String(s.clone()))))),
+            (
+                "source".to_string(),
+                Val::Option(
+                    self.source
+                        .as_ref()
+                        .map(|s| Box::new(Val::String(s.clone()))),
+                ),
+            ),
+            (
+                "code".to_string(),
+                Val::Option(self.code.as_ref().map(|s| Box::new(Val::String(s.clone())))),
+            ),
         ])
     }
 }
@@ -295,7 +356,9 @@ impl CompletionKind {
 impl CompletionItem {
     pub fn from_val(val: &Val) -> Option<Self> {
         let fields = as_record(val)?;
-        let kind = fields.iter().find(|(k, _)| k == "kind")
+        let kind = fields
+            .iter()
+            .find(|(k, _)| k == "kind")
             .and_then(|(_, v)| match v {
                 Val::Option(Some(inner)) => Some(CompletionKind::from_val(inner)),
                 _ => None,
@@ -314,7 +377,9 @@ impl CompletionItem {
 impl HoverResult {
     pub fn from_val(val: &Val) -> Option<Self> {
         let fields = as_record(val)?;
-        let range = fields.iter().find(|(k, _)| k == "range")
+        let range = fields
+            .iter()
+            .find(|(k, _)| k == "range")
             .and_then(|(_, v)| match v {
                 Val::Option(Some(inner)) => Range::from_val(inner),
                 _ => None,
@@ -329,7 +394,9 @@ impl HoverResult {
 impl TextEdit {
     pub fn from_val(val: &Val) -> Option<Self> {
         let fields = as_record(val)?;
-        let range = fields.iter().find(|(k, _)| k == "range")
+        let range = fields
+            .iter()
+            .find(|(k, _)| k == "range")
             .and_then(|(_, v)| Range::from_val(v))?;
         Some(TextEdit {
             range,
@@ -341,7 +408,9 @@ impl TextEdit {
 impl CodeAction {
     pub fn from_val(val: &Val) -> Option<Self> {
         let fields = as_record(val)?;
-        let edits = fields.iter().find(|(k, _)| k == "edits")
+        let edits = fields
+            .iter()
+            .find(|(k, _)| k == "edits")
             .and_then(|(_, v)| match v {
                 Val::List(items) => Some(items.iter().filter_map(TextEdit::from_val).collect()),
                 _ => None,
@@ -395,10 +464,14 @@ impl SymbolKind {
 impl Symbol {
     pub fn from_val(val: &Val) -> Option<Self> {
         let fields = as_record(val)?;
-        let kind = fields.iter().find(|(k, _)| k == "kind")
+        let kind = fields
+            .iter()
+            .find(|(k, _)| k == "kind")
             .map(|(_, v)| SymbolKind::from_val(v))
             .unwrap_or(SymbolKind::Variable);
-        let location = fields.iter().find(|(k, _)| k == "location")
+        let location = fields
+            .iter()
+            .find(|(k, _)| k == "location")
             .and_then(|(_, v)| Location::from_val(v))?;
         Some(Symbol {
             name: get_str(fields, "name"),
@@ -421,13 +494,27 @@ impl FoldingRange {
 }
 
 /// Unwrap a WIT `result<list<T>, string>` Val into a Rust Result.
-/// On Ok, calls `convert` on each list element.
+/// On Ok, calls `convert` on each list element. Returns `Err` if any
+/// element fails conversion or if the inner type is not a `Val::List`.
 pub fn unwrap_result_list<T>(val: &Val, convert: fn(&Val) -> Option<T>) -> Result<Vec<T>, String> {
     match val {
-        Val::Result(Ok(Some(inner))) => match inner.as_ref() {
-            Val::List(items) => Ok(items.iter().filter_map(convert).collect()),
-            _ => Ok(vec![]),
-        },
+        Val::Result(Ok(Some(inner))) => {
+            match inner.as_ref() {
+                Val::List(items) => {
+                    let mut results = Vec::with_capacity(items.len());
+                    for (i, item) in items.iter().enumerate() {
+                        match convert(item) {
+                        Some(t) => results.push(t),
+                        None => return Err(format!("unwrap_result_list: conversion failed at index {i}, value: {item:?}")),
+                    }
+                    }
+                    Ok(results)
+                }
+                other => Err(format!(
+                    "unwrap_result_list: expected Val::List, got {other:?}"
+                )),
+            }
+        }
         Val::Result(Ok(None)) => Ok(vec![]),
         Val::Result(Err(Some(inner))) => match inner.as_ref() {
             Val::String(s) => Err(s.to_string()),
@@ -439,7 +526,10 @@ pub fn unwrap_result_list<T>(val: &Val, convert: fn(&Val) -> Option<T>) -> Resul
 }
 
 /// Unwrap a WIT `result<option<T>, string>` Val into a Rust Result.
-pub fn unwrap_result_option<T>(val: &Val, convert: fn(&Val) -> Option<T>) -> Result<Option<T>, String> {
+pub fn unwrap_result_option<T>(
+    val: &Val,
+    convert: fn(&Val) -> Option<T>,
+) -> Result<Option<T>, String> {
     match val {
         Val::Result(Ok(Some(inner))) => match inner.as_ref() {
             Val::Option(Some(item)) => Ok(convert(item)),
@@ -463,7 +553,10 @@ mod tests {
 
     #[test]
     fn position_roundtrip() {
-        let pos = Position { line: 42, character: 7 };
+        let pos = Position {
+            line: 42,
+            character: 7,
+        };
         let val = pos.to_val();
         let back = Position::from_val(&val).unwrap();
         assert_eq!(back.line, 42);
@@ -473,8 +566,14 @@ mod tests {
     #[test]
     fn range_roundtrip() {
         let r = Range {
-            start: Position { line: 1, character: 0 },
-            end: Position { line: 5, character: 10 },
+            start: Position {
+                line: 1,
+                character: 0,
+            },
+            end: Position {
+                line: 5,
+                character: 10,
+            },
         };
         let val = r.to_val();
         let back = Range::from_val(&val).unwrap();
@@ -486,8 +585,14 @@ mod tests {
     fn diagnostic_roundtrip() {
         let d = Diagnostic {
             range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 5 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 5,
+                },
             },
             severity: Severity::Warning,
             message: "test warning".to_string(),
@@ -504,20 +609,38 @@ mod tests {
 
     #[test]
     fn severity_from_val() {
-        assert!(matches!(Severity::from_val(&Val::Enum("error".to_string())), Severity::Error));
-        assert!(matches!(Severity::from_val(&Val::Enum("hint".to_string())), Severity::Hint));
+        assert!(matches!(
+            Severity::from_val(&Val::Enum("error".to_string())),
+            Severity::Error
+        ));
+        assert!(matches!(
+            Severity::from_val(&Val::Enum("hint".to_string())),
+            Severity::Hint
+        ));
         // Unknown falls back to Information
-        assert!(matches!(Severity::from_val(&Val::Enum("unknown".to_string())), Severity::Information));
+        assert!(matches!(
+            Severity::from_val(&Val::Enum("unknown".to_string())),
+            Severity::Information
+        ));
     }
 
     #[test]
     fn completion_item_from_val() {
         let val = Val::Record(vec![
             ("label".to_string(), Val::String("hello".to_string())),
-            ("kind".to_string(), Val::Option(Some(Box::new(Val::Enum("function".to_string()))))),
+            (
+                "kind".to_string(),
+                Val::Option(Some(Box::new(Val::Enum("function".to_string())))),
+            ),
             ("detail".to_string(), Val::Option(None)),
-            ("documentation".to_string(), Val::Option(Some(Box::new(Val::String("A function".to_string()))))),
-            ("insert-text".to_string(), Val::String("hello()".to_string())),
+            (
+                "documentation".to_string(),
+                Val::Option(Some(Box::new(Val::String("A function".to_string())))),
+            ),
+            (
+                "insert-text".to_string(),
+                Val::String("hello()".to_string()),
+            ),
             ("filter-text".to_string(), Val::Option(None)),
         ]);
         let item = CompletionItem::from_val(&val).unwrap();
@@ -546,6 +669,49 @@ mod tests {
     }
 
     #[test]
+    fn unwrap_result_list_ok_with_positions() {
+        let pos1 = Position {
+            line: 10,
+            character: 5,
+        };
+        let pos2 = Position {
+            line: 20,
+            character: 15,
+        };
+        let val = Val::Result(Ok(Some(Box::new(Val::List(vec![
+            pos1.to_val(),
+            pos2.to_val(),
+        ])))));
+        let result = unwrap_result_list(&val, Position::from_val).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], pos1);
+        assert_eq!(result[1], pos2);
+    }
+
+    #[test]
+    fn unwrap_result_list_conversion_failure() {
+        let val = Val::Result(Ok(Some(Box::new(Val::List(vec![Val::String(
+            "not a record".to_string(),
+        )])))));
+        let result = unwrap_result_list(&val, Position::from_val);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("index 0"), "expected index in error: {err}");
+    }
+
+    #[test]
+    fn unwrap_result_list_non_list_inner() {
+        let val = Val::Result(Ok(Some(Box::new(Val::String("unexpected".to_string())))));
+        let result = unwrap_result_list::<Position>(&val, Position::from_val);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("expected Val::List"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn unwrap_result_list_err() {
         let val = Val::Result(Err(Some(Box::new(Val::String("oops".to_string())))));
         let result = unwrap_result_list::<Position>(&val, Position::from_val);
@@ -560,12 +726,67 @@ mod tests {
     }
 
     #[test]
+    fn unwrap_result_option_some_with_hover() {
+        let hover = HoverResult {
+            contents: "type Foo = Bar".to_string(),
+            range: Some(Range {
+                start: Position {
+                    line: 1,
+                    character: 0,
+                },
+                end: Position {
+                    line: 1,
+                    character: 14,
+                },
+            }),
+        };
+        let record = Val::Record(vec![
+            (
+                "contents".to_string(),
+                Val::String("type Foo = Bar".to_string()),
+            ),
+            (
+                "range".to_string(),
+                Val::Option(Some(Box::new(
+                    Range {
+                        start: Position {
+                            line: 1,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 1,
+                            character: 14,
+                        },
+                    }
+                    .to_val(),
+                ))),
+            ),
+        ]);
+        let val = Val::Result(Ok(Some(Box::new(Val::Option(Some(Box::new(record)))))));
+        let result = unwrap_result_option(&val, HoverResult::from_val).unwrap();
+        assert!(result.is_some());
+        let hr = result.unwrap();
+        assert_eq!(hr.contents, "type Foo = Bar");
+        assert_eq!(hr.range, hover.range);
+    }
+
+    #[test]
     fn text_edit_from_val() {
         let val = Val::Record(vec![
-            ("range".to_string(), Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 3 },
-            }.to_val()),
+            (
+                "range".to_string(),
+                Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 3,
+                    },
+                }
+                .to_val(),
+            ),
             ("new-text".to_string(), Val::String("new".to_string())),
         ]);
         let edit = TextEdit::from_val(&val).unwrap();
@@ -579,7 +800,10 @@ mod tests {
         let val = Val::Record(vec![
             ("start-line".to_string(), Val::U32(10)),
             ("end-line".to_string(), Val::U32(20)),
-            ("kind".to_string(), Val::Option(Some(Box::new(Val::String("comment".to_string()))))),
+            (
+                "kind".to_string(),
+                Val::Option(Some(Box::new(Val::String("comment".to_string())))),
+            ),
         ]);
         let fr = FoldingRange::from_val(&val).unwrap();
         assert_eq!(fr.start_line, 10);
@@ -591,10 +815,20 @@ mod tests {
     fn location_from_val() {
         let val = Val::Record(vec![
             ("uri".to_string(), Val::String("file:///foo.rs".to_string())),
-            ("range".to_string(), Range {
-                start: Position { line: 1, character: 2 },
-                end: Position { line: 3, character: 4 },
-            }.to_val()),
+            (
+                "range".to_string(),
+                Range {
+                    start: Position {
+                        line: 1,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 4,
+                    },
+                }
+                .to_val(),
+            ),
         ]);
         let loc = Location::from_val(&val).unwrap();
         assert_eq!(loc.uri, "file:///foo.rs");
@@ -603,23 +837,45 @@ mod tests {
 
     #[test]
     fn symbol_kind_from_val() {
-        assert!(matches!(SymbolKind::from_val(&Val::Enum("function".to_string())), SymbolKind::Function));
-        assert!(matches!(SymbolKind::from_val(&Val::Enum("class".to_string())), SymbolKind::Class));
-        assert!(matches!(SymbolKind::from_val(&Val::Enum("enum-member".to_string())), SymbolKind::EnumMember));
+        assert!(matches!(
+            SymbolKind::from_val(&Val::Enum("function".to_string())),
+            SymbolKind::Function
+        ));
+        assert!(matches!(
+            SymbolKind::from_val(&Val::Enum("class".to_string())),
+            SymbolKind::Class
+        ));
+        assert!(matches!(
+            SymbolKind::from_val(&Val::Enum("enum-member".to_string())),
+            SymbolKind::EnumMember
+        ));
     }
 
     #[test]
     fn code_action_from_val() {
         let edit_val = Val::Record(vec![
-            ("range".to_string(), Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 5 },
-            }.to_val()),
+            (
+                "range".to_string(),
+                Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 5,
+                    },
+                }
+                .to_val(),
+            ),
             ("new-text".to_string(), Val::String("fixed".to_string())),
         ]);
         let val = Val::Record(vec![
             ("title".to_string(), Val::String("Fix it".to_string())),
-            ("kind".to_string(), Val::Option(Some(Box::new(Val::String("quickfix".to_string()))))),
+            (
+                "kind".to_string(),
+                Val::Option(Some(Box::new(Val::String("quickfix".to_string())))),
+            ),
             ("edits".to_string(), Val::List(vec![edit_val])),
         ]);
         let action = CodeAction::from_val(&val).unwrap();

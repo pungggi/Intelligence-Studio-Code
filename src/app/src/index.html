@@ -99,16 +99,16 @@
           <button id="debug-btn-stop" title="Stop (Shift+F5)" aria-label="Stop" class="debug-btn-hidden">&#9632;</button>
         </div>
         <div class="debug-section">
-          <div class="debug-section-header">CALL STACK</div>
-          <div id="debug-callstack"></div>
+          <h3 class="debug-section-header"><button id="debug-callstack-heading" aria-expanded="true" aria-controls="debug-callstack">CALL STACK</button></h3>
+          <div id="debug-callstack" role="region" aria-labelledby="debug-callstack-heading"></div>
         </div>
         <div class="debug-section">
-          <div class="debug-section-header">VARIABLES</div>
-          <div id="debug-variables"></div>
+          <h3 class="debug-section-header"><button id="debug-variables-heading" aria-expanded="true" aria-controls="debug-variables">VARIABLES</button></h3>
+          <div id="debug-variables" role="region" aria-labelledby="debug-variables-heading"></div>
         </div>
         <div class="debug-section">
-          <div class="debug-section-header">BREAKPOINTS</div>
-          <div id="debug-breakpoints-list"></div>
+          <h3 class="debug-section-header"><button id="debug-breakpoints-heading" aria-expanded="true" aria-controls="debug-breakpoints-list">BREAKPOINTS</button></h3>
+          <div id="debug-breakpoints-list" role="region" aria-labelledby="debug-breakpoints-heading"></div>
         </div>
       </div>
 
@@ -173,7 +173,7 @@
       </div>
 
       <!-- Output sub-panel -->
-      <div id="output-panel" class="bottom-sub-panel" style="display:none;">
+      <div id="output-panel" class="bottom-sub-panel sub-panel-hidden">
         <div id="output-sub-header">
           <select id="output-channel-select"></select>
           <button id="output-clear" title="Clear">Clear</button>
@@ -188,7 +188,7 @@
       </div>
 
       <!-- Debug Console sub-panel -->
-      <div id="debug-console-panel" class="bottom-sub-panel" style="display:none;">
+      <div id="debug-console-panel" class="bottom-sub-panel sub-panel-hidden">
         <div id="debug-console-content"></div>
       </div>
     </div>
@@ -269,7 +269,7 @@
   <div id="command-palette" class="palette-hidden" role="dialog" aria-label="Command palette" aria-modal="true">
     <div id="palette-backdrop"></div>
     <div id="palette-panel">
-      <input id="palette-input" type="text" placeholder="Type a command..." autocomplete="off" aria-label="Command search" aria-autocomplete="list" aria-controls="palette-list" />
+      <input id="palette-input" type="text" placeholder="Type a command..." autocomplete="off" aria-label="Command search" role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="palette-list" />
       <div id="palette-list" role="listbox" aria-label="Commands"></div>
     </div>
   </div>

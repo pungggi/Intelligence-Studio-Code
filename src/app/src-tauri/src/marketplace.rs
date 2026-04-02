@@ -1,5 +1,6 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 const OPEN_VSX_API: &str = "https://open-vsx.org/api";
 
@@ -14,7 +15,7 @@ pub struct ExtensionInfo {
     pub download_count: Option<u64>,
     pub categories: Option<Vec<String>>,
     #[serde(default)]
-    pub files: std::collections::HashMap<String, String>,
+    pub files: HashMap<String, String>,
     pub publisher_name: Option<String>,
 }
 
@@ -47,7 +48,7 @@ struct OpenVsxExtensionEntry {
     description: Option<String>,
     download_count: Option<u64>,
     url: Option<String>,
-    files: Option<std::collections::HashMap<String, String>>,
+    files: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,7 +177,7 @@ impl MarketplaceClient {
             None => return Err("Download URL has no host".to_string()),
         }
 
-        let resp = self
+        let mut resp = self
             .client
             .get(download_url)
             .send()
@@ -205,16 +206,19 @@ impl MarketplaceClient {
             return Err("VSIX file exceeds 100MB limit".to_string());
         }
 
-        let bytes = resp
-            .bytes()
+        let mut bytes = Vec::with_capacity(content_length as usize);
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| format!("Failed to read VSIX bytes: {e}"))?;
-
-        if bytes.len() > 100 * 1024 * 1024 {
-            return Err("VSIX file exceeds 100MB limit".to_string());
+            .map_err(|e| format!("Failed to read VSIX bytes: {e}"))?
+        {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > 100 * 1024 * 1024 {
+                return Err("VSIX file exceeds 100MB limit".to_string());
+            }
         }
 
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 }
 

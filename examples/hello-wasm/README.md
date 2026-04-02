@@ -12,7 +12,12 @@ rustup target add wasm32-wasip2
 
 ```sh
 cargo build --target wasm32-wasip2 --release
+
+# Unix/macOS:
 cp target/wasm32-wasip2/release/hello_wasm.wasm hello-wasm.wasm
+
+# Windows (PowerShell):
+# Copy-Item target\wasm32-wasip2\release\hello_wasm.wasm hello-wasm.wasm
 ```
 
 > **Note:** Rust converts package-name hyphens to underscores in the produced artifact (so `target/wasm32-wasip2/release/hello_wasm.wasm` is the actual build output). We copy/rename it to `hello-wasm.wasm` for the example.

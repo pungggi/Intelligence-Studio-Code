@@ -354,9 +354,10 @@ fn extract_zip_entry(
             .take(MAX_VSIX_FILE_SIZE)
             .read_to_end(&mut contents)
             .map_err(|e| format!("Failed to read {relative_path}: {e}"))?;
-        // Double-check actual decompressed size.
-        if contents.len() > MAX_VSIX_FILE_SIZE as usize {
-            log::warn!("Skipping oversized file in VSIX: {relative_path}");
+        // Detect truncation: if the read filled the entire budget, the file
+        // was likely larger than MAX_VSIX_FILE_SIZE and was silently cut off.
+        if contents.len() as u64 >= MAX_VSIX_FILE_SIZE {
+            log::warn!("Skipping oversized/truncated file in VSIX: {relative_path}");
             return Ok(());
         }
         std::fs::write(&target, &contents)

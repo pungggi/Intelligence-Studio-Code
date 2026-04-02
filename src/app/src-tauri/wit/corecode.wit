@@ -132,6 +132,51 @@ interface language-provider {
                        -> result<list<folding-range>, string>;
 }
 
+// ── Host imports — Webview panels ───────────────────────────────────────────
+
+interface webview {
+  /// Request opening a webview panel. The host calls get-html after this
+  /// returns to obtain the initial HTML content.
+  /// column: 1 = active, 2 = beside, 3 = third column.
+  open-panel: func(panel-id: string, title: string, column: u32) -> result<_, string>;
+
+  /// Update the HTML content of an already-open panel.
+  set-html: func(panel-id: string, html: string) -> result<_, string>;
+
+  /// Post a JSON-encoded message to the webview's JavaScript context.
+  post-message: func(panel-id: string, message: string) -> result<_, string>;
+
+  /// Close a panel programmatically.
+  close-panel: func(panel-id: string) -> result<_, string>;
+}
+
+// ── Extension exports — webview provider (optional) ─────────────────────────
+
+interface webview-provider {
+  /// Called by the host after open-panel to get the initial HTML.
+  /// state: JSON string of previously saved state, or empty string.
+  get-html: func(panel-id: string, state: string) -> string;
+
+  /// Called when the webview posts a message back to the extension.
+  on-message: func(panel-id: string, message: string);
+
+  /// Called when the user or host closes a webview panel.
+  on-close: func(panel-id: string);
+}
+
+// ── Extension exports — grammar provider (optional) ─────────────────────────
+
+interface grammar-provider {
+  /// Return the highlights.scm query string.
+  highlights-query: func() -> string;
+
+  /// Return the injections.scm query string, or none if not needed.
+  injections-query: func() -> option<string>;
+
+  /// Return bracket pair definitions as JSON: [["{","}"],["(",")"],...]
+  bracket-pairs: func() -> string;
+}
+
 // ── World ───────────────────────────────────────────────────────────────────
 
 world corecode-extension {
@@ -150,4 +195,23 @@ world corecode-language-extension {
 
   export lifecycle;
   export language-provider;
+}
+
+/// World for extensions that supply a tree-sitter grammar.
+world corecode-grammar-extension {
+  import ui;
+  import workspace;
+
+  export lifecycle;
+  export grammar-provider;
+}
+
+/// World for extensions that provide webview panels.
+world corecode-webview-extension {
+  import ui;
+  import workspace;
+  import webview;
+
+  export lifecycle;
+  export webview-provider;
 }

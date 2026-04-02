@@ -259,6 +259,43 @@ pub fn pack(manifest: &CoreCodeManifest, wasm_path: &Path) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Extract the highlights.scm query embedded in the WASM binary.
+/// Parses the WASM custom sections to locate `queries/{language_id}/highlights.scm`.
+fn extract_highlights_query(
+    wasm_path: &std::path::Path,
+    grammar: &Grammar,
+) -> anyhow::Result<String> {
+    use wasmparser::{Parser, Payload};
+    let bytes = std::fs::read(wasm_path)?;
+    let target = format!("queries/{}/highlights.scm", grammar.language_id);
+    for payload in Parser::new(0).parse_all(&bytes) {
+        if let Payload::CustomSection(reader) = payload? {
+            if reader.name() == target {
+                return Ok(std::str::from_utf8(reader.data())?.to_string());
+            }
+        }
+    }
+    anyhow::bail!("highlights.scm not found in WASM binary for '{}'", grammar.language_id)
+}
+
+/// Extract the injections.scm query, or None if not present.
+fn extract_injections_query(
+    wasm_path: &std::path::Path,
+    grammar: &Grammar,
+) -> anyhow::Result<Option<String>> {
+    use wasmparser::{Parser, Payload};
+    let bytes = std::fs::read(wasm_path)?;
+    let target = format!("queries/{}/injections.scm", grammar.language_id);
+    for payload in Parser::new(0).parse_all(&bytes) {
+        if let Payload::CustomSection(reader) = payload? {
+            if reader.name() == target {
+                return Ok(Some(std::str::from_utf8(reader.data())?.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn generate_zed_manifest(manifest: &CoreCodeManifest) -> String {
     let mut s = String::new();
     s.push_str("[extension]\n");
@@ -490,12 +527,14 @@ fn generate_language_registrations(langs: &std::collections::HashMap<String, boo
     )
 }
 
-fn injectVsCodeBridge(html, webview, context) {
+/// Returns the JS source for injectVsCodeBridge as a string,
+/// to be embedded in the generated VS Code adapter.
+fn inject_vscode_bridge_js() -> &'static str {
+    r#"function injectVsCodeBridge(html, webview, context) {
   const bridgeUri = webview.asWebviewUri(
     vscode.Uri.joinPath(context.extensionUri, 'webview', 'corecode-bridge.js')
   );
   const scriptTag = `<script src="${bridgeUri}"></script>`;
-
   const headClose = html.indexOf('</head>');
   if (headClose !== -1) {
     return html.slice(0, headClose) + scriptTag + html.slice(headClose);
@@ -504,7 +543,8 @@ fn injectVsCodeBridge(html, webview, context) {
   if (bodyClose !== -1) {
     return html.slice(0, bodyClose) + scriptTag + html.slice(bodyClose);
   }
-  return html + scriptTag;  // fallback: append
+  return html + scriptTag;
+}"#
 }
 
 fn generate_webview_code() -> String {
@@ -613,17 +653,19 @@ fn find_wasm_binary() -> anyhow::Result<std::path::PathBuf> {
     anyhow::bail!("No wasm32-wasi binary found. Run `cargo build --target wasm32-wasi` first.")
 }
 
-/// Parse export names from a WASM binary (component model exports).
+/// Parse export names from a WASM binary using wasmparser.
 fn inspect_wasm_exports(wasm_path: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    use wasmparser::{Parser, Payload};
     let bytes = std::fs::read(wasm_path)?;
-    // Use wasmparser for lightweight parsing without full instantiation.
-    // For Phase 5 initial implementation, use heuristic string scan:
-    let text = String::from_utf8_lossy(&bytes);
-    let exports: Vec<String> = ["lifecycle", "language-provider", "grammar-provider", "webview-provider"]
-        .iter()
-        .filter(|iface| text.contains(*iface))
-        .map(|s| s.to_string())
-        .collect();
+    let mut exports = Vec::new();
+    for payload in Parser::new(0).parse_all(&bytes) {
+        if let Payload::ExportSection(reader) = payload? {
+            for export in reader {
+                let export = export?;
+                exports.push(export.name.to_string());
+            }
+        }
+    }
     Ok(exports)
 }
 
@@ -703,6 +745,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wit-bindgen = "0.26"
+corecode-extension-api = "0.1"
 "#))?;
 
     // corecode.toml

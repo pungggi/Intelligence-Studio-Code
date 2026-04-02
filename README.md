@@ -63,7 +63,7 @@ npm run dev
 
 ## Vendored Dependencies
 
-Some frontend dependencies (like `xterm.js`) are vendored for simplicity in the build-less Tauri frontend. To update or regenerate THESE assets, use the provided scripts:
+Some frontend dependencies (like `xterm.js`) are vendored for simplicity in the build-less Tauri frontend. To update or regenerate these assets, use the provided scripts:
 
 ```bash
 # On Windows (PowerShell)

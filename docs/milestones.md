@@ -367,7 +367,7 @@ VisibleContent { lines: Vec<HighlightedLine>, first_line, total_lines, file_path
 
 ---
 
-## M8: Full Platform (8 weeks) — IN PROGRESS
+## M8: Full Platform (8 weeks) — In Progress
 
 **Goal:** WebView support, integrated terminal, settings UI, extension marketplace, and accessibility.
 

@@ -99,7 +99,12 @@ impl DebugManager {
         let home = dirs::home_dir().ok_or_else(|| {
             "could not determine user home directory — debug adapter restricted".to_string()
         })?;
-        let home_canonical = std::fs::canonicalize(&home).unwrap_or(home);
+        let home_canonical = std::fs::canonicalize(&home).map_err(|e| {
+            format!(
+                "could not canonicalize home directory '{}': {e}",
+                home.display()
+            )
+        })?;
         if !canonical.starts_with(&home_canonical) {
             return Err(format!(
                 "Debug adapter '{}' is not within the user home directory",
@@ -218,16 +223,20 @@ impl DebugManager {
                                 // Push a synthetic overflow marker so consumers can detect lost events.
                                 // Only insert one overflow marker to avoid filling the buffer entirely.
                                 if store.last().map(|e| e.msg_type != "overflow").unwrap_or(true) {
-                                    store.push(DebugEvent {
-                                        session_id: sid_reader.clone(),
-                                        msg_type: "overflow".to_string(),
-                                        seq: 0,
-                                        event: Some("overflow".to_string()),
-                                        command: None,
-                                        request_seq: None,
-                                        success: None,
-                                        body: Some(serde_json::json!({ "dropped_type": evt.msg_type })),
-                                    });
+                                    // Replace the last real event with an overflow marker
+                                    // so the buffer stays within the 1000-event cap.
+                                    if let Some(last) = store.last_mut() {
+                                        *last = DebugEvent {
+                                            session_id: sid_reader.clone(),
+                                            msg_type: "overflow".to_string(),
+                                            seq: 0,
+                                            event: Some("overflow".to_string()),
+                                            command: None,
+                                            request_seq: None,
+                                            success: None,
+                                            body: Some(serde_json::json!({ "dropped_type": evt.msg_type })),
+                                        };
+                                    }
                                 }
                             }
                         }

@@ -60,13 +60,16 @@ my-ext/
 id       = "my-publisher.my-ext"
 name     = "My Extension"
 version  = "0.1.0"
-host     = "wasm"                  # always "wasm" for this host
+host     = "wasm"                  # optional; if present, must be "wasm"
 
 [entry]
 wasm     = "extension.wasm"
 
 [capabilities]                      # declare-only; host enforces
 workspace_read  = true
+workspace_write = false             # extension cannot write to workspace
+filesystem_read = false             # extension cannot read outside workspace
+filesystem_write = false            # extension cannot write outside workspace
 network_fetch   = false             # extension cannot open sockets
 webview_panels  = true
 ```
@@ -112,19 +115,29 @@ It provides:
 Capabilities declared in `corecode.toml` are checked at activation time:
 
 - `workspace_read = false` → host denies any file-read WIT call, returns `Err`
+- `workspace_write = false` → host denies any file-write WIT call, returns `Err`
+- `filesystem_read = false` → host denies reads outside the workspace, returns `Err`
+- `filesystem_write = false` → host denies writes outside the workspace, returns `Err`
 - `network_fetch = false` → `http_fetch` import is not linked; calling it causes a hard WASM trap
 - `webview_panels = false` → `webview_create` returns `Err("not declared")`
 
 **Rationale for the behavioral difference:** `network_fetch = false` causes a hard WASM trap
 (unlinked import) as a security measure — network access must be completely blocked at the
 runtime level so there is no code path that can accidentally or maliciously bypass it.
-In contrast, `workspace_read` and `webview_panels` return soft `Err` values because they are
-capability checks that extensions can detect and handle gracefully (e.g. degrade to read-only
-mode or skip opening a panel).
+In contrast, `workspace_read`, `workspace_write`, `filesystem_*` and `webview_panels` return
+soft `Err` values because they are capability checks that extensions can detect and handle
+gracefully (e.g. degrade to read-only mode or skip opening a panel).
 
 This is implemented via conditional `wasmtime::Linker` binding at instance creation.
 Extensions that call a network function they did not declare in capabilities are hard-trapped
 (WASM trap, not a soft error) so the failure is loud and auditable.
+
+**WASI enforcement (defense in depth):** The `wasmtime::WasiCtxBuilder` must also enforce
+hard denials at the WASI layer, independent of WIT-level capability checks:
+- Sockets/networking: explicitly denied via `WasiCtxBuilder` (do not inherit network)
+- Filesystem: only preopened directories matching granted capabilities are exposed
+- The WIT capability flags (`workspace_read`, `network_fetch`, etc.) are soft checks;
+  the WASI layer is the hard enforcement boundary. Both layers must agree.
 
 ---
 
@@ -159,23 +172,21 @@ pub enum ExtensionKind {
     Wasm,     // has corecode.toml
 }
 
-pub fn detect_kind(ext_dir: &std::path::Path) -> Option<ExtensionKind> {
+pub fn detect_kind(ext_dir: &std::path::Path) -> Result<Option<ExtensionKind>, String> {
     let has_toml = ext_dir.join("corecode.toml").exists();
     let has_pkg  = ext_dir.join("package.json").exists();
     match (has_toml, has_pkg) {
-        (true, true) => {
-            log::warn!(
-                "Extension '{}' has both corecode.toml and package.json; \
-                 treating as WASM extension",
-                ext_dir.display()
-            );
-            Some(ExtensionKind::Wasm)
-        }
-        (true, false)  => Some(ExtensionKind::Wasm),
-        (false, true)  => Some(ExtensionKind::NodeJs),
-        (false, false) => None,
+        (true, true) => Err(format!(
+            "Extension '{}' has both corecode.toml and package.json; \
+             remove one to clarify the extension type",
+            ext_dir.display()
+        )),
+        (true, false)  => Ok(Some(ExtensionKind::Wasm)),
+        (false, true)  => Ok(Some(ExtensionKind::NodeJs)),
+        (false, false) => Ok(None),
     }
 }
 ```
 
-An extension directory containing both files logs a warning and is treated as a WASM extension.
+An extension directory containing both manifest files is treated as an error — the developer
+must remove one to avoid ambiguous routing.

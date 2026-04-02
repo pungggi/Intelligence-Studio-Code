@@ -464,9 +464,17 @@ impl WasmHostManager {
         let manifest = CoreCodeManifest::load(ext_dir)?;
         let id = manifest.extension.id.clone();
 
-        // Prevent double-activation
-        if self.instances.lock().unwrap().contains_key(&id) {
-            return Err(format!("Extension '{}' already loaded", id));
+        // Prevent double-activation: check instances and reserve in loading set
+        // under the same lock to close the TOCTOU window.
+        {
+            let instances = self.instances.lock().unwrap();
+            if instances.contains_key(&id) {
+                return Err(format!("Extension '{}' already loaded", id));
+            }
+            let mut loading = self.loading.lock().unwrap();
+            if !loading.insert(id.clone()) {
+                return Err(format!("Extension '{}' is already being loaded", id));
+            }
         }
 
         let host_ctx = HostContext::new(
@@ -474,10 +482,20 @@ impl WasmHostManager {
             manifest.capabilities.workspace_read,
         );
 
-        let mut instance = WasmInstance::load(&self.engine, ext_dir, &manifest, host_ctx)?;
-        instance.activate()?;
+        let mut instance = match WasmInstance::load(&self.engine, ext_dir, &manifest, host_ctx) {
+            Ok(i) => i,
+            Err(e) => {
+                self.loading.lock().unwrap().remove(&id);
+                return Err(e);
+            }
+        };
+        if let Err(e) = instance.activate() {
+            self.loading.lock().unwrap().remove(&id);
+            return Err(e);
+        }
 
-        self.instances.lock().unwrap().insert(id, instance);
+        self.instances.lock().unwrap().insert(id.clone(), instance);
+        self.loading.lock().unwrap().remove(&id);
         Ok(())
     }
 

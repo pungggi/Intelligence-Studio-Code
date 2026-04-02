@@ -435,6 +435,8 @@ pub struct DecorationRange {
 
 /// M6: Default timeout for LSP requests (10 seconds).
 const LSP_REQUEST_TIMEOUT_MS: u64 = 10_000;
+/// Maximum number of concurrent pending LSP requests to prevent unbounded memory growth.
+const MAX_PENDING_REQUESTS: usize = 200;
 
 /// Shared state for the IPC bridge, bundling all synchronized fields so they
 /// can be passed as a single `Arc<IpcState>` instead of 18 separate Arcs.
@@ -623,15 +625,25 @@ impl IpcHandle {
         let request_id = self.next_request_id();
         let (tx, rx) = std::sync::mpsc::channel();
 
-        // Register pending request
-        lock_or_default(&self.state.pending_requests).insert(request_id.clone(), tx);
+        // Register pending request (cap to prevent unbounded memory growth).
+        {
+            let mut pending = lock_or_default(&self.state.pending_requests);
+            if pending.len() >= MAX_PENDING_REQUESTS {
+                return Err("Too many pending LSP requests".to_string());
+            }
+            pending.insert(request_id.clone(), tx);
+        }
 
-        // Send the request
-        self.send(OutgoingMessage::LspRequest {
+        // Send the request — use try_send directly so we can detect failure
+        // and clean up the pending entry instead of leaving it orphaned.
+        if let Err(e) = self.sender.try_send(OutgoingMessage::LspRequest {
             request_id: request_id.clone(),
             method: method.to_string(),
             params,
-        });
+        }) {
+            lock_or_default(&self.state.pending_requests).remove(&request_id);
+            return Err(format!("Failed to send LSP request: {e}"));
+        }
 
         // Block on the response with timeout (works from any thread)
         match rx.recv_timeout(std::time::Duration::from_millis(LSP_REQUEST_TIMEOUT_MS)) {

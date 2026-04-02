@@ -47,6 +47,7 @@
 
   /* Layout */
   --bottom-panel-height: 280px;
+  --webview-bg: var(--bg);
 }
 
 * {
@@ -895,6 +896,10 @@ body {
   display: none !important;
 }
 
+.sub-panel-hidden {
+  display: none !important;
+}
+
 #bottom-panel {
   display: flex;
   flex-direction: column;
@@ -1577,7 +1582,7 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: #ffffff;
+  background: var(--webview-bg);
 }
 
 .webview-iframe {
@@ -1645,9 +1650,19 @@ body {
   --syn-punctuation: #000000;
 }
 
-/* High-contrast focus rings */
-:root.hc-dark *:focus,
-:root.hc-light *:focus {
+/* High-contrast focus rings — keyboard focus only, targeted interactive elements */
+:root.hc-dark a:focus-visible,
+:root.hc-dark button:focus-visible,
+:root.hc-dark input:focus-visible,
+:root.hc-dark select:focus-visible,
+:root.hc-dark textarea:focus-visible,
+:root.hc-dark [tabindex]:not([tabindex="-1"]):focus-visible,
+:root.hc-light a:focus-visible,
+:root.hc-light button:focus-visible,
+:root.hc-light input:focus-visible,
+:root.hc-light select:focus-visible,
+:root.hc-light textarea:focus-visible,
+:root.hc-light [tabindex]:not([tabindex="-1"]):focus-visible {
   outline: 2px solid var(--accent) !important;
   outline-offset: 1px;
 }
@@ -1955,7 +1970,7 @@ input:focus-visible,
 
 .empty-state {
   padding: 8px;
-  color: #888;
+  color: var(--fg-muted);
   font-size: 12px;
 }
 

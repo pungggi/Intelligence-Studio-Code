@@ -13,11 +13,17 @@
 import { createServer, Server, Socket } from "net";
 import { timingSafeEqual } from "node:crypto";
 
+export function tokensMatch(provided: string | null | undefined, expected: string): boolean {
+  if (provided == null) return false;
+  if (provided.length !== expected.length) return false;
+  return timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+}
+
 const IPC_HOST = "127.0.0.1";
 const IPC_PORT = parseInt(process.env.CORECODE_IPC_PORT ?? "0", 10);
 
 /** Maximum IPC frame size (10 MB). Must match Rust side. */
-const MAX_FRAME_SIZE = 10 * 1024 * 1024;
+export const MAX_FRAME_SIZE = 10 * 1024 * 1024;
 
 /** Timeout for authentication handshake (5 seconds). */
 const AUTH_TIMEOUT_MS = 5000;
@@ -88,6 +94,8 @@ export class IpcServer {
           console.log("[IPC] Frontend disconnected");
           this.client = null;
           this.authenticated = false;
+          this.bufferChunks = [];
+          this.bufferLength = 0;
           if (this.authTimer) {
             clearTimeout(this.authTimer);
             this.authTimer = null;
@@ -161,10 +169,7 @@ export class IpcServer {
         if (!this.authenticated) {
           if (msg.method === "ipc/auth" && this.authToken) {
             const providedToken = (msg.params as { token?: string })?.token;
-            const tokensMatch = providedToken != null &&
-              providedToken.length === this.authToken.length &&
-              timingSafeEqual(Buffer.from(providedToken), Buffer.from(this.authToken));
-            if (tokensMatch) {
+            if (tokensMatch(providedToken, this.authToken)) {
               this.authenticated = true;
               if (this.authTimer) {
                 clearTimeout(this.authTimer);
@@ -210,6 +215,10 @@ export class IpcServer {
   /** Send a JSON message with length-prefix framing. */
   send(msg: IpcMessage): void {
     if (!this.client || this.client.destroyed) return;
+    if (!this.authenticated) {
+      console.warn("[IPC] Dropping outgoing message — client not authenticated");
+      return;
+    }
 
     const json = Buffer.from(JSON.stringify(msg), "utf-8");
 

@@ -31,11 +31,11 @@ describe("LanguageClient command allowlist", () => {
   });
 
   it("accepts an absolute Windows path", () => {
-    assert.ok(isCommandAllowed("C:\\\\Users\\\\user\\\\.cargo\\\\bin\\\\rust-analyzer.exe"));
+    assert.ok(isCommandAllowed("C:\\Users\\user\\.cargo\\bin\\rust-analyzer.exe"));
   });
 
   it("accepts a path with spaces (e.g. Program Files)", () => {
-    assert.ok(isCommandAllowed("C:\\\\Program Files\\\\MyLSP\\\\server.exe"));
+    assert.ok(isCommandAllowed("C:\\Program Files\\MyLSP\\server.exe"));
   });
 
   it("accepts node binary", () => {

@@ -87,13 +87,13 @@ const GHOST_TEXT_COLOR = 'rgba(205,214,244,0.35)';  // dimmed Catppuccin fg
 // Inlay hints state
 let inlayHints = new Map();  // lineIdx -> Array<{character, label, kind}>
 let inlayHintsUri = null;
+let inlayHintsTimer = null;
+const INLAY_HINT_COLOR = 'rgba(166,173,200,0.55)';  // dimmed, semi-transparent
 
 // Folding state
 let foldingRanges = [];      // Array<{startLine, endLine, kind?}> from WASM/heuristic
 let collapsedFolds = new Set(); // Set of startLine values that are collapsed
 let foldedLineSet = new Set();  // Set of buffer lines currently hidden (recomputed)
-let inlayHintsTimer = null;
-const INLAY_HINT_COLOR = 'rgba(166,173,200,0.55)';  // dimmed, semi-transparent
 
 // Document highlights state (registerDocumentHighlightProvider)
 let documentHighlights = [];  // Array<{start_line, start_col, end_line, end_col, kind}>
@@ -322,8 +322,7 @@ function resizeCanvases() {
 }
 
 function updateScrollSizer() {
-  const effectiveLines = foldedLineSet.size > 0 ? (totalLines - foldedLineSet.size) : totalLines;
-  const totalH = effectiveLines * lineHeight;
+  const totalH = getEffectiveLineCount() * lineHeight;
   // Scroll sizer: total height minus the canvas height (canvas is sticky and in-flow)
   const sizerH = Math.max(0, totalH - editorEl.clientHeight);
   scrollSizer.style.height = sizerH + 'px';
@@ -808,9 +807,9 @@ async function fetchVisibleContent() {
   let fetchFirst, fetchCount;
   if (foldedLineSet.size > 0) {
     const bufFirst = displayToBuffer(displayFirst);
-    const bufLast = displayToBuffer(Math.min(displayFirst + displayCount - 1, totalLines - foldedLineSet.size - 1));
+    const bufLast = displayToBuffer(Math.min(displayFirst + displayCount - 1, getEffectiveLineCount() - 1));
     fetchFirst = bufFirst;
-    fetchCount = bufLast - bufFirst + 1;
+    fetchCount = Math.max(1, bufLast - bufFirst + 1);
   } else {
     fetchFirst = displayFirst;
     fetchCount = displayCount;
@@ -1488,8 +1487,7 @@ function posFromMouse(e) {
   const y = e.clientY - rect.top + scrollTop;
   const x = e.clientX - rect.left - EDITOR_PADDING_LEFT + editorEl.scrollLeft;
 
-  const effectiveTotal = foldedLineSet.size > 0 ? (totalLines - foldedLineSet.size) : totalLines;
-  const displayLine = Math.max(0, Math.min(Math.floor(y / lineHeight), effectiveTotal - 1));
+  const displayLine = Math.max(0, Math.min(Math.floor(y / lineHeight), getEffectiveLineCount() - 1));
   const line = foldedLineSet.size > 0 ? displayToBuffer(displayLine) : displayLine;
   const lineText = getLineText(line);
   const col = Math.max(0, Math.min(Math.round(x / cellWidth), lineText.length));
@@ -1731,6 +1729,7 @@ async function openFileFromExplorer(path) {
 function openPalette() {
   paletteOpen = true;
   paletteEl.classList.remove('palette-hidden');
+  paletteInputEl.setAttribute('aria-expanded', 'true');
   paletteInputEl.value = '';
   paletteSelectedIndex = 0;
   invoke('list_commands').then(cmds => {
@@ -1748,6 +1747,7 @@ function openPalette() {
 function closePalette() {
   paletteOpen = false;
   paletteEl.classList.add('palette-hidden');
+  paletteInputEl.setAttribute('aria-expanded', 'false');
   editorEl.focus();
 }
 
@@ -2375,6 +2375,7 @@ document.addEventListener('keydown', (e) => {
         // Reuse the palette-style input box for the rename prompt
         paletteOpen = true;
         paletteEl.classList.remove('palette-hidden');
+        paletteInputEl.setAttribute('aria-expanded', 'true');
         paletteInputEl.value = currentName;
         paletteInputEl.placeholder = 'New name...';
         paletteListEl.innerHTML = '';
@@ -2392,6 +2393,7 @@ document.addEventListener('keydown', (e) => {
         function closeRenameAndApply(newName) {
           paletteOpen = false;
           paletteEl.classList.add('palette-hidden');
+          paletteInputEl.setAttribute('aria-expanded', 'false');
           paletteInputEl.placeholder = 'Type a command...';
           renAbort.abort();
           paletteInputEl.addEventListener('input', paletteInputHandler);
@@ -3100,11 +3102,10 @@ function switchBottomTab(tab) {
   bottomPanelTabs.forEach(btn => {
     btn.classList.toggle('active', btn.dataset.panel === tab);
   });
-  outputPanelEl.style.display = tab === 'output' ? '' : 'none';
-  terminalPanelEl.style.display = tab === 'terminal' ? '' : 'none';
+  outputPanelEl.classList.toggle('sub-panel-hidden', tab !== 'output');
+  terminalPanelEl.classList.toggle('sub-panel-hidden', tab !== 'terminal');
   const dbgConsoleEl = document.getElementById('debug-console-panel');
-  if (dbgConsoleEl) dbgConsoleEl.style.display = tab === 'debug-console' ? 'flex' : 'none';
-  if (tab === 'debug-console' && dbgConsoleEl) dbgConsoleEl.style.flexDirection = 'column';
+  if (dbgConsoleEl) dbgConsoleEl.classList.toggle('sub-panel-hidden', tab !== 'debug-console');
   if (tab === 'terminal' && activeTerminalId) {
     const term = terminals.get(activeTerminalId);
     if (term) {
@@ -3444,6 +3445,7 @@ function handleQuickPick(req) {
   const title = req.params.title || req.params.placeHolder || 'Select an item';
   paletteOpen = true;
   paletteEl.classList.remove('palette-hidden');
+  paletteInputEl.setAttribute('aria-expanded', 'true');
   paletteInputEl.value = '';
   paletteInputEl.placeholder = title;
   paletteSelectedIndex = 0;
@@ -3489,6 +3491,7 @@ function handleQuickPick(req) {
   async function closePaletteAndRespond(requestId, value) {
     paletteOpen = false;
     paletteEl.classList.add('palette-hidden');
+    paletteInputEl.setAttribute('aria-expanded', 'false');
     paletteInputEl.placeholder = 'Type a command...';
     qpAbort.abort();
     paletteInputEl.addEventListener('input', paletteInputHandler);
@@ -3507,6 +3510,7 @@ function handleInputBox(req) {
   const defaultValue = req.params.value || '';
   paletteOpen = true;
   paletteEl.classList.remove('palette-hidden');
+  paletteInputEl.setAttribute('aria-expanded', 'true');
   paletteInputEl.value = defaultValue;
   paletteInputEl.placeholder = placeholder;
   paletteListEl.innerHTML = '';
@@ -3529,6 +3533,7 @@ function handleInputBox(req) {
   async function closeInputAndRespond(requestId, value) {
     paletteOpen = false;
     paletteEl.classList.add('palette-hidden');
+    paletteInputEl.setAttribute('aria-expanded', 'false');
     paletteInputEl.placeholder = 'Type a command...';
     ibAbort.abort();
     paletteInputEl.addEventListener('input', paletteInputHandler);
@@ -4127,7 +4132,18 @@ function symbolKindClass(kind) { const map = { 5: 'symbol-icon-method', 11: 'sym
 function symbolKindLetter(kind) { const map = { 5: 'M', 11: 'F', 4: 'C', 10: 'I', 12: 'V', 6: 'P', 13: 'K', 9: 'E', 1: 'M' }; return map[kind] || 'S'; }
 function closeSymbolOutline() { symbolsOpen = false; symbolsPalette.classList.add('palette-hidden'); editorEl.focus(); }
 
-symbolsInput.addEventListener('input', () => { symbolSelectedIdx = 0; renderSymbolList(symbolsInput.value); });
+symbolsInput.addEventListener('input', () => {
+  const val = symbolsInput.value;
+  symbolSelectedIdx = 0;
+  if (val.startsWith('#')) {
+    // Workspace symbol mode — debounce WASM query
+    clearTimeout(wsSymbolDebounce);
+    wsSymbolDebounce = setTimeout(() => searchWorkspaceSymbols(val.slice(1).trim()), 200);
+  } else {
+    // Document symbol mode — filter immediately
+    renderSymbolList(val);
+  }
+});
 symbolsInput.addEventListener('keydown', (e) => {
   const total = symbolsList.children.length;
   if (e.key === 'ArrowDown') { e.preventDefault(); symbolSelectedIdx = Math.min(symbolSelectedIdx + 1, total - 1); updateSymbolSelection(); }
@@ -4175,17 +4191,6 @@ async function searchWorkspaceSymbols(query) {
     renderSymbolList('');
   } catch { /* ignore */ }
 }
-
-// Hook into the existing symbols input to detect '#' prefix for workspace search
-const _origSymbolInput = symbolsInput._inputHandler;
-symbolsInput.addEventListener('input', () => {
-  const val = symbolsInput.value;
-  if (val.startsWith('#')) {
-    const query = val.slice(1).trim();
-    clearTimeout(wsSymbolDebounce);
-    wsSymbolDebounce = setTimeout(() => searchWorkspaceSymbols(query), 200);
-  }
-});
 
 // --- Formatting ---
 
@@ -4275,6 +4280,11 @@ async function formatSelection() {
 
 // --- Code Folding ---
 
+// Precomputed lookup arrays — rebuilt by recomputeFoldedLines().
+// _d2b[displayLine] = bufferLine; _b2d[bufferLine] = displayLine (-1 if folded).
+let _d2b = [];
+let _b2d = [];
+
 function recomputeFoldedLines() {
   foldedLineSet.clear();
   for (const range of foldingRanges) {
@@ -4284,32 +4294,34 @@ function recomputeFoldedLines() {
       }
     }
   }
+  // Rebuild lookup arrays
+  _d2b = [];
+  _b2d = new Array(totalLines);
+  for (let buf = 0; buf < totalLines; buf++) {
+    if (foldedLineSet.has(buf)) {
+      _b2d[buf] = -1;
+    } else {
+      _b2d[buf] = _d2b.length;
+      _d2b.push(buf);
+    }
+  }
 }
 
 function getEffectiveLineCount() {
-  return totalLines - foldedLineSet.size;
+  return foldedLineSet.size > 0 ? _d2b.length : totalLines;
 }
 
 function displayToBuffer(displayLine) {
-  let bufferLine = 0;
-  let display = 0;
-  while (bufferLine < totalLines) {
-    if (!foldedLineSet.has(bufferLine)) {
-      if (display === displayLine) return bufferLine;
-      display++;
-    }
-    bufferLine++;
-  }
-  return totalLines - 1;
+  if (_d2b.length === 0) return displayLine;
+  if (displayLine < 0) return 0;
+  if (displayLine >= _d2b.length) return totalLines - 1;
+  return _d2b[displayLine];
 }
 
 function bufferToDisplay(bufferLine) {
-  if (foldedLineSet.has(bufferLine)) return -1;
-  let display = 0;
-  for (let l = 0; l < bufferLine; l++) {
-    if (!foldedLineSet.has(l)) display++;
-  }
-  return display;
+  if (_b2d.length === 0) return bufferLine;
+  if (bufferLine < 0 || bufferLine >= _b2d.length) return -1;
+  return _b2d[bufferLine];
 }
 
 function getFoldRangeAtLine(line) {

@@ -25,6 +25,10 @@ pub struct GlyphInfo {
     pub advance: f32,
 }
 
+/// Line height multiplier: cell height = font_size × LINE_HEIGHT_MULTIPLIER.
+/// 1.5 is the standard line-height convention for readable monospaced text.
+const LINE_HEIGHT_MULTIPLIER: f32 = 1.5;
+
 pub struct GlyphAtlas {
     font: Font,
     font_size: f32,
@@ -53,7 +57,7 @@ impl GlyphAtlas {
         // Calculate cell dimensions from a reference character
         let (metrics, _) = font.rasterize('M', font_size);
         let cell_width = metrics.advance_width.ceil();
-        let cell_height = (font_size * 1.5).ceil();
+        let cell_height = (font_size * LINE_HEIGHT_MULTIPLIER).ceil();
 
         Self {
             font,
@@ -106,8 +110,7 @@ impl GlyphAtlas {
                     let atlas_y = base_y + gy as u32;
 
                     if atlas_x < self.atlas_width && atlas_y < self.atlas_height {
-                        let atlas_idx =
-                            ((atlas_y * self.atlas_width + atlas_x) * 4) as usize;
+                        let atlas_idx = ((atlas_y * self.atlas_width + atlas_x) * 4) as usize;
                         let alpha = bitmap[gy * metrics.width + gx];
                         self.atlas_data[atlas_idx] = 255; // R
                         self.atlas_data[atlas_idx + 1] = 255; // G
@@ -179,6 +182,9 @@ impl GlyphAtlas {
             },
             texture_size,
         );
+
+        self.atlas_data.clear();
+        self.atlas_data.shrink_to_fit();
 
         texture
     }

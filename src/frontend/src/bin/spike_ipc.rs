@@ -16,19 +16,20 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 const SOCKET_PATH: &str = "127.0.0.1:17532";
 const MESSAGE_COUNT: usize = 10_000;
 const WARMUP_COUNT: usize = 500;
+const MAX_RESPONSE_LEN: usize = 64 * 1024; // 64 KiB — no valid response should exceed this
 
 // --- Binary protocol (simulates FlatBuffers) ---
 // Format: [4-byte length LE][payload]
 // Payload for request: { msg_type: u8, id: u64, uri_len: u16, uri: [u8], version: u32, text_len: u32, text: [u8] }
 // Payload for response: { msg_type: u8, id: u64, status: u8 }
 
-fn build_binary_message(id: u64, uri: &str, text: &str) -> Vec<u8> {
+fn build_binary_message(id: u64, uri: &str, text: &str) -> Result<Vec<u8>> {
     // Simple binary encoding — no external deps needed
     let mut payload = Vec::with_capacity(32 + uri.len() + text.len());
 
@@ -37,7 +38,9 @@ fn build_binary_message(id: u64, uri: &str, text: &str) -> Vec<u8> {
     // id
     payload.extend_from_slice(&id.to_le_bytes());
     // uri length + uri
-    payload.extend_from_slice(&(uri.len() as u16).to_le_bytes());
+    let uri_len = u16::try_from(uri.len())
+        .map_err(|_| anyhow::anyhow!("URI too long: {} bytes exceeds u16::MAX", uri.len()))?;
+    payload.extend_from_slice(&uri_len.to_le_bytes());
     payload.extend_from_slice(uri.as_bytes());
     // version
     payload.extend_from_slice(&(id as u32).to_le_bytes());
@@ -49,7 +52,7 @@ fn build_binary_message(id: u64, uri: &str, text: &str) -> Vec<u8> {
     let mut frame = Vec::with_capacity(4 + payload.len());
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     frame.extend_from_slice(&payload);
-    frame
+    Ok(frame)
 }
 
 fn read_binary_response(stream: &mut TcpStream) -> Result<(u64, u8)> {
@@ -114,13 +117,19 @@ fn build_json_message(id: u64, uri: &str, text: &str) -> Result<Vec<u8>> {
 }
 
 fn read_json_response(stream: &mut TcpStream) -> Result<u64> {
-    // Read until newline
+    // Read until newline, with a hard cap to prevent unbounded growth
     let mut buf = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
     loop {
         stream.read_exact(&mut byte)?;
         if byte[0] == b'\n' {
             break;
+        }
+        if buf.len() >= MAX_RESPONSE_LEN {
+            anyhow::bail!(
+                "JSON response exceeded maximum length of {} bytes",
+                MAX_RESPONSE_LEN
+            );
         }
         buf.push(byte[0]);
     }
@@ -139,6 +148,10 @@ struct BenchResult {
 }
 
 impl BenchResult {
+    fn average_rtt(&self) -> f64 {
+        self.rtts.iter().map(|d| d.as_secs_f64()).sum::<f64>() / self.rtts.len() as f64
+    }
+
     fn report(&self) {
         let total_ms = self.total_time.as_secs_f64() * 1000.0;
         let throughput = self.message_count as f64 / self.total_time.as_secs_f64();
@@ -206,7 +219,7 @@ fn run_binary_benchmark(stream: &mut TcpStream) -> Result<BenchResult> {
 
     // Warmup
     for i in 0..WARMUP_COUNT {
-        let msg = build_binary_message(i as u64, uri, text);
+        let msg = build_binary_message(i as u64, uri, text)?;
         stream.write_all(&msg)?;
         let _ = read_binary_response(stream)?;
     }
@@ -216,7 +229,7 @@ fn run_binary_benchmark(stream: &mut TcpStream) -> Result<BenchResult> {
     let total_start = Instant::now();
 
     for i in 0..MESSAGE_COUNT {
-        let msg = build_binary_message((WARMUP_COUNT + i) as u64, uri, text);
+        let msg = build_binary_message((WARMUP_COUNT + i) as u64, uri, text)?;
         let rtt_start = Instant::now();
         stream.write_all(&msg)?;
         let (resp_id, _status) = read_binary_response(stream)?;
@@ -276,13 +289,15 @@ fn main() -> Result<()> {
     println!("=== CoreCode Spike 2: IPC Latency Benchmark ===\n");
     println!("Connecting to {SOCKET_PATH}...");
 
+    let addr: SocketAddr = SOCKET_PATH.parse()?;
+    let connect_timeout = Duration::from_secs(5);
+
     // Run binary benchmark
     println!("\n[1/2] Running binary protocol benchmark ({MESSAGE_COUNT} messages, {WARMUP_COUNT} warmup)...");
-    let mut stream = TcpStream::connect(SOCKET_PATH)?;
+    let mut stream = TcpStream::connect_timeout(&addr, connect_timeout)?;
     // Send protocol selection: 'B' for binary
     stream.write_all(b"B")?;
     let binary_result = run_binary_benchmark(&mut stream)?;
-    drop(stream);
 
     // Small pause between benchmarks
     std::thread::sleep(Duration::from_millis(100));
@@ -291,11 +306,10 @@ fn main() -> Result<()> {
     println!(
         "[2/2] Running JSON-RPC benchmark ({MESSAGE_COUNT} messages, {WARMUP_COUNT} warmup)..."
     );
-    let mut stream = TcpStream::connect(SOCKET_PATH)?;
+    let mut stream = TcpStream::connect_timeout(&addr, connect_timeout)?;
     // Send protocol selection: 'J' for JSON
     stream.write_all(b"J")?;
     let json_result = run_json_benchmark(&mut stream)?;
-    drop(stream);
 
     // Report results
     println!("\n==================================================");
@@ -305,18 +319,8 @@ fn main() -> Result<()> {
     json_result.report();
 
     // Comparison
-    let binary_avg = binary_result
-        .rtts
-        .iter()
-        .map(|d| d.as_secs_f64())
-        .sum::<f64>()
-        / binary_result.rtts.len() as f64;
-    let json_avg = json_result
-        .rtts
-        .iter()
-        .map(|d| d.as_secs_f64())
-        .sum::<f64>()
-        / json_result.rtts.len() as f64;
+    let binary_avg = binary_result.average_rtt();
+    let json_avg = json_result.average_rtt();
     let speedup = json_avg / binary_avg;
 
     println!("\n--- Comparison ---");
