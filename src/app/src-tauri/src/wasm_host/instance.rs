@@ -484,21 +484,6 @@ impl WasmInstance {
             .unwrap_or_default()
     }
 
-    /// Whether this extension exports any language-provider functions.
-    pub fn has_language_provider(&self) -> bool {
-        self.completions_fn.is_some()
-            || self.hover_fn.is_some()
-            || self.diagnostics_fn.is_some()
-            || self.format_document_fn.is_some()
-            || self.format_range_fn.is_some()
-            || self.definition_fn.is_some()
-            || self.references_fn.is_some()
-            || self.rename_fn.is_some()
-            || self.code_actions_fn.is_some()
-            || self.workspace_symbols_fn.is_some()
-            || self.folding_ranges_fn.is_some()
-    }
-
     // ── Language provider dispatch methods ────────────────────────────────────
 
     /// Helper: call an export function with fuel and error handling.
@@ -802,13 +787,6 @@ impl WasmInstance {
     }
 
     // ── Grammar provider dispatch methods ──────────────────────────────────
-
-    /// Whether this extension exports any grammar-provider functions.
-    pub fn has_grammar_provider(&self) -> bool {
-        self.highlights_query_fn.is_some()
-            || self.injections_query_fn.is_some()
-            || self.bracket_pairs_fn.is_some()
-    }
 
     /// Call grammar-provider#highlights-query if exported.
     pub fn highlights_query(&mut self) -> Result<String, String> {

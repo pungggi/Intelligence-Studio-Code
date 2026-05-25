@@ -32,7 +32,11 @@ pub struct GrammarConfig {
     pub grammar_dylib: Option<String>,
 }
 
+/// Manifest schema for the `[extension]` table. `name` / `version` are part of
+/// the published contract (read by package tooling and the marketplace) even
+/// though no runtime code accesses them directly yet.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ExtensionMeta {
     pub id: String,
     pub name: String,
@@ -45,7 +49,11 @@ pub struct EntryConfig {
     pub wasm: String,
 }
 
+/// Capability flags requested by the extension. Every flag is part of the
+/// public manifest schema; some are checked by tests / future enforcement
+/// paths even when no current runtime branch reads them.
 #[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)]
 pub struct Capabilities {
     #[serde(default)]
     pub workspace_read: bool,

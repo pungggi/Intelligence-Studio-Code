@@ -236,13 +236,6 @@ impl TerminalManager {
             .collect()
     }
 
-    /// Close all terminals (used during shutdown).
-    pub fn close_all(&mut self) {
-        let ids: Vec<String> = self.sessions.keys().cloned().collect();
-        for id in ids {
-            let _ = self.close(&id);
-        }
-    }
 }
 
 /// Background thread that reads PTY output and emits it to the frontend.

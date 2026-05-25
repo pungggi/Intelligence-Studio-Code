@@ -368,6 +368,7 @@ impl WasmHostManager {
     }
 
     /// Remove an extension's language claims from the registry.
+    #[allow(dead_code)]
     pub fn remove_from_language_registry(&self, id: &str) {
         let mut registry = self.language_registry.lock().unwrap();
         for providers in registry.values_mut() {

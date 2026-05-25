@@ -337,13 +337,6 @@ impl DebugManager {
         }
     }
 
-    pub fn has_session(&self, session_id: &str) -> bool {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains_key(session_id)
-    }
-
     pub fn list_sessions(&self) -> Vec<String> {
         self.sessions
             .lock()

@@ -13,6 +13,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// A tree-sitter grammar loaded at runtime from an extension's native dylib.
+///
+/// Fields `highlights_query`, `injections_query`, and `bracket_pairs` form the
+/// public grammar-data contract — read by tests and by the (forthcoming)
+/// renderer integration. `#[allow(dead_code)]` keeps the schema intact without
+/// noisy warnings while consumers are still in flight.
+#[allow(dead_code)]
 pub struct DynamicGrammar {
     pub language_id: String,
     pub file_types: Vec<String>,
@@ -68,6 +74,7 @@ impl GrammarRegistry {
     }
 
     /// Remove all grammars registered by a specific extension language-id.
+    #[allow(dead_code)]
     pub fn unregister(&self, language_id: &str) {
         let mut ext_map = self.ext_map.lock().unwrap();
         let mut dynamic = self.dynamic.lock().unwrap();
@@ -85,18 +92,21 @@ impl GrammarRegistry {
     }
 
     /// Look up a grammar's highlights query by language-id.
+    #[allow(dead_code)]
     pub fn highlights_query(&self, lang_id: &str) -> Option<String> {
         let map = self.dynamic.lock().unwrap();
         Some(map.get(lang_id)?.highlights_query.clone())
     }
 
     /// Look up bracket pairs by language-id.
+    #[allow(dead_code)]
     pub fn bracket_pairs(&self, lang_id: &str) -> Option<Vec<[String; 2]>> {
         let map = self.dynamic.lock().unwrap();
         Some(map.get(lang_id)?.bracket_pairs.clone())
     }
 
     /// Check whether a language-id is registered.
+    #[allow(dead_code)]
     pub fn has_language(&self, lang_id: &str) -> bool {
         self.dynamic.lock().unwrap().contains_key(lang_id)
     }
