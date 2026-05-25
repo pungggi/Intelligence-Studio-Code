@@ -61,8 +61,8 @@ impl HostContext {
     }
 }
 
-/// Maximum number of output lines buffered per extension before messages are dropped.
 const MAX_OUTPUT_LINES: usize = 1_000;
+const MAX_NOTIFICATIONS: usize = 200;
 
 // ── ui::log ──────────────────────────────────────────────────────────────────
 
@@ -86,7 +86,7 @@ pub fn host_show_message(ctx: &mut HostContext, level: String, message: String) 
         _         => log::info!("[wasm-ext] {}", message),
     }
     if let Ok(mut notifs) = ctx.notifications.lock() {
-        if notifs.len() < MAX_OUTPUT_LINES {
+        if notifs.len() < MAX_NOTIFICATIONS {
             notifs.push((level, message));
         }
     }
@@ -158,15 +158,26 @@ pub fn host_read_file(ctx: &mut HostContext, path: String) -> Result<String, Str
 
 // ── workspace::find_files ─────────────────────────────────────────────────────
 
-pub fn host_find_files(ctx: &mut HostContext, _glob: String) -> Result<Vec<String>, String> {
+pub fn host_find_files(ctx: &mut HostContext, pattern: String) -> Result<Vec<String>, String> {
     if !ctx.workspace_read_allowed {
         return Err("capability 'workspace_read' not declared in corecode.toml".to_string());
     }
-    if ctx.workspace_root.is_none() {
-        return Err("no workspace open".to_string());
-    }
-    // Phase 1 stub — full glob support added in Phase 2 with the `glob` crate.
-    Ok(vec![])
+    let root = ctx.workspace_root.as_ref()
+        .ok_or_else(|| "no workspace open".to_string())?;
+
+    // Anchor the glob pattern inside the workspace root.
+    let full_pattern = root.join(&pattern);
+    let full_str = full_pattern.to_string_lossy();
+
+    let paths = glob::glob(&full_str)
+        .map_err(|e| format!("find_files: invalid pattern '{pattern}': {e}"))?
+        .filter_map(|entry| entry.ok())
+        .filter(|p| p.is_file())
+        .take(1_000)
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+
+    Ok(paths)
 }
 
 // ── workspace::get_config ─────────────────────────────────────────────────────
@@ -353,5 +364,103 @@ mod tests {
         let ctx = ctx_with_workspace(dir.path(), false);
         let uri = host_root_uri(&ctx);
         assert!(uri.starts_with("file://"), "{}", uri);
+    }
+
+    // ── panel ID validation ───────────────────────────────────────────────────
+
+    fn ctx_webview() -> HostContext {
+        HostContext::new(None, false, "test.ext".to_string(), None, true)
+    }
+
+    #[test]
+    fn validate_panel_id_rejects_empty() {
+        assert!(validate_panel_id("").is_err());
+    }
+
+    #[test]
+    fn validate_panel_id_accepts_exactly_64_chars() {
+        let id = "a".repeat(MAX_PANEL_ID_LEN);
+        assert!(validate_panel_id(&id).is_ok(), "64-char id should be valid");
+    }
+
+    #[test]
+    fn validate_panel_id_rejects_65_chars() {
+        let id = "a".repeat(MAX_PANEL_ID_LEN + 1);
+        assert!(validate_panel_id(&id).is_err());
+    }
+
+    #[test]
+    fn validate_panel_id_rejects_invalid_chars() {
+        assert!(validate_panel_id("bad/slash").is_err());
+        assert!(validate_panel_id("bad space").is_err());
+        assert!(validate_panel_id("bad@at").is_err());
+    }
+
+    #[test]
+    fn validate_panel_id_accepts_hyphen_and_dot() {
+        assert!(validate_panel_id("my-panel.1").is_ok());
+    }
+
+    // ── webview ops buffer cap ────────────────────────────────────────────────
+
+    #[test]
+    fn open_panel_drops_when_buffer_full() {
+        let mut ctx = ctx_webview();
+        // Fill the buffer to MAX_WEBVIEW_OPS
+        for i in 0..MAX_WEBVIEW_OPS {
+            host_open_panel(&mut ctx, format!("p{i}"), "T".to_string(), 1).unwrap();
+        }
+        // The next op should silently succeed from the caller's view (no error),
+        // but the op must be dropped (buffer stays at MAX_WEBVIEW_OPS).
+        host_open_panel(&mut ctx, "overflow".to_string(), "T".to_string(), 1).unwrap();
+        let ops = ctx.webview_ops.lock().unwrap();
+        assert_eq!(ops.len(), MAX_WEBVIEW_OPS, "buffer must not exceed MAX_WEBVIEW_OPS");
+    }
+
+    // ── HTML size limit ───────────────────────────────────────────────────────
+
+    #[test]
+    fn set_html_accepts_payload_at_limit() {
+        let mut ctx = ctx_webview();
+        host_open_panel(&mut ctx, "p1".to_string(), "T".to_string(), 1).unwrap();
+        let html = "x".repeat(MAX_HTML_SIZE);
+        assert!(host_set_html(&mut ctx, "p1".to_string(), html).is_ok());
+    }
+
+    #[test]
+    fn set_html_rejects_payload_over_limit() {
+        let mut ctx = ctx_webview();
+        host_open_panel(&mut ctx, "p1".to_string(), "T".to_string(), 1).unwrap();
+        let html = "x".repeat(MAX_HTML_SIZE + 1);
+        let err = host_set_html(&mut ctx, "p1".to_string(), html).unwrap_err();
+        assert!(err.contains("MB limit"), "{err}");
+    }
+
+    // ── notification buffer cap ───────────────────────────────────────────────
+
+    #[test]
+    fn show_message_drops_when_buffer_full() {
+        let mut ctx = ctx_no_workspace();
+        for _ in 0..MAX_NOTIFICATIONS {
+            host_show_message(&mut ctx, "info".to_string(), "msg".to_string());
+        }
+        // Additional notification must be silently dropped.
+        host_show_message(&mut ctx, "info".to_string(), "overflow".to_string());
+        let notifs = ctx.notifications.lock().unwrap();
+        assert_eq!(notifs.len(), MAX_NOTIFICATIONS);
+    }
+
+    // ── find_files result cap ─────────────────────────────────────────────────
+
+    #[test]
+    fn find_files_caps_results_at_1000() {
+        let dir = TempDir::new().unwrap();
+        // Create 1 001 files.
+        for i in 0..=1_000usize {
+            std::fs::write(dir.path().join(format!("f{i:04}.txt")), b"").unwrap();
+        }
+        let mut ctx = ctx_with_workspace(dir.path(), true);
+        let results = host_find_files(&mut ctx, "*.txt".to_string()).unwrap();
+        assert_eq!(results.len(), 1_000, "result must be capped at 1 000");
     }
 }

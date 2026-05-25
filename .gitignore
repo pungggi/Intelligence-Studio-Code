@@ -28,3 +28,5 @@ Thumbs.db
 *.so
 *.dylib
 *.dll
+
+.pi/ghost-autocomplete

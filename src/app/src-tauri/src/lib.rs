@@ -1,4 +1,5 @@
 mod debug;
+mod dispatch;
 mod editor;
 mod ext_host;
 mod extension_mgr;
@@ -638,44 +639,8 @@ fn get_wasm_status_bar_items(state: tauri::State<AppState>) -> Vec<ipc_bridge::S
 }
 
 // --- WASM Language Provider Commands ---
-
-#[tauri::command]
-fn wasm_completions(
-    state: tauri::State<AppState>,
-    lang_id: String,
-    uri: String,
-    line: u32,
-    character: u32,
-    trigger: Option<String>,
-) -> Result<serde_json::Value, String> {
-    let items = state.wasm_host.completions_for_lang(
-        &lang_id, &uri, line, character, trigger.as_deref(),
-    );
-    serde_json::to_value(&items).map_err(|e| format!("serialization error: {e}"))
-}
-
-#[tauri::command]
-fn wasm_diagnostics(
-    state: tauri::State<AppState>,
-    lang_id: String,
-    uri: String,
-    content: String,
-) -> Result<serde_json::Value, String> {
-    let diags = state.wasm_host.diagnostics_for_lang(&lang_id, &uri, &content);
-    serde_json::to_value(&diags).map_err(|e| format!("serialization error: {e}"))
-}
-
-#[tauri::command]
-fn wasm_hover(
-    state: tauri::State<AppState>,
-    lang_id: String,
-    uri: String,
-    line: u32,
-    character: u32,
-) -> Result<serde_json::Value, String> {
-    let result = state.wasm_host.hover_for_lang(&lang_id, &uri, line, character);
-    serde_json::to_value(&result).map_err(|e| format!("serialization error: {e}"))
-}
+// Note: wasm_completions, wasm_diagnostics, wasm_hover, wasm_definition, wasm_references
+// were removed — the unified lang_* commands in the dispatch layer supersede them.
 
 #[tauri::command]
 fn wasm_format_document(
@@ -705,31 +670,6 @@ fn wasm_format_range(
     };
     let edits = state.wasm_host.format_range_for_lang(&lang_id, &uri, &content, &range);
     serde_json::to_value(&edits).map_err(|e| format!("serialization error: {e}"))
-}
-
-#[tauri::command]
-fn wasm_definition(
-    state: tauri::State<AppState>,
-    lang_id: String,
-    uri: String,
-    line: u32,
-    character: u32,
-) -> Result<serde_json::Value, String> {
-    let result = state.wasm_host.definition_for_lang(&lang_id, &uri, line, character);
-    serde_json::to_value(&result).map_err(|e| format!("serialization error: {e}"))
-}
-
-#[tauri::command]
-fn wasm_references(
-    state: tauri::State<AppState>,
-    lang_id: String,
-    uri: String,
-    line: u32,
-    character: u32,
-    include_decl: bool,
-) -> Result<serde_json::Value, String> {
-    let locs = state.wasm_host.references_for_lang(&lang_id, &uri, line, character, include_decl);
-    serde_json::to_value(&locs).map_err(|e| format!("serialization error: {e}"))
 }
 
 #[tauri::command]
@@ -780,7 +720,149 @@ fn wasm_folding_ranges(
     serde_json::to_value(&ranges).map_err(|e| format!("serialization error: {e}"))
 }
 
-/// Notify Extension Host of text changes.
+// ── Unified Language Dispatch ─────────────────────────────────────────────────
+
+
+/// Unified completions — merges results from WASM extensions and LSP servers.
+#[tauri::command]
+fn lang_completions(
+    uri: String,
+    line: u32,
+    character: u32,
+    trigger: Option<String>,
+    state: tauri::State<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+
+    // WASM: Pull — returns Vec, errors logged internally
+    let wasm_items = state.wasm_host.completions_for_lang(
+        &lang_id, &uri, line, character, trigger.as_deref(),
+    );
+
+    // LSP: Pull via request_sync
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/completion",
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        }),
+    );
+
+
+    Ok(dispatch::merged_completions(wasm_items, lsp_result))
+}
+
+/// Unified hover — WASM priority, LSP fallback.
+#[tauri::command]
+fn lang_hover(
+    uri: String,
+    line: u32,
+    character: u32,
+    state: tauri::State<AppState>,
+) -> Result<Option<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+    // WASM: Pull
+    let wasm_hover = state.wasm_host.hover_for_lang(&lang_id, &uri, line, character);
+
+    // LSP: Pull
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/hover",
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        }),
+    );
+
+    Ok(dispatch::merged_hover(wasm_hover, lsp_result))
+}
+
+/// Unified diagnostics — merges push-based LSP diagnostics with pull-based WASM diagnostics.
+///
+/// LSP diagnostics are stored in ipc_bridge state (arrived via publishDiagnostics).
+/// WASM diagnostics need file content, which is fetched from the open buffer.
+#[tauri::command]
+fn lang_diagnostics(
+    uri: String,
+    window: tauri::WebviewWindow,
+    state: tauri::State<AppState>,
+) -> Result<Vec<ipc_bridge::Diagnostic>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+
+    // LSP: Read from stored state (push-based)
+    let lsp_diags = state.ipc.get_diagnostics_for_uri(&uri);
+
+    // WASM: Pull — needs file content from open buffer
+    let content = {
+        let wid = window.label().to_string();
+        let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
+        let ws = get_or_create_ws(&mut guard, wid, &state.grammar_registry);
+        let path = dispatch::uri_to_path(&uri);
+        ws.get_buffer_by_path(std::path::Path::new(&path))
+            .map(|buf| buf.get_full_text())
+            .unwrap_or_default()
+    };
+
+    let wasm_diags = state.wasm_host.diagnostics_for_lang(&lang_id, &uri, &content);
+
+    Ok(dispatch::merged_diagnostics_for_uri(&uri, &wasm_diags, &lsp_diags))
+}
+
+/// Unified definition — WASM priority, LSP fallback.
+#[tauri::command]
+fn lang_definition(
+    uri: String,
+    line: u32,
+    character: u32,
+    state: tauri::State<AppState>,
+) -> Result<Option<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+    // WASM: Pull
+    let wasm_def = state.wasm_host.definition_for_lang(&lang_id, &uri, line, character);
+
+    // LSP: Pull
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/definition",
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        }),
+    );
+
+    Ok(dispatch::merged_definition(wasm_def, lsp_result))
+}
+
+/// Unified references — merged (union semantics).
+#[tauri::command]
+fn lang_references(
+    uri: String,
+    line: u32,
+    character: u32,
+    include_decl: bool,
+    state: tauri::State<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+
+    // WASM: Pull
+    let wasm_locs = state.wasm_host.references_for_lang(&lang_id, &uri, line, character, include_decl);
+
+
+    // LSP: Pull
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/references",
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+            "context": { "includeDeclaration": include_decl },
+        }),
+    );
+
+    Ok(dispatch::merged_references(wasm_locs, lsp_result))
+}
 fn notify_change(path_str: &str, version: u32, text: &str, ipc: &IpcHandle, workspace_id: &str) {
     ipc.send(OutgoingMessage::DidChange {
         uri: path_to_uri(path_str),
@@ -1996,14 +2078,9 @@ pub fn run() {
             get_wasm_output_lines,
             get_wasm_notifications,
             get_wasm_status_bar_items,
-            // Phase 2: WASM language provider commands
-            wasm_completions,
-            wasm_diagnostics,
-            wasm_hover,
+            // WASM-only language provider commands (no LSP equivalent yet)
             wasm_format_document,
             wasm_format_range,
-            wasm_definition,
-            wasm_references,
             wasm_rename,
             wasm_code_actions,
             wasm_workspace_symbols,
@@ -2025,6 +2102,12 @@ pub fn run() {
             lsp_prepare_rename,
             lsp_document_highlights,
             get_show_text_document_requests,
+            // Unified Language Dispatch
+            lang_completions,
+            lang_hover,
+            lang_diagnostics,
+            lang_definition,
+            lang_references,
             // M8: Marketplace commands
             marketplace_search,
             marketplace_get_extension,

@@ -2810,6 +2810,7 @@ function setWebviewHtml(panelId, html) {
   if (!panel) return;
 
   const escapedPanelId = JSON.stringify(panelId);
+  const cspMeta = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:;">`;
   const apiScript = `<script>
 (function(){
   const _panelId=${escapedPanelId};
@@ -2824,14 +2825,15 @@ function setWebviewHtml(panelId, html) {
 })();
 <\/script>`;
 
-  // Inject the shim just after the opening <head> or <html> tag, or prepend
+  const inject = cspMeta + apiScript;
+  // Inject the CSP meta + shim just after the opening <head> or <html> tag, or prepend
   let injected = html;
   if (/<head[^>]*>/i.test(html)) {
-    injected = html.replace(/(<head[^>]*>)/i, '$1' + apiScript);
+    injected = html.replace(/(<head[^>]*>)/i, '$1' + inject);
   } else if (/<html[^>]*>/i.test(html)) {
-    injected = html.replace(/(<html[^>]*>)/i, '$1' + apiScript);
+    injected = html.replace(/(<html[^>]*>)/i, '$1' + inject);
   } else {
-    injected = apiScript + html;
+    injected = inject + html;
   }
 
   panel.iframe.srcdoc = injected;
@@ -3334,32 +3336,9 @@ async function refreshDiagnostics() {
   if (!isPageVisible()) return;
   try {
     await fetchVisibleContent();
-    // Merge WASM diagnostics alongside Node.js diagnostics.
     if (filePath) {
-      const langId = detectLanguage(filePath);
       const uri = filePathToUri(filePath);
-      // Read the full content from the backend for diagnostic analysis.
-      const fullText = await invoke('get_text_range', {
-        startLine: 0, startCol: 0, endLine: totalLines, endCol: 0,
-      }).catch(() => '');
-      if (fullText) {
-        const wasmDiags = await invoke('wasm_diagnostics', {
-          langId, uri, content: fullText,
-        }).catch(() => []);
-        if (wasmDiags && wasmDiags.length > 0) {
-          // Convert WASM diagnostics to the same shape as Node.js diagnostics.
-          const converted = wasmDiags.map(d => ({
-            line: d.range?.start?.line ?? 0,
-            col_start: d.range?.start?.character ?? 0,
-            end_line: d.range?.end?.line ?? d.range?.start?.line ?? 0,
-            col_end: d.range?.end?.character ?? 0,
-            severity: d.severity ?? 'warning',
-            message: d.message ?? '',
-            source: d.source ?? 'wasm',
-          }));
-          diagnostics = [...diagnostics, ...converted];
-        }
-      }
+      diagnostics = await invoke('lang_diagnostics', { uri }).catch(() => []);
     }
     updateMetadataUI();
     requestRender();
@@ -3603,36 +3582,19 @@ async function triggerAutocomplete(triggerChar) {
   if (!uri) return;
   const thisSeq = ++completionSeq;
   try {
-    const langId = detectLanguage(filePath);
-    // Run Node.js LSP and WASM completions in parallel, merge results.
-    const [lspResult, wasmItems] = await Promise.all([
-      invoke('lsp_completion', {
-        uri, line: cursorLine, character: cursorCol,
-        triggerKind: triggerChar ? 2 : 1, triggerCharacter: triggerChar || null,
-      }).catch(() => null),
-      invoke('wasm_completions', {
-        langId, uri, line: cursorLine, character: cursorCol,
-        trigger: triggerChar || null,
-      }).catch(() => []),
-    ]);
+    // Unified dispatch: single call merges WASM + LSP completions
+    const items = await invoke('lang_completions', {
+      uri, line: cursorLine, character: cursorCol,
+      trigger: triggerChar || null,
+    }).catch(() => []);
     // Discard stale response if a newer request was issued while awaiting.
     if (thisSeq !== completionSeq) return;
-    const nodeItems = lspResult?.items ?? [];
     // Normalise WASM items to the same shape as LSP items.
-    const wasmNorm = (wasmItems || []).map(w => ({
+    const allItems = (items || []).map(w => ({
       label: w.label, kind: w.kind, detail: w.detail,
       documentation: w.documentation, insertText: w.insert_text ?? w.label,
       filterText: w.filter_text ?? w.label,
     }));
-    // Deduplicate by (label, insertText) — prevents identical suggestions
-    // when both Node.js and WASM providers return the same item.
-    const seen = new Set();
-    const allItems = [...nodeItems, ...wasmNorm].filter(item => {
-      const key = `${item.label}:${item.insertText || item.label}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
     if (allItems.length === 0) { closeAutocomplete(); return; }
     acItems = allItems;
     acSelectedIdx = 0;
@@ -3732,13 +3694,8 @@ async function requestHover(line, col) {
   const uri = getActiveUri();
   if (!uri) return;
   try {
-    const langId = detectLanguage(filePath);
-    // Run Node.js LSP and WASM hover in parallel.
-    const [lspResult, wasmResult] = await Promise.all([
-      invoke('lsp_hover', { uri, line, character: col }).catch(() => null),
-      invoke('wasm_hover', { langId, uri, line, character: col }).catch(() => null),
-    ]);
-    const result = (lspResult?.contents) ? lspResult : wasmResult;
+    // Unified dispatch: merges WASM + LSP, WASM priority
+    const result = await invoke('lang_hover', { uri, line, character: col }).catch(() => null);
     if (!result || (!result.contents)) { closeHover(); return; }
     hoverContent.textContent = '';
     const text = typeof result.contents === 'string' ? result.contents
@@ -3785,13 +3742,8 @@ async function goToDefinition() {
   if (!uri) return;
   try {
     statusEl.textContent = 'Go to definition...';
-    const langId = detectLanguage(filePath);
-    const [lspResult, wasmResult] = await Promise.all([
-      invoke('lsp_definition', { uri, line: cursorLine, character: cursorCol }).catch(() => null),
-      invoke('wasm_definition', { langId, uri, line: cursorLine, character: cursorCol }).catch(() => null),
-    ]);
-    // Prefer LSP result; fall back to WASM
-    const result = (lspResult && (!Array.isArray(lspResult) || lspResult.length > 0)) ? lspResult : wasmResult;
+    // Unified dispatch: merges WASM + LSP, WASM priority
+    const result = await invoke('lang_definition', { uri, line: cursorLine, character: cursorCol }).catch(() => null);
     if (!result || (Array.isArray(result) && result.length === 0)) {
       statusEl.textContent = 'No definition found';
       setTimeout(() => { statusEl.textContent = ''; }, 2000);
@@ -3848,12 +3800,8 @@ async function findReferences() {
   if (!uri) return;
   try {
     statusEl.textContent = 'Finding references...';
-    const langId = detectLanguage(filePath);
-    const [lspResult, wasmResult] = await Promise.all([
-      invoke('lsp_references', { uri, line: cursorLine, character: cursorCol }).catch(() => []),
-      invoke('wasm_references', { langId, uri, line: cursorLine, character: cursorCol, includeDecl: true }).catch(() => []),
-    ]);
-    const merged = [...(Array.isArray(lspResult) ? lspResult : []), ...(Array.isArray(wasmResult) ? wasmResult : [])];
+    // Unified dispatch: merges WASM + LSP (union semantics)
+    const merged = await invoke('lang_references', { uri, line: cursorLine, character: cursorCol, includeDecl: true }).catch(() => []);
     if (merged.length === 0) {
       statusEl.textContent = 'No references found';
       setTimeout(() => { statusEl.textContent = ''; }, 2000);

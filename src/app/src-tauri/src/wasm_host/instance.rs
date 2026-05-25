@@ -9,7 +9,7 @@ use crate::wasm_host::manifest::CoreCodeManifest;
 use crate::wasm_host::wit_types::{self, *};
 use std::path::Path;
 use wasmtime::component::{Component, Func, Linker, Val};
-use wasmtime::{Engine, Store};
+use wasmtime::{Engine, Store, StoreLimitsBuilder};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
 /// Maximum size of a WASM binary that the host will load (50 MB).
@@ -23,11 +23,16 @@ const FUEL_PER_CALL: u64 = 1_000_000_000;
 /// so 30 ticks ≈ 30 seconds wall-clock timeout per call as defense-in-depth.
 const EPOCH_DEADLINE_TICKS: u64 = 30;
 
+/// Maximum WASM linear memory per extension instance (256 MB).
+const MAX_WASM_MEMORY: usize = 256 * 1024 * 1024;
+
 /// State stored inside each `wasmtime::Store`.
 pub(super) struct InstanceState {
     wasi: WasiCtx,
     table: ResourceTable,
     pub(super) host_ctx: HostContext,
+    /// Memory limiter — enforces MAX_WASM_MEMORY to prevent exhaustion attacks.
+    limits: wasmtime::StoreLimits,
 }
 
 impl WasiView for InstanceState {
@@ -100,14 +105,20 @@ impl WasmInstance {
         // Minimal WASI context — no filesystem, no networking, no env vars.
         let wasi = WasiCtxBuilder::new().build();
         let table = ResourceTable::new();
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(MAX_WASM_MEMORY)
+            .build();
         let state = InstanceState {
             wasi,
             table,
             host_ctx,
+            limits,
         };
         let mut store = Store::new(engine, state);
         // Set epoch deadline so the store traps after ~30 seconds wall-clock time.
         store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
+        // Enforce memory limit — traps if the WASM module tries to grow past MAX_WASM_MEMORY.
+        store.limiter(|s| &mut s.limits);
 
         // Build the component linker.
         let mut linker: Linker<InstanceState> = Linker::new(engine);

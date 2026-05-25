@@ -68,6 +68,9 @@ wasmtime-wasi = "25"
 # corecode.toml manifest parsing
 toml = "0.8"
 
+# Glob matching for workspace::find_files
+glob = "0.3"
+
 # Dynamic grammar loading (tree-sitter grammars from pre-packaged extension dylibs)
 libloading = "0.8"
 

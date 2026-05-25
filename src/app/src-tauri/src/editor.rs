@@ -774,6 +774,11 @@ impl WorkspaceState {
         path.and_then(move |p| self.buffers.get_mut(&p))
     }
 
+    /// Get a reference to a buffer by path (any open buffer, not just active).
+    pub fn get_buffer_by_path(&self, path: &Path) -> Option<&DocumentBuffer> {
+        self.buffers.get(path)
+    }
+
     /// Get a mutable reference to a buffer by path (any open buffer, not just active).
     pub fn get_buffer_mut_by_path(&mut self, path: &Path) -> Option<&mut DocumentBuffer> {
         self.buffers.get_mut(path)

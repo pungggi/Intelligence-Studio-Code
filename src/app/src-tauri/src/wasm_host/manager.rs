@@ -76,6 +76,8 @@ impl WasmHostManager {
         {
             let engine_clone = engine.clone();
             let shutdown_clone = shutdown.clone();
+            // The JoinHandle is intentionally dropped: the thread exits via the
+            // `epoch_ticker_shutdown` flag set in `deactivate_all`, not via join.
             std::thread::Builder::new()
                 .name("wasm-epoch-ticker".into())
                 .spawn(move || {
@@ -118,7 +120,10 @@ impl WasmHostManager {
     /// Extensions not on this list that declare `grammar-dylib` will still
     /// activate — their dylib is simply skipped with a warning log.
     pub fn set_native_grammar_allowlist(&self, ids: HashSet<String>) {
-        *self.native_grammar_allowlist.lock().unwrap() = ids;
+        match self.native_grammar_allowlist.lock() {
+            Ok(mut g) => *g = ids,
+            Err(e) => log::error!("set_native_grammar_allowlist: mutex poisoned, ignoring update: {e}"),
+        }
     }
 
     /// Scan `extensions_dir` and activate all WASM extensions found there.
@@ -197,26 +202,22 @@ impl WasmHostManager {
             }
         }
 
-        // RAII guard: removes `id` from `loading` on drop (covers all error paths,
-        // including panics between activate() and the final instances.insert()).
+        // RAII guard: always removes `id` from `loading` on drop — whether activation
+        // succeeds or fails (including panics). This allows retry after any failure.
         struct LoadingGuard<'a> {
             loading: &'a Mutex<HashSet<String>>,
             id: String,
-            committed: bool,
         }
         impl Drop for LoadingGuard<'_> {
             fn drop(&mut self) {
-                if !self.committed {
-                    if let Ok(mut set) = self.loading.lock() {
-                        set.remove(&self.id);
-                    }
+                if let Ok(mut set) = self.loading.lock() {
+                    set.remove(&self.id);
                 }
             }
         }
-        let mut guard = LoadingGuard {
+        let _guard = LoadingGuard {
             loading: &self.loading,
             id: id.clone(),
-            committed: false,
         };
 
         let host_ctx = HostContext::new(
@@ -227,8 +228,7 @@ impl WasmHostManager {
             manifest.capabilities.webview_panels,
         );
 
-        let mut instance = WasmInstance::load(&self.engine, ext_dir, &manifest, host_ctx)
-            .map_err(|e| e)?;
+        let mut instance = WasmInstance::load(&self.engine, ext_dir, &manifest, host_ctx)?;
 
         instance.activate()?;
 
@@ -288,9 +288,7 @@ impl WasmHostManager {
         self.process_webview_ops(&id, &mut instance);
 
         self.instances.lock().unwrap().insert(id.clone(), instance);
-        // Disarm the drop guard — the extension is fully committed to `instances`.
-        guard.committed = true;
-        self.loading.lock().unwrap().remove(&id);
+        // _guard drops here, removing id from `loading`.
         Ok(id)
     }
 
@@ -410,7 +408,7 @@ impl WasmHostManager {
     /// HTML, then emits a "create" + "setHtml" event pair. Other ops map 1:1
     /// to `WebviewPanelEvent`s.
     ///
-    /// Must be called while `instances` lock is held and the instance is available.
+    /// Called with a live `&mut WasmInstance` — does NOT require `instances` to be locked.
     fn process_webview_ops(&self, ext_id: &str, instance: &mut WasmInstance) {
         let ops = instance.drain_webview_ops();
         if ops.is_empty() {
@@ -524,6 +522,11 @@ impl WasmHostManager {
     /// Route a message from the frontend webview back to the owning WASM extension.
     ///
     /// Returns `Err` if the panel is not owned by any WASM extension.
+    ///
+    /// Note: `panel_owners` and `instances` are acquired in separate lock scopes. If the
+    /// extension is deactivated between the two lock acquisitions, this returns
+    /// `Err("Extension … not loaded")` and the message is silently dropped — an acceptable
+    /// race given that deactivation also closes its panels on the frontend.
     pub fn route_webview_message(&self, panel_id: &str, message: &str) -> Result<(), String> {
         let ext_id = {
             let owners = self.panel_owners.lock().unwrap();
