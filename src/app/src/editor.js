@@ -168,6 +168,11 @@ let selAnchorLine = null;
 let selAnchorCol = null;
 let isDragging = false;
 
+// Selection-range expand/shrink — stack of prior selections so shrink can pop
+// back to the previous level. Cleared when the cursor moves without expand.
+let selectionRangeStack = []; // Array<{ startLine, startCol, endLine, endCol }>
+let selectionRangeAnchor = null; // { line, character } — where expand started
+
 // Multi-cursor state
 let extraCursors = []; // Array<{ line, col, anchorLine, anchorCol }>
 // Ctrl+D state
@@ -1961,6 +1966,10 @@ document.addEventListener('keydown', (e) => {
   if (e.ctrlKey && e.key === ' ') { e.preventDefault(); triggerAutocomplete(null); return; }
   if (e.key === 'F12' && !e.shiftKey && !e.ctrlKey) { e.preventDefault(); goToDefinition(); return; }
   if (e.key === 'F12' && e.shiftKey && !e.ctrlKey) { e.preventDefault(); findReferences(); return; }
+  if (e.key === 'F12' && e.ctrlKey && !e.shiftKey) { e.preventDefault(); goToImplementation(); return; }
+  if (e.key === 'F12' && e.ctrlKey && e.shiftKey) { e.preventDefault(); goToTypeDefinition(); return; }
+  if (e.altKey && e.shiftKey && e.key === 'ArrowRight') { e.preventDefault(); expandSelection(); return; }
+  if (e.altKey && e.shiftKey && e.key === 'ArrowLeft') { e.preventDefault(); shrinkSelection(); return; }
   if (e.ctrlKey && e.key === '.') { e.preventDefault(); requestCodeActions(); return; }
   if (e.ctrlKey && e.shiftKey && e.key === '[') { e.preventDefault(); foldAtCursor(); return; }
   if (e.ctrlKey && e.shiftKey && e.key === ']') { e.preventDefault(); unfoldAtCursor(); return; }
@@ -3721,14 +3730,25 @@ hoverTooltip.addEventListener('mouseleave', () => closeHover());
 // --- Go-to-definition ---
 
 async function goToDefinition() {
+  return goToLocationCommand('lang_definition', 'definition');
+}
+
+async function goToTypeDefinition() {
+  return goToLocationCommand('lsp_type_definition', 'type definition');
+}
+
+async function goToImplementation() {
+  return goToLocationCommand('lsp_implementation', 'implementation');
+}
+
+async function goToLocationCommand(command, label) {
   const uri = getActiveUri();
   if (!uri) return;
   try {
-    statusEl.textContent = 'Go to definition...';
-    // Unified dispatch: merges WASM + LSP, WASM priority
-    const result = await invoke('lang_definition', { uri, line: cursorLine, character: cursorCol }).catch(() => null);
+    statusEl.textContent = `Go to ${label}...`;
+    const result = await invoke(command, { uri, line: cursorLine, character: cursorCol }).catch(() => null);
     if (!result || (Array.isArray(result) && result.length === 0)) {
-      statusEl.textContent = 'No definition found';
+      statusEl.textContent = `No ${label} found`;
       setTimeout(() => { statusEl.textContent = ''; }, 2000);
       return;
     }
@@ -3737,7 +3757,7 @@ async function goToDefinition() {
     if (loc.uri && loc.range) await navigateToLocation(loc.uri, loc.range.start.line, loc.range.start.character);
     statusEl.textContent = '';
   } catch {
-    statusEl.textContent = 'Definition unavailable';
+    statusEl.textContent = `${label} unavailable`;
     setTimeout(() => { statusEl.textContent = ''; }, 2000);
   }
 }
@@ -3775,6 +3795,87 @@ editorEl.addEventListener('click', async (e) => {
     await goToDefinition();
   }
 });
+
+// --- Selection range (expand / shrink) ---
+
+async function expandSelection() {
+  const uri = getActiveUri();
+  if (!uri) return;
+  // Anchor at first expand from current cursor — on shrink we walk back to
+  // this point. Re-anchor whenever the cursor moves outside the current
+  // top-of-stack selection between expand calls.
+  const cur = currentSelectionRange();
+  if (!selectionRangeAnchor || !selectionContains(cur, selectionRangeAnchor)) {
+    selectionRangeStack = [];
+    selectionRangeAnchor = { line: cursorLine, character: cursorCol };
+  }
+  let result;
+  try {
+    result = await invoke('lsp_selection_ranges', {
+      uri,
+      positions: [{ line: selectionRangeAnchor.line, character: selectionRangeAnchor.character }],
+    });
+  } catch {
+    return;
+  }
+  if (!Array.isArray(result) || result.length === 0) return;
+  // result[0] is a SelectionRange chain (range + parent + ...). Walk to the
+  // first range strictly enclosing the current selection.
+  let node = result[0];
+  while (node) {
+    if (rangeStrictlyContains(node.range, cur)) {
+      selectionRangeStack.push(cur);
+      applySelectionRange(node.range);
+      return;
+    }
+    node = node.parent;
+  }
+}
+
+function shrinkSelection() {
+  if (selectionRangeStack.length === 0) return;
+  const prev = selectionRangeStack.pop();
+  applySelectionRange({
+    start: { line: prev.startLine, character: prev.startCol },
+    end:   { line: prev.endLine,   character: prev.endCol },
+  });
+}
+
+function currentSelectionRange() {
+  if (selAnchorLine === null || selAnchorCol === null) {
+    return { startLine: cursorLine, startCol: cursorCol, endLine: cursorLine, endCol: cursorCol };
+  }
+  if (selAnchorLine < cursorLine || (selAnchorLine === cursorLine && selAnchorCol <= cursorCol)) {
+    return { startLine: selAnchorLine, startCol: selAnchorCol, endLine: cursorLine, endCol: cursorCol };
+  }
+  return { startLine: cursorLine, startCol: cursorCol, endLine: selAnchorLine, endCol: selAnchorCol };
+}
+
+function applySelectionRange(range) {
+  selAnchorLine = range.start.line;
+  selAnchorCol = range.start.character;
+  cursorLine = range.end.line;
+  cursorCol = range.end.character;
+  requestRender();
+}
+
+function selectionContains(sel, pos) {
+  if (pos.line < sel.startLine || pos.line > sel.endLine) return false;
+  if (pos.line === sel.startLine && pos.character < sel.startCol) return false;
+  if (pos.line === sel.endLine && pos.character > sel.endCol) return false;
+  return true;
+}
+
+function rangeStrictlyContains(range, sel) {
+  const posLE = (a, b) => a.line < b.line || (a.line === b.line && a.character <= b.character);
+  const selStart = { line: sel.startLine, character: sel.startCol };
+  const selEnd = { line: sel.endLine, character: sel.endCol };
+  if (!posLE(range.start, selStart)) return false;
+  if (!posLE(selEnd, range.end)) return false;
+  const startsEq = range.start.line === selStart.line && range.start.character === selStart.character;
+  const endsEq = range.end.line === selEnd.line && range.end.character === selEnd.character;
+  return !(startsEq && endsEq);
+}
 
 // --- Find References ---
 
