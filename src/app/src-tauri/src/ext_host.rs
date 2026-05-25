@@ -192,6 +192,14 @@ pub fn start_extension_host(
 }
 
 fn find_ext_host_script(app: &AppHandle) -> Option<PathBuf> {
+    // 1. Explicit override — useful in dev/CI when bundled paths don't apply.
+    if let Ok(env_path) = std::env::var("CORECODE_EXT_HOST_SCRIPT") {
+        let p = PathBuf::from(env_path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
     let res_dir = app.path().resource_dir().ok();
     let exe_dir = app.path().executable_dir().ok();
 
@@ -200,7 +208,7 @@ fn find_ext_host_script(app: &AppHandle) -> Option<PathBuf> {
         &["extension-host", "src", "spike-ext-host.js"],
     ];
 
-    for base in [res_dir, exe_dir].into_iter().flatten() {
+    for base in [res_dir.clone(), exe_dir.clone()].into_iter().flatten() {
         for suffix in suffixes {
             let mut candidate: PathBuf = base.clone();
             for part in *suffix {
@@ -208,6 +216,23 @@ fn find_ext_host_script(app: &AppHandle) -> Option<PathBuf> {
             }
             if candidate.exists() {
                 return Some(candidate);
+            }
+        }
+    }
+
+    // 2. Dev-mode fallback: walk up from the executable directory looking for
+    //    `src/extension-host/dist/host.js`. In `cargo tauri dev` the exe lives
+    //    at `src/app/src-tauri/target/debug/<name>.exe`, so the repo root sits
+    //    four levels up.
+    if let Some(start) = exe_dir {
+        let mut cur: PathBuf = start;
+        for _ in 0..8 {
+            let candidate = cur.join("src").join("extension-host").join("dist").join("host.js");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            if !cur.pop() {
+                break;
             }
         }
     }

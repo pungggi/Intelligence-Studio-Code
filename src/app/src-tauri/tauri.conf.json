@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "identifier": "dev.corecode.editor",
   "build": {
+    "beforeDevCommand": "npx --yes http-server src -p 1420 -c-1 -s",
     "frontendDist": "../src",
     "devUrl": "http://localhost:1420"
   },

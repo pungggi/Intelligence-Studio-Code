@@ -7,11 +7,15 @@
  * 3. Routes messages between extensions and the frontend
  */
 
-import { resolve, relative, isAbsolute } from "path";
+import { resolve, relative, isAbsolute, dirname } from "path";
 import { realpathSync, existsSync } from "fs";
+import { fileURLToPath } from "url";
 import { ExtensionLoader } from "./extension-loader.js";
 import { IpcServer, IpcMessage } from "./ipc-server.js";
 import { VscodeApiShim } from "./vscode-api-shim.js";
+
+// ESM equivalent of CommonJS __dirname.
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const IPC_HOST = process.env.CORECODE_IPC_HOST ?? "127.0.0.1";
 const IPC_PORT = parseInt(process.env.CORECODE_IPC_PORT ?? "17532", 10);
