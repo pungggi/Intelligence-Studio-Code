@@ -189,6 +189,207 @@ pub fn uri_to_path(uri: &str) -> String {
     percent_decode(raw)
 }
 
+/// Normalize a WASM TextEdit into LSP-style JSON: `{ range, newText }`.
+fn text_edit_to_lsp_json(e: &wasm_host::wit_types::TextEdit) -> serde_json::Value {
+    serde_json::json!({
+        "range": {
+            "start": { "line": e.range.start.line, "character": e.range.start.character },
+            "end":   { "line": e.range.end.line,   "character": e.range.end.character },
+        },
+        "newText": e.new_text,
+    })
+}
+
+/// Merge format edits — LSP priority, WASM fallback.
+///
+/// Matches existing frontend behavior: prefer LSP formatter output (rustfmt,
+/// prettier, etc.) when non-empty; otherwise fall back to WASM extension edits.
+/// Returns LSP-style `{ range, newText }` objects.
+pub fn merged_format_edits(
+    wasm_edits: &[wasm_host::wit_types::TextEdit],
+    lsp_result: Result<serde_json::Value, String>,
+) -> Vec<serde_json::Value> {
+    if let Ok(val) = lsp_result {
+        if let Some(arr) = val.as_array() {
+            if !arr.is_empty() {
+                return arr.clone();
+            }
+        }
+    }
+    wasm_edits.iter().map(text_edit_to_lsp_json).collect()
+}
+
+/// Merge rename edits — LSP priority, WASM fallback.
+///
+/// Returns a list of `WorkspaceFileEdit`-shaped JSON objects ready for
+/// `apply_workspace_edit`. Accepts both LSP `WorkspaceEdit.changes` (already
+/// pre-normalized by the Node host) and `WorkspaceEdit.documentChanges`
+/// (an array of `{ textDocument: { uri }, edits: [{ range, newText }] }`),
+/// which is converted to the snake_case `WorkspaceFileEdit` shape. Falls back
+/// to WASM edits wrapped into a single change targeting `uri`.
+pub fn merged_rename_changes(
+    wasm_edits: &[wasm_host::wit_types::TextEdit],
+    uri: &str,
+    lsp_result: Result<serde_json::Value, String>,
+) -> Vec<serde_json::Value> {
+    if let Ok(val) = lsp_result {
+        if let Some(changes) = val.get("changes").and_then(|v| v.as_array()) {
+            if !changes.is_empty() {
+                return changes.clone();
+            }
+        }
+        if let Some(doc_changes) = val.get("documentChanges").and_then(|v| v.as_array()) {
+            let converted: Vec<serde_json::Value> = doc_changes
+                .iter()
+                .filter_map(lsp_document_change_to_file_edit)
+                .collect();
+            if !converted.is_empty() {
+                return converted;
+            }
+        }
+    }
+    if wasm_edits.is_empty() {
+        return vec![];
+    }
+    let edits: Vec<serde_json::Value> = wasm_edits
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "start_line": e.range.start.line as usize,
+                "start_col":  e.range.start.character as usize,
+                "end_line":   e.range.end.line as usize,
+                "end_col":    e.range.end.character as usize,
+                "new_text":   e.new_text,
+            })
+        })
+        .collect();
+    vec![serde_json::json!({ "uri": uri, "edits": edits })]
+}
+
+/// Convert a single LSP `documentChanges[i]` (a `TextDocumentEdit`) to the
+/// snake_case `WorkspaceFileEdit` shape expected by `apply_workspace_edit`.
+/// Returns `None` if the entry is a resource op (create/rename/delete file)
+/// rather than a `TextDocumentEdit`.
+fn lsp_document_change_to_file_edit(item: &serde_json::Value) -> Option<serde_json::Value> {
+    let uri = item.get("textDocument")?.get("uri")?.as_str()?;
+    let lsp_edits = item.get("edits")?.as_array()?;
+    let edits: Vec<serde_json::Value> = lsp_edits
+        .iter()
+        .filter_map(|e| {
+            let range = e.get("range")?;
+            let start = range.get("start")?;
+            let end = range.get("end")?;
+            let new_text = e
+                .get("newText")
+                .or_else(|| e.get("new_text"))
+                .and_then(|v| v.as_str())?;
+            Some(serde_json::json!({
+                "start_line": start.get("line")?.as_u64()? as usize,
+                "start_col":  start.get("character")?.as_u64()? as usize,
+                "end_line":   end.get("line")?.as_u64()? as usize,
+                "end_col":    end.get("character")?.as_u64()? as usize,
+                "new_text":   new_text,
+            }))
+        })
+        .collect();
+    if edits.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({ "uri": uri, "edits": edits }))
+}
+
+/// Merge code actions — union of LSP and WASM results.
+///
+/// LSP items appear first (preserving their already-normalized shape).
+/// WASM `CodeAction { title, kind, edits }` is normalized into a workspace-edit
+/// envelope: `{ title, kind, isPreferred: false, edit: { changes: [...] } }`.
+pub fn merged_code_actions(
+    wasm_actions: Vec<wasm_host::wit_types::CodeAction>,
+    lsp_result: Result<serde_json::Value, String>,
+    fallback_uri: &str,
+) -> Vec<serde_json::Value> {
+    let mut merged: Vec<serde_json::Value> = Vec::new();
+    if let Ok(val) = lsp_result {
+        if let Some(arr) = val.as_array() {
+            merged.extend(arr.iter().cloned());
+        }
+    }
+    for a in wasm_actions {
+        let changes: Vec<serde_json::Value> = a
+            .edits
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "uri": fallback_uri,
+                    "range": {
+                        "start": { "line": e.range.start.line, "character": e.range.start.character },
+                        "end":   { "line": e.range.end.line,   "character": e.range.end.character },
+                    },
+                    "newText": e.new_text,
+                })
+            })
+            .collect();
+        let edit = if changes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!({ "changes": changes })
+        };
+        merged.push(serde_json::json!({
+            "title": a.title,
+            "kind": a.kind,
+            "isPreferred": false,
+            "edit": edit,
+        }));
+    }
+    merged
+}
+
+/// Merge workspace symbols — union of LSP and WASM results.
+pub fn merged_workspace_symbols(
+    wasm_symbols: Vec<wasm_host::wit_types::Symbol>,
+    lsp_result: Result<serde_json::Value, String>,
+) -> Vec<serde_json::Value> {
+    let mut merged: Vec<serde_json::Value> = wasm_symbols
+        .into_iter()
+        .map(serde_json::to_value)
+        .filter_map(Result::ok)
+        .collect();
+    if let Ok(val) = lsp_result {
+        if let Some(arr) = val.as_array() {
+            merged.extend(arr.iter().cloned());
+        }
+    }
+    merged
+}
+
+/// Merge folding ranges — WASM priority, LSP fallback.
+///
+/// Returns `{ startLine, endLine, kind }` objects (frontend already normalizes
+/// either casing, but emitting camelCase keeps parity with LSP shape).
+pub fn merged_folding_ranges(
+    wasm_ranges: &[wasm_host::wit_types::FoldingRange],
+    lsp_result: Result<serde_json::Value, String>,
+) -> Vec<serde_json::Value> {
+    if !wasm_ranges.is_empty() {
+        return wasm_ranges
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "startLine": r.start_line,
+                    "endLine":   r.end_line,
+                    "kind":      r.kind,
+                })
+            })
+            .collect();
+    }
+    if let Ok(val) = lsp_result {
+        if let Some(arr) = val.as_array() {
+            return arr.clone();
+        }
+    }
+    vec![]
+}
+
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -212,7 +413,10 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wasm_host::wit_types::{CompletionItem, HoverResult, Location, Position, Range, Severity, Diagnostic as WasmDiag};
+    use crate::wasm_host::wit_types::{
+        CodeAction, CompletionItem, Diagnostic as WasmDiag, FoldingRange, HoverResult, Location,
+        Position, Range, Severity, Symbol, SymbolKind, TextEdit,
+    };
 
     fn zero_range() -> Range {
         Range {
@@ -444,5 +648,215 @@ mod tests {
         let raw = "not-a-uri";
         let path = uri_to_path(raw);
         assert_eq!(path, raw);
+    }
+
+    // ── merged_format_edits ───────────────────────────────────────────────────
+
+    fn text_edit(line: u32, ch: u32, new_text: &str) -> TextEdit {
+        TextEdit {
+            range: Range {
+                start: Position { line, character: ch },
+                end: Position { line, character: ch },
+            },
+            new_text: new_text.to_string(),
+        }
+    }
+
+    #[test]
+    fn merged_format_lsp_priority_when_non_empty() {
+        let wasm = vec![text_edit(0, 0, "wasm")];
+        let lsp = Ok(serde_json::json!([{ "range": {}, "newText": "lsp" }]));
+        let out = merged_format_edits(&wasm, lsp);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["newText"], "lsp");
+    }
+
+    #[test]
+    fn merged_format_falls_back_to_wasm_when_lsp_empty() {
+        let wasm = vec![text_edit(3, 2, "hello")];
+        let lsp = Ok(serde_json::json!([]));
+        let out = merged_format_edits(&wasm, lsp);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["newText"], "hello");
+        assert_eq!(out[0]["range"]["start"]["line"], 3);
+        assert_eq!(out[0]["range"]["start"]["character"], 2);
+    }
+
+    #[test]
+    fn merged_format_falls_back_to_wasm_when_lsp_error() {
+        let wasm = vec![text_edit(0, 0, "wasm")];
+        let out = merged_format_edits(&wasm, Err("lsp down".to_string()));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["newText"], "wasm");
+    }
+
+    #[test]
+    fn merged_format_empty_when_both_empty() {
+        let out = merged_format_edits(&[], Ok(serde_json::json!([])));
+        assert!(out.is_empty());
+    }
+
+    // ── merged_rename_changes ─────────────────────────────────────────────────
+
+    #[test]
+    fn merged_rename_lsp_priority() {
+        let wasm = vec![text_edit(0, 0, "wasm")];
+        let lsp = Ok(serde_json::json!({
+            "changes": [{ "uri": "file:///a.rs", "edits": [] }]
+        }));
+        let out = merged_rename_changes(&wasm, "file:///x.rs", lsp);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["uri"], "file:///a.rs");
+    }
+
+    #[test]
+    fn merged_rename_wraps_wasm_into_workspace_edit_when_lsp_empty() {
+        let wasm = vec![text_edit(2, 4, "newName")];
+        let lsp = Ok(serde_json::json!({ "changes": [] }));
+        let out = merged_rename_changes(&wasm, "file:///x.rs", lsp);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["uri"], "file:///x.rs");
+        let edits = out[0]["edits"].as_array().unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0]["new_text"], "newName");
+        assert_eq!(edits[0]["start_line"], 2);
+        assert_eq!(edits[0]["start_col"], 4);
+    }
+
+    #[test]
+    fn merged_rename_empty_when_both_empty() {
+        let out = merged_rename_changes(&[], "file:///x.rs", Ok(serde_json::json!({ "changes": [] })));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn merged_rename_converts_lsp_document_changes() {
+        let lsp = Ok(serde_json::json!({
+            "documentChanges": [{
+                "textDocument": { "uri": "file:///a.rs", "version": 1 },
+                "edits": [{
+                    "range": {
+                        "start": { "line": 5, "character": 2 },
+                        "end":   { "line": 5, "character": 10 },
+                    },
+                    "newText": "renamed",
+                }],
+            }],
+        }));
+        let out = merged_rename_changes(&[], "file:///x.rs", lsp);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["uri"], "file:///a.rs");
+        let edits = out[0]["edits"].as_array().unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0]["start_line"], 5);
+        assert_eq!(edits[0]["start_col"], 2);
+        assert_eq!(edits[0]["end_line"], 5);
+        assert_eq!(edits[0]["end_col"], 10);
+        assert_eq!(edits[0]["new_text"], "renamed");
+    }
+
+    #[test]
+    fn merged_rename_skips_resource_ops_in_document_changes() {
+        let wasm = vec![text_edit(0, 0, "wasmFallback")];
+        let lsp = Ok(serde_json::json!({
+            "documentChanges": [
+                { "kind": "create", "uri": "file:///new.rs" },
+                { "kind": "rename", "oldUri": "a", "newUri": "b" },
+            ],
+        }));
+        let out = merged_rename_changes(&wasm, "file:///x.rs", lsp);
+        // No TextDocumentEdit entries -> fall through to WASM wrap
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["uri"], "file:///x.rs");
+        assert_eq!(out[0]["edits"][0]["new_text"], "wasmFallback");
+    }
+
+    // ── merged_code_actions ───────────────────────────────────────────────────
+
+    #[test]
+    fn merged_code_actions_union_lsp_first() {
+        let wasm = vec![CodeAction {
+            title: "wasm action".to_string(),
+            kind: Some("quickfix".to_string()),
+            edits: vec![text_edit(0, 0, "fix")],
+        }];
+        let lsp = Ok(serde_json::json!([{ "title": "lsp action" }]));
+        let out = merged_code_actions(wasm, lsp, "file:///x.rs");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["title"], "lsp action");
+        assert_eq!(out[1]["title"], "wasm action");
+        assert_eq!(out[1]["kind"], "quickfix");
+        assert_eq!(out[1]["edit"]["changes"][0]["uri"], "file:///x.rs");
+        assert_eq!(out[1]["edit"]["changes"][0]["newText"], "fix");
+    }
+
+    #[test]
+    fn merged_code_actions_wasm_with_no_edits_has_null_edit() {
+        let wasm = vec![CodeAction {
+            title: "info".to_string(),
+            kind: None,
+            edits: vec![],
+        }];
+        let out = merged_code_actions(wasm, Err("down".to_string()), "file:///x.rs");
+        assert_eq!(out.len(), 1);
+        assert!(out[0]["edit"].is_null());
+    }
+
+    // ── merged_workspace_symbols ──────────────────────────────────────────────
+
+    #[test]
+    fn merged_workspace_symbols_union_wasm_first() {
+        let wasm = vec![Symbol {
+            name: "wasm_sym".to_string(),
+            kind: SymbolKind::Function,
+            location: Location { uri: "file:///a.rs".to_string(), range: zero_range() },
+            container_name: None,
+        }];
+        let lsp = Ok(serde_json::json!([{ "name": "lsp_sym" }]));
+        let out = merged_workspace_symbols(wasm, lsp);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["name"], "wasm_sym");
+        assert_eq!(out[1]["name"], "lsp_sym");
+    }
+
+    #[test]
+    fn merged_workspace_symbols_lsp_error_returns_wasm_only() {
+        let wasm = vec![Symbol {
+            name: "wasm_sym".to_string(),
+            kind: SymbolKind::Function,
+            location: Location { uri: "file:///a.rs".to_string(), range: zero_range() },
+            container_name: None,
+        }];
+        let out = merged_workspace_symbols(wasm, Err("down".to_string()));
+        assert_eq!(out.len(), 1);
+    }
+
+    // ── merged_folding_ranges ─────────────────────────────────────────────────
+
+    #[test]
+    fn merged_folding_wasm_priority() {
+        let wasm = vec![FoldingRange { start_line: 1, end_line: 5, kind: Some("region".to_string()) }];
+        let lsp = Ok(serde_json::json!([{ "startLine": 10, "endLine": 20 }]));
+        let out = merged_folding_ranges(&wasm, lsp);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["startLine"], 1);
+        assert_eq!(out[0]["endLine"], 5);
+        assert_eq!(out[0]["kind"], "region");
+    }
+
+    #[test]
+    fn merged_folding_falls_back_to_lsp_when_wasm_empty() {
+        let out = merged_folding_ranges(
+            &[],
+            Ok(serde_json::json!([{ "startLine": 10, "endLine": 20 }])),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["startLine"], 10);
+    }
+
+    #[test]
+    fn merged_folding_empty_when_both_empty() {
+        let out = merged_folding_ranges(&[], Err("down".to_string()));
+        assert!(out.is_empty());
     }
 }

@@ -851,6 +851,21 @@ impl WasmHostManager {
         results
     }
 
+    /// Workspace symbols across every active extension (language-agnostic).
+    /// Used for global symbol search where the originating file's language
+    /// should not constrain results.
+    pub fn workspace_symbols_all(&self, query: &str) -> Vec<Symbol> {
+        let mut results = Vec::new();
+        let mut instances = self.instances.lock().unwrap();
+        for (id, inst) in instances.iter_mut() {
+            match inst.workspace_symbols(query) {
+                Ok(items) => results.extend(items),
+                Err(e) => log::warn!("workspace-symbols error from {id}: {e}"),
+            }
+        }
+        results
+    }
+
     /// Folding ranges from the first extension that returns a non-empty list.
     pub fn folding_ranges_for_lang(
         &self,
@@ -1004,6 +1019,13 @@ mod tests {
     fn workspace_symbols_returns_empty_for_unknown_lang() {
         let mgr = make_manager();
         let syms = mgr.workspace_symbols_for_lang("cobol", "test");
+        assert!(syms.is_empty());
+    }
+
+    #[test]
+    fn workspace_symbols_all_returns_empty_when_no_instances() {
+        let mgr = make_manager();
+        let syms = mgr.workspace_symbols_all("test");
         assert!(syms.is_empty());
     }
 

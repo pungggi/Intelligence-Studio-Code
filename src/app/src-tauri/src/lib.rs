@@ -638,89 +638,11 @@ fn get_wasm_status_bar_items(state: tauri::State<AppState>) -> Vec<ipc_bridge::S
         .collect()
 }
 
-// --- WASM Language Provider Commands ---
-// Note: wasm_completions, wasm_diagnostics, wasm_hover, wasm_definition, wasm_references
-// were removed — the unified lang_* commands in the dispatch layer supersede them.
-
-#[tauri::command]
-fn wasm_format_document(
-    state: tauri::State<AppState>,
-    lang_id: String,
-    uri: String,
-    content: String,
-) -> Result<serde_json::Value, String> {
-    let edits = state.wasm_host.format_document_for_lang(&lang_id, &uri, &content);
-    serde_json::to_value(&edits).map_err(|e| format!("serialization error: {e}"))
-}
-
-#[tauri::command]
-fn wasm_format_range(
-    state: tauri::State<AppState>,
-    lang_id: String,
-    uri: String,
-    content: String,
-    start_line: u32,
-    start_character: u32,
-    end_line: u32,
-    end_character: u32,
-) -> Result<serde_json::Value, String> {
-    let range = crate::wasm_host::wit_types::Range {
-        start: crate::wasm_host::wit_types::Position { line: start_line, character: start_character },
-        end: crate::wasm_host::wit_types::Position { line: end_line, character: end_character },
-    };
-    let edits = state.wasm_host.format_range_for_lang(&lang_id, &uri, &content, &range);
-    serde_json::to_value(&edits).map_err(|e| format!("serialization error: {e}"))
-}
-
-#[tauri::command]
-fn wasm_rename(
-    state: tauri::State<AppState>,
-    lang_id: String,
-    uri: String,
-    line: u32,
-    character: u32,
-    new_name: String,
-) -> Result<serde_json::Value, String> {
-    let edits = state.wasm_host.rename_for_lang(&lang_id, &uri, line, character, &new_name);
-    serde_json::to_value(&edits).map_err(|e| format!("serialization error: {e}"))
-}
-
-#[tauri::command]
-fn wasm_code_actions(
-    state: tauri::State<AppState>,
-    lang_id: String,
-    uri: String,
-    range: serde_json::Value,
-    diagnostics: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let r: wasm_host::Range = serde_json::from_value(range).map_err(|e| format!("bad range: {e}"))?;
-    let diags: Vec<wasm_host::Diagnostic> = serde_json::from_value(diagnostics).map_err(|e| format!("bad diagnostics: {e}"))?;
-    let actions = state.wasm_host.code_actions_for_lang(&lang_id, &uri, &r, &diags);
-    serde_json::to_value(&actions).map_err(|e| format!("serialization error: {e}"))
-}
-
-#[tauri::command]
-fn wasm_workspace_symbols(
-    state: tauri::State<AppState>,
-    lang_id: String,
-    query: String,
-) -> Result<serde_json::Value, String> {
-    let symbols = state.wasm_host.workspace_symbols_for_lang(&lang_id, &query);
-    serde_json::to_value(&symbols).map_err(|e| format!("serialization error: {e}"))
-}
-
-#[tauri::command]
-fn wasm_folding_ranges(
-    state: tauri::State<AppState>,
-    lang_id: String,
-    uri: String,
-    content: String,
-) -> Result<serde_json::Value, String> {
-    let ranges = state.wasm_host.folding_ranges_for_lang(&lang_id, &uri, &content);
-    serde_json::to_value(&ranges).map_err(|e| format!("serialization error: {e}"))
-}
-
 // ── Unified Language Dispatch ─────────────────────────────────────────────────
+// All language provider features (completions, diagnostics, hover, definition,
+// references, format, rename, code actions, workspace symbols, folding ranges)
+// are exposed via lang_* commands below; they merge WASM extension results
+// with LSP server results through the dispatch module.
 
 
 /// Unified completions — merges results from WASM extensions and LSP servers.
@@ -863,6 +785,175 @@ fn lang_references(
 
     Ok(dispatch::merged_references(wasm_locs, lsp_result))
 }
+
+/// Unified document formatting — LSP priority, WASM fallback.
+#[tauri::command]
+fn lang_format_document(
+    uri: String,
+    content: String,
+    tab_size: Option<u32>,
+    insert_spaces: Option<bool>,
+    state: tauri::State<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+    let wasm_edits = state.wasm_host.format_document_for_lang(&lang_id, &uri, &content);
+
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/formatting",
+        serde_json::json!({
+            "uri": uri,
+            "tabSize": tab_size.unwrap_or(2),
+            "insertSpaces": insert_spaces.unwrap_or(true),
+        }),
+    );
+
+    Ok(dispatch::merged_format_edits(&wasm_edits, lsp_result))
+}
+
+/// Unified range formatting — LSP priority, WASM fallback.
+#[tauri::command]
+fn lang_format_range(
+    uri: String,
+    content: String,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+    tab_size: Option<u32>,
+    insert_spaces: Option<bool>,
+    state: tauri::State<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+    let range = crate::wasm_host::wit_types::Range {
+        start: crate::wasm_host::wit_types::Position { line: start_line, character: start_character },
+        end: crate::wasm_host::wit_types::Position { line: end_line, character: end_character },
+    };
+    let wasm_edits = state.wasm_host.format_range_for_lang(&lang_id, &uri, &content, &range);
+
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/rangeFormatting",
+        serde_json::json!({
+            "uri": uri,
+            "startLine": start_line,
+            "startCharacter": start_character,
+            "endLine": end_line,
+            "endCharacter": end_character,
+            "tabSize": tab_size.unwrap_or(2),
+            "insertSpaces": insert_spaces.unwrap_or(true),
+        }),
+    );
+
+    Ok(dispatch::merged_format_edits(&wasm_edits, lsp_result))
+}
+
+/// Unified rename — LSP priority, WASM fallback. Returns workspace-edit changes
+/// ready for `apply_workspace_edit`.
+#[tauri::command]
+fn lang_rename(
+    uri: String,
+    line: u32,
+    character: u32,
+    new_name: String,
+    state: tauri::State<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+    let wasm_edits = state.wasm_host.rename_for_lang(&lang_id, &uri, line, character, &new_name);
+
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/rename",
+        serde_json::json!({
+            "uri": uri,
+            "line": line,
+            "character": character,
+            "newName": new_name,
+        }),
+    );
+
+    Ok(dispatch::merged_rename_changes(&wasm_edits, &uri, lsp_result))
+}
+
+/// Unified code actions — union of LSP and WASM results.
+#[tauri::command]
+fn lang_code_actions(
+    uri: String,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+    diagnostics: Option<serde_json::Value>,
+    state: tauri::State<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+    let range = wasm_host::Range {
+        start: wasm_host::Position { line: start_line, character: start_character },
+        end: wasm_host::Position { line: end_line, character: end_character },
+    };
+    let diags: Vec<wasm_host::Diagnostic> = diagnostics
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let wasm_actions = state.wasm_host.code_actions_for_lang(&lang_id, &uri, &range, &diags);
+
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/codeAction",
+        serde_json::json!({
+            "uri": uri,
+            "startLine": start_line,
+            "startCharacter": start_character,
+            "endLine": end_line,
+            "endCharacter": end_character,
+        }),
+    );
+
+    Ok(dispatch::merged_code_actions(wasm_actions, lsp_result, &uri))
+}
+
+/// Unified workspace symbols — union of LSP and WASM results.
+///
+/// When `lang_hint` is provided, only WASM extensions claiming that language
+/// are queried. Without a hint, every active WASM extension is consulted so
+/// that global symbol search is not constrained by the originating file.
+#[tauri::command]
+fn lang_workspace_symbols(
+    query: String,
+    lang_hint: Option<String>,
+    state: tauri::State<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let wasm_symbols = match lang_hint.as_deref().filter(|s| !s.is_empty()) {
+        Some(lang_id) => state.wasm_host.workspace_symbols_for_lang(lang_id, &query),
+        None => state.wasm_host.workspace_symbols_all(&query),
+    };
+
+    let lsp_result = state.ipc.request_sync(
+        "workspace/symbol",
+        serde_json::json!({ "query": query }),
+    );
+
+    Ok(dispatch::merged_workspace_symbols(wasm_symbols, lsp_result))
+}
+
+/// Unified folding ranges — WASM priority, LSP fallback.
+#[tauri::command]
+fn lang_folding_ranges(
+    uri: String,
+    content: String,
+    state: tauri::State<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+    let wasm_ranges = state.wasm_host.folding_ranges_for_lang(&lang_id, &uri, &content);
+
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/foldingRange",
+        serde_json::json!({ "uri": uri }),
+    );
+
+    Ok(dispatch::merged_folding_ranges(&wasm_ranges, lsp_result))
+}
+
 fn notify_change(path_str: &str, version: u32, text: &str, ipc: &IpcHandle, workspace_id: &str) {
     ipc.send(OutgoingMessage::DidChange {
         uri: path_to_uri(path_str),
@@ -873,82 +964,9 @@ fn notify_change(path_str: &str, version: u32, text: &str, ipc: &IpcHandle, work
 }
 
 // --- M6: LSP Tauri Commands ---
-
-/// Request hover information at a position.
-#[tauri::command]
-fn lsp_hover(
-    uri: String,
-    line: usize,
-    character: usize,
-    state: tauri::State<AppState>,
-) -> Result<serde_json::Value, String> {
-    let params = serde_json::json!({ "uri": uri, "line": line, "character": character });
-    state.ipc.request_sync("textDocument/hover", params)
-}
-
-/// Request completions at a position.
-#[tauri::command]
-fn lsp_completion(
-    uri: String,
-    line: usize,
-    character: usize,
-    trigger_kind: Option<u32>,
-    trigger_character: Option<String>,
-    state: tauri::State<AppState>,
-) -> Result<serde_json::Value, String> {
-    let params = serde_json::json!({
-        "uri": uri,
-        "line": line,
-        "character": character,
-        "triggerKind": trigger_kind.unwrap_or(1),
-        "triggerCharacter": trigger_character,
-    });
-    state.ipc.request_sync("textDocument/completion", params)
-}
-
-/// Request go-to-definition at a position.
-#[tauri::command]
-fn lsp_definition(
-    uri: String,
-    line: usize,
-    character: usize,
-    state: tauri::State<AppState>,
-) -> Result<serde_json::Value, String> {
-    let params = serde_json::json!({ "uri": uri, "line": line, "character": character });
-    state.ipc.request_sync("textDocument/definition", params)
-}
-
-/// Request find references at a position.
-#[tauri::command]
-fn lsp_references(
-    uri: String,
-    line: usize,
-    character: usize,
-    state: tauri::State<AppState>,
-) -> Result<serde_json::Value, String> {
-    let params = serde_json::json!({ "uri": uri, "line": line, "character": character });
-    state.ipc.request_sync("textDocument/references", params)
-}
-
-/// Request code actions for a range.
-#[tauri::command]
-fn lsp_code_action(
-    uri: String,
-    start_line: usize,
-    start_character: usize,
-    end_line: usize,
-    end_character: usize,
-    state: tauri::State<AppState>,
-) -> Result<serde_json::Value, String> {
-    let params = serde_json::json!({
-        "uri": uri,
-        "startLine": start_line,
-        "startCharacter": start_character,
-        "endLine": end_line,
-        "endCharacter": end_character,
-    });
-    state.ipc.request_sync("textDocument/codeAction", params)
-}
+// Hover/completion/definition/references/code-action/format/rename are exposed
+// only through the unified `lang_*` dispatch commands above. The LSP-only
+// commands below remain because no WASM dispatch equivalent exists yet.
 
 /// Request signature help at a position.
 #[tauri::command]
@@ -976,22 +994,6 @@ fn lsp_document_symbols(
 ) -> Result<serde_json::Value, String> {
     let params = serde_json::json!({ "uri": uri });
     state.ipc.request_sync("textDocument/documentSymbol", params)
-}
-
-/// Request document formatting.
-#[tauri::command]
-fn lsp_format(
-    uri: String,
-    tab_size: Option<u32>,
-    insert_spaces: Option<bool>,
-    state: tauri::State<AppState>,
-) -> Result<serde_json::Value, String> {
-    let params = serde_json::json!({
-        "uri": uri,
-        "tabSize": tab_size.unwrap_or(2),
-        "insertSpaces": insert_spaces.unwrap_or(true),
-    });
-    state.ipc.request_sync("textDocument/formatting", params)
 }
 
 /// Request inline completions (ghost text) at a position.
@@ -1035,19 +1037,6 @@ fn lsp_inlay_hints(
 ) -> Result<serde_json::Value, String> {
     let params = serde_json::json!({ "uri": uri, "startLine": start_line, "endLine": end_line });
     state.ipc.request_sync("textDocument/inlayHint", params)
-}
-
-/// Request rename edits for the symbol at the given position.
-#[tauri::command]
-fn lsp_rename(
-    uri: String,
-    line: usize,
-    character: usize,
-    new_name: String,
-    state: tauri::State<AppState>,
-) -> Result<serde_json::Value, String> {
-    let params = serde_json::json!({ "uri": uri, "line": line, "character": character, "newName": new_name });
-    state.ipc.request_sync("textDocument/rename", params)
 }
 
 /// Check if rename is available at the given position.
@@ -2078,27 +2067,14 @@ pub fn run() {
             get_wasm_output_lines,
             get_wasm_notifications,
             get_wasm_status_bar_items,
-            // WASM-only language provider commands (no LSP equivalent yet)
-            wasm_format_document,
-            wasm_format_range,
-            wasm_rename,
-            wasm_code_actions,
-            wasm_workspace_symbols,
-            wasm_folding_ranges,
-            // M6: LSP commands
+            // M6: LSP commands (LSP-only; lang_* superset commands above
+            // handle hover/completion/definition/references/code-action/format/rename)
             lsp_inline_completion,
             lsp_inlay_hints,
             get_tree_view_events,
             tree_view_get_children,
-            lsp_hover,
-            lsp_completion,
-            lsp_definition,
-            lsp_references,
-            lsp_code_action,
             lsp_signature_help,
             lsp_document_symbols,
-            lsp_format,
-            lsp_rename,
             lsp_prepare_rename,
             lsp_document_highlights,
             get_show_text_document_requests,
@@ -2108,6 +2084,12 @@ pub fn run() {
             lang_diagnostics,
             lang_definition,
             lang_references,
+            lang_format_document,
+            lang_format_range,
+            lang_rename,
+            lang_code_actions,
+            lang_workspace_symbols,
+            lang_folding_ranges,
             // M8: Marketplace commands
             marketplace_search,
             marketplace_get_extension,

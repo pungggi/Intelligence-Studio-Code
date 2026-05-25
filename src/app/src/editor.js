@@ -2401,28 +2401,11 @@ document.addEventListener('keydown', (e) => {
           paletteBackdropEl.addEventListener('click', closePalette);
           editorEl.focus();
           if (!newName || newName === currentName) return;
-          const renameLangId = detectLanguage(filePath);
-          Promise.all([
-            invoke('lsp_rename', { uri: renameUri, line: renameLine, character: renameChar, newName }).catch(() => null),
-            invoke('wasm_rename', { langId: renameLangId, uri: renameUri, line: renameLine, character: renameChar, newName }).catch(() => []),
-          ]).then(async ([lspResult, wasmEdits]) => {
-              const hasLsp = lspResult && lspResult.changes && lspResult.changes.length > 0;
-              const hasWasm = wasmEdits && wasmEdits.length > 0;
-              if (!hasLsp && !hasWasm) { showToast('error', 'Rename returned no edits'); return; }
+          invoke('lang_rename', { uri: renameUri, line: renameLine, character: renameChar, newName })
+            .then(async (changes) => {
+              if (!changes || changes.length === 0) { showToast('error', 'Rename returned no edits'); return; }
               try {
-                if (hasLsp) {
-                  await invoke('apply_workspace_edit', { changes: lspResult.changes });
-                }
-                if (hasWasm) {
-                  // Apply WASM text edits directly (sorted bottom-up to preserve offsets)
-                  const sorted = wasmEdits.slice().sort((a, b) => b.range.start.line - a.range.start.line || b.range.start.character - a.range.start.character);
-                  for (const edit of sorted) {
-                    await invoke('edit_replace_range', {
-                      startLine: edit.range.start.line, startCol: edit.range.start.character,
-                      endLine: edit.range.end.line, endCol: edit.range.end.character, text: edit['new-text'] || edit.newText || edit.new_text || '',
-                    });
-                  }
-                }
+                await invoke('apply_workspace_edit', { changes });
                 await fetchVisibleContent();
                 requestRender();
               } catch (err) { showToast('error', String(err)); }
@@ -3856,21 +3839,10 @@ async function requestCodeActions() {
     startLine = sel.startLine; startChar = sel.startCol; endLine = sel.endLine; endChar = sel.endCol;
   }
   try {
-    const langId = detectLanguage(filePath);
-    const range = { start: { line: startLine, character: startChar }, end: { line: endLine, character: endChar } };
-    const [lspResult, wasmResult] = await Promise.all([
-      invoke('lsp_code_action', { uri, startLine, startCharacter: startChar, endLine, endCharacter: endChar }).catch(() => []),
-      invoke('wasm_code_actions', { langId, uri, range, diagnostics: [] }).catch(() => []),
-    ]);
-    // Normalise WASM code actions to the same shape as LSP ones
-    const wasmNorm = (wasmResult || []).map(a => ({
-      title: a.title,
-      kind: a.kind || undefined,
-      isPreferred: false,
-      edit: a.edits && a.edits.length > 0 ? { changes: a.edits.map(e => ({ uri: e.uri || uri, range: e.range, newText: e['new-text'] || e.newText || e.new_text || '' })) } : undefined,
-    }));
-    const merged = [...(Array.isArray(lspResult) ? lspResult : []), ...wasmNorm];
-    if (merged.length === 0) {
+    const merged = await invoke('lang_code_actions', {
+      uri, startLine, startCharacter: startChar, endLine, endCharacter: endChar, diagnostics: [],
+    }).catch(() => []);
+    if (!merged || merged.length === 0) {
       statusEl.textContent = 'No code actions available';
       setTimeout(() => { statusEl.textContent = ''; }, 2000);
       return;
@@ -4123,11 +4095,11 @@ async function openWorkspaceSymbolSearch() {
 
 async function searchWorkspaceSymbols(query) {
   if (!query) { symbolItems = []; renderSymbolList(''); return; }
-  const langId = detectLanguage(filePath || '');
+  const langHint = detectLanguage(filePath || '');
   try {
-    const wasmResult = await invoke('wasm_workspace_symbols', { langId, query }).catch(() => []);
-    const items = (wasmResult || []).map(s => ({
-      name: s.container_name ? `${s.container_name}.${s.name}` : s.name,
+    const result = await invoke('lang_workspace_symbols', { query, langHint }).catch(() => []);
+    const items = (result || []).map(s => ({
+      name: s.container_name ? `${s.container_name}.${s.name}` : (s.containerName ? `${s.containerName}.${s.name}` : s.name),
       detail: s.location?.uri || '',
       kind: s.kind,
       line: s.location?.range?.start?.line ?? 0,
@@ -4147,16 +4119,12 @@ async function formatDocument() {
   if (!uri) return;
   try {
     statusEl.textContent = 'Formatting...';
-    const langId = detectLanguage(filePath);
     const fullText = await invoke('get_text_range', {
       startLine: 0, startCol: 0, endLine: totalLines, endCol: 0,
     }).catch(() => '');
-    const [lspResult, wasmResult] = await Promise.all([
-      invoke('lsp_format', { uri, tabSize: 2, insertSpaces: true }).catch(() => []),
-      invoke('wasm_format_document', { langId, uri, content: fullText }).catch(() => []),
-    ]);
-    // Prefer LSP edits; fall back to WASM edits
-    const result = (lspResult && lspResult.length > 0) ? lspResult : wasmResult;
+    const result = await invoke('lang_format_document', {
+      uri, content: fullText, tabSize: 2, insertSpaces: true,
+    }).catch(() => []);
     if (result && Array.isArray(result) && result.length > 0) {
       const edits = result.slice().sort((a, b) => {
         if (b.range.start.line !== a.range.start.line) return b.range.start.line - a.range.start.line;
@@ -4191,17 +4159,17 @@ async function formatSelection() {
   if (!sel) { formatDocument(); return; } // No selection — fall back to full format
   try {
     statusEl.textContent = 'Formatting selection...';
-    const langId = detectLanguage(filePath);
     const fullText = await invoke('get_text_range', {
       startLine: 0, startCol: 0, endLine: totalLines, endCol: 0,
     }).catch(() => '');
-    const wasmResult = await invoke('wasm_format_range', {
-      langId, uri, content: fullText,
+    const result = await invoke('lang_format_range', {
+      uri, content: fullText,
       startLine: sel.startLine, startCharacter: sel.startCol,
       endLine: sel.endLine, endCharacter: sel.endCol,
+      tabSize: 2, insertSpaces: true,
     }).catch(() => []);
-    if (wasmResult && Array.isArray(wasmResult) && wasmResult.length > 0) {
-      const edits = wasmResult.slice().sort((a, b) => {
+    if (result && Array.isArray(result) && result.length > 0) {
+      const edits = result.slice().sort((a, b) => {
         if (b.range.start.line !== a.range.start.line) return b.range.start.line - a.range.start.line;
         return b.range.start.character - a.range.start.character;
       });
@@ -4330,17 +4298,14 @@ function unfoldAtCursor() {
 
 async function fetchFoldingRanges() {
   if (!filePath) return;
-  const langId = detectLanguage(filePath);
   const uri = getActiveUri();
   if (!uri) return;
   try {
     const fullText = await invoke('get_text_range', {
       startLine: 0, startCol: 0, endLine: totalLines, endCol: 0,
     }).catch(() => '');
-    const wasmResult = await invoke('wasm_folding_ranges', {
-      langId, uri, content: fullText,
-    }).catch(() => []);
-    foldingRanges = (wasmResult || []).map(r => ({
+    const result = await invoke('lang_folding_ranges', { uri, content: fullText }).catch(() => []);
+    foldingRanges = (result || []).map(r => ({
       startLine: r.start_line ?? r.startLine ?? 0,
       endLine: r.end_line ?? r.endLine ?? 0,
       kind: r.kind ?? null,
