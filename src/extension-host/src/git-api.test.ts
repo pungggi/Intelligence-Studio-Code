@@ -8,7 +8,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { createGitExtension, validateFilePath, validateRef, validateConfigKey, safeDate, repoContainsPath } from "./git-api.js";
+import { createGitExtension, validateFilePath, validateRef, validateConfigKey, safeDate, repoContainsPath } from "./git-api.ts";
 
 // ── Thin wrappers that call the real exported validators ──────────────────────
 
