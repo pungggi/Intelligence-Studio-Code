@@ -1120,12 +1120,16 @@ fn lsp_document_links(
 }
 
 /// Resolve a previously returned document link (fills in `target`/`tooltip`).
+///
+/// The link is wrapped in `{ "link": ... }` so the shim envelope is stable
+/// across future additions (e.g. cancellation/context fields).
 #[tauri::command]
 fn lsp_resolve_document_link(
     link: serde_json::Value,
     state: tauri::State<AppState>,
 ) -> Result<serde_json::Value, String> {
-    state.ipc.request_sync("documentLink/resolve", link)
+    let params = serde_json::json!({ "link": link });
+    state.ipc.request_sync("documentLink/resolve", params)
 }
 
 /// Request full-document semantic tokens (encoded as relative deltas per LSP spec).
@@ -1158,6 +1162,21 @@ fn lsp_semantic_tokens_range(
         },
     });
     state.ipc.request_sync("textDocument/semanticTokens/range", params)
+}
+
+/// Request a delta against a prior semantic-tokens result (`previousResultId`).
+/// The shim returns either a full SemanticTokens or an `edits` envelope.
+#[tauri::command]
+fn lsp_semantic_tokens_delta(
+    uri: String,
+    previous_result_id: String,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+        "previousResultId": previous_result_id,
+    });
+    state.ipc.request_sync("textDocument/semanticTokens/full/delta", params)
 }
 
 /// Drain showTextDocument requests from the Extension Host.
@@ -2181,6 +2200,7 @@ pub fn run() {
             lsp_resolve_document_link,
             lsp_semantic_tokens_full,
             lsp_semantic_tokens_range,
+            lsp_semantic_tokens_delta,
             get_show_text_document_requests,
             // Unified Language Dispatch
             lang_completions,

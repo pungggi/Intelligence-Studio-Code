@@ -814,3 +814,300 @@ describe("dispatch: textDocument/semanticTokens/range", () => {
     assert.deepEqual(captured, { start: { line: 1, character: 2 }, end: { line: 1, character: 8 } });
   });
 });
+
+// ── extractPosition / extractRange (helper behavior) ─────────────────────────
+
+function extractPosition(params: Record<string, unknown>): Position | null {
+  const nested = params.position as { line?: number; character?: number } | undefined;
+  if (nested && typeof nested.line === "number" && typeof nested.character === "number") {
+    return { line: nested.line, character: nested.character };
+  }
+  const flatLine = params.line as number | undefined;
+  const flatChar = params.character as number | undefined;
+  if (typeof flatLine === "number" && typeof flatChar === "number") {
+    return { line: flatLine, character: flatChar };
+  }
+  return null;
+}
+
+function extractRange(params: Record<string, unknown>): Range | null {
+  const nested = params.range as {
+    start?: { line?: number; character?: number };
+    end?: { line?: number; character?: number };
+  } | undefined;
+  if (
+    nested?.start && nested.end &&
+    typeof nested.start.line === "number" && typeof nested.start.character === "number" &&
+    typeof nested.end.line === "number" && typeof nested.end.character === "number"
+  ) {
+    return {
+      start: { line: nested.start.line, character: nested.start.character },
+      end: { line: nested.end.line, character: nested.end.character },
+    };
+  }
+  const sl = params.startLine as number | undefined;
+  const sc = params.startCharacter as number | undefined;
+  const el = params.endLine as number | undefined;
+  const ec = params.endCharacter as number | undefined;
+  if (typeof sl === "number" && typeof sc === "number" && typeof el === "number" && typeof ec === "number") {
+    return { start: { line: sl, character: sc }, end: { line: el, character: ec } };
+  }
+  return null;
+}
+
+describe("extractPosition — shape tolerance", () => {
+  it("reads nested {position: {line, character}}", () => {
+    const p = extractPosition({ position: { line: 4, character: 7 } });
+    assert.deepEqual(p, { line: 4, character: 7 });
+  });
+
+  it("reads flat {line, character}", () => {
+    const p = extractPosition({ line: 1, character: 2 });
+    assert.deepEqual(p, { line: 1, character: 2 });
+  });
+
+  it("returns null when neither shape is present", () => {
+    assert.equal(extractPosition({}), null);
+    assert.equal(extractPosition({ position: { line: 1 } }), null); // partial nested
+  });
+});
+
+describe("extractRange — shape tolerance", () => {
+  it("reads nested {range: {start, end}}", () => {
+    const r = extractRange({ range: { start: { line: 0, character: 0 }, end: { line: 2, character: 5 } } });
+    assert.deepEqual(r, { start: { line: 0, character: 0 }, end: { line: 2, character: 5 } });
+  });
+
+  it("reads flat startLine/startCharacter/endLine/endCharacter", () => {
+    const r = extractRange({ startLine: 1, startCharacter: 2, endLine: 3, endCharacter: 4 });
+    assert.deepEqual(r, { start: { line: 1, character: 2 }, end: { line: 3, character: 4 } });
+  });
+
+  it("returns null when neither shape is present", () => {
+    assert.equal(extractRange({}), null);
+    assert.equal(extractRange({ startLine: 1 }), null); // partial flat
+  });
+});
+
+// ── URI extraction — nested vs flat ──────────────────────────────────────────
+
+function extractUri(params: Record<string, unknown>): string | undefined {
+  const td = params.textDocument as { uri?: string } | undefined;
+  return (td?.uri ?? params.uri) as string | undefined;
+}
+
+describe("URI extraction — shape tolerance", () => {
+  it("reads nested {textDocument: {uri}}", () => {
+    assert.equal(extractUri({ textDocument: { uri: "file:///a.ts" } }), "file:///a.ts");
+  });
+
+  it("reads flat {uri}", () => {
+    assert.equal(extractUri({ uri: "file:///b.ts" } as Record<string, unknown>), "file:///b.ts");
+  });
+
+  it("prefers nested when both present", () => {
+    assert.equal(
+      extractUri({ textDocument: { uri: "file:///nested.ts" }, uri: "file:///flat.ts" }),
+      "file:///nested.ts",
+    );
+  });
+
+  it("returns undefined when neither shape is present", () => {
+    assert.equal(extractUri({}), undefined);
+  });
+});
+
+// ── documentLink/resolve — routing by providerId ─────────────────────────────
+
+type DocLinkProviderEntry = {
+  id: string;
+  selector: { language: string };
+  provider: { resolveDocumentLink?: (link: DocumentLink, token: unknown) => unknown };
+};
+
+function stripProviderIdT(data: Record<string, unknown>): Record<string, unknown> | undefined {
+  const { _providerId: _omit, ...rest } = data;
+  void _omit;
+  return Object.keys(rest).length === 0 ? undefined : rest;
+}
+
+async function dispatchDocumentLinkResolveRouted(
+  providers: DocLinkProviderEntry[],
+  params: { link?: DocumentLink } | DocumentLink,
+): Promise<unknown> {
+  const linkInput = ((params as { link?: DocumentLink }).link ?? params) as
+    DocumentLink & { data?: { _providerId?: string; [k: string]: unknown } };
+  const providerId = linkInput.data?._providerId;
+  const link = providerId !== undefined && linkInput.data
+    ? { ...linkInput, data: stripProviderIdT(linkInput.data) }
+    : linkInput;
+  if (providerId) {
+    const entry = providers.find(e => e.id === providerId);
+    if (entry?.provider.resolveDocumentLink) {
+      const result = await entry.provider.resolveDocumentLink(link, nullToken);
+      if (result) return result;
+    }
+    return link;
+  }
+  for (const entry of providers) {
+    if (entry.provider.resolveDocumentLink) {
+      const result = await entry.provider.resolveDocumentLink(link, nullToken);
+      if (result) return result;
+    }
+  }
+  return link;
+}
+
+describe("documentLink/resolve — provider routing", () => {
+  it("routes to the provider whose id matches data._providerId", async () => {
+    let calledA = false, calledB = false;
+    const providers: DocLinkProviderEntry[] = [
+      { id: "dlp-1", selector: { language: "md" }, provider: { resolveDocumentLink: (l) => { calledA = true; return { ...l, target: "from-A" }; } } },
+      { id: "dlp-2", selector: { language: "md" }, provider: { resolveDocumentLink: (l) => { calledB = true; return { ...l, target: "from-B" }; } } },
+    ];
+    const out = await dispatchDocumentLinkResolveRouted(providers, {
+      link: {
+        range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+        data: { _providerId: "dlp-2", id: 42 } as { _providerId: string; id: number },
+      },
+    });
+    assert.equal(calledA, false);
+    assert.equal(calledB, true);
+    assert.equal((out as DocumentLink).target, "from-B");
+  });
+
+  it("strips _providerId before handing link to the provider", async () => {
+    let captured: DocumentLink | null = null;
+    const providers: DocLinkProviderEntry[] = [
+      { id: "dlp-1", selector: { language: "md" }, provider: { resolveDocumentLink: (l) => { captured = l; return l; } } },
+    ];
+    await dispatchDocumentLinkResolveRouted(providers, {
+      link: {
+        range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+        data: { _providerId: "dlp-1", id: "keep-me" } as { _providerId: string; id: string },
+      },
+    });
+    assert.ok(captured !== null);
+    assert.deepEqual((captured as DocumentLink).data, { id: "keep-me" });
+  });
+
+  it("falls back to first provider when no _providerId tag is present", async () => {
+    let calledA = false;
+    const providers: DocLinkProviderEntry[] = [
+      { id: "dlp-1", selector: { language: "md" }, provider: { resolveDocumentLink: (l) => { calledA = true; return l; } } },
+    ];
+    await dispatchDocumentLinkResolveRouted(providers, {
+      link: { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } } },
+    });
+    assert.equal(calledA, true);
+  });
+
+  it("accepts unwrapped link (legacy shape) at params root", async () => {
+    let called = false;
+    const providers: DocLinkProviderEntry[] = [
+      { id: "dlp-1", selector: { language: "md" }, provider: { resolveDocumentLink: () => { called = true; return null; } } },
+    ];
+    const legacyLink: DocumentLink = { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } } };
+    await dispatchDocumentLinkResolveRouted(providers, legacyLink);
+    assert.equal(called, true);
+  });
+});
+
+// ── semanticTokens/full/delta ────────────────────────────────────────────────
+
+type SemanticTokensEdit = { start: number; deleteCount: number; data?: number[] | Uint32Array };
+
+function serializeSemanticTokensEdits(
+  result: unknown,
+  legend: { tokenTypes: string[]; tokenModifiers: string[] } | undefined,
+): unknown {
+  const r = result as { data?: Uint32Array | number[]; resultId?: string; edits?: SemanticTokensEdit[] };
+  if (r.edits) {
+    return {
+      resultId: r.resultId,
+      edits: r.edits.map(e => ({
+        start: e.start,
+        deleteCount: e.deleteCount,
+        data: e.data instanceof Uint32Array ? Array.from(e.data) : (e.data ?? []),
+      })),
+      legend: legend ? { tokenTypes: legend.tokenTypes, tokenModifiers: legend.tokenModifiers } : undefined,
+    };
+  }
+  return serializeSemanticTokens(result, legend);
+}
+
+async function dispatchSemanticTokensDelta(
+  providers: Array<{
+    selector: { language: string };
+    provider: { provideDocumentSemanticTokensEdits?: (previousResultId: string, token: unknown) => unknown };
+    legend?: { tokenTypes: string[]; tokenModifiers: string[] };
+  }>,
+  doc: { languageId: string } | undefined,
+  params: { previousResultId?: string },
+): Promise<unknown> {
+  if (!doc) return null;
+  const previousResultId = params.previousResultId;
+  if (!previousResultId) return null;
+  for (const entry of providers) {
+    if (matchesSelector(entry.selector, doc) && entry.provider.provideDocumentSemanticTokensEdits) {
+      const result = await entry.provider.provideDocumentSemanticTokensEdits(previousResultId, nullToken);
+      if (result) return serializeSemanticTokensEdits(result, entry.legend);
+    }
+  }
+  return null;
+}
+
+describe("dispatch: textDocument/semanticTokens/full/delta", () => {
+  it("returns serialized edits envelope when provider returns edits", async () => {
+    let captured: string | null = null;
+    const provider = {
+      provideDocumentSemanticTokensEdits: (previousResultId: string) => {
+        captured = previousResultId;
+        return {
+          resultId: "r2",
+          edits: [{ start: 0, deleteCount: 5, data: new Uint32Array([1, 2, 3, 0, 0]) }],
+        };
+      },
+    };
+    const out = await dispatchSemanticTokensDelta(
+      [{ selector: { language: "rust" }, provider, legend: { tokenTypes: ["keyword"], tokenModifiers: [] } }],
+      { languageId: "rust" },
+      { previousResultId: "r1" },
+    );
+    assert.equal(captured, "r1");
+    const o = out as { resultId: string; edits: Array<{ start: number; deleteCount: number; data: number[] }> };
+    assert.equal(o.resultId, "r2");
+    assert.deepEqual(o.edits[0].data, [1, 2, 3, 0, 0]);
+  });
+
+  it("falls back to serializeSemanticTokens when provider returns full re-emit", async () => {
+    const provider = {
+      provideDocumentSemanticTokensEdits: () => ({ data: [0, 0, 5, 0, 0], resultId: "r2" }),
+    };
+    const out = await dispatchSemanticTokensDelta(
+      [{ selector: { language: "rust" }, provider, legend: { tokenTypes: ["k"], tokenModifiers: [] } }],
+      { languageId: "rust" },
+      { previousResultId: "r1" },
+    );
+    assert.deepEqual((out as { data: number[] }).data, [0, 0, 5, 0, 0]);
+  });
+
+  it("returns null when previousResultId is missing", async () => {
+    const provider = { provideDocumentSemanticTokensEdits: () => ({ data: [1] }) };
+    const out = await dispatchSemanticTokensDelta(
+      [{ selector: { language: "rust" }, provider, legend: undefined }],
+      { languageId: "rust" },
+      {},
+    );
+    assert.equal(out, null);
+  });
+
+  it("returns null when no provider implements provideDocumentSemanticTokensEdits", async () => {
+    const out = await dispatchSemanticTokensDelta(
+      [{ selector: { language: "rust" }, provider: {}, legend: undefined }],
+      { languageId: "rust" },
+      { previousResultId: "r1" },
+    );
+    assert.equal(out, null);
+  });
+});

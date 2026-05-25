@@ -675,6 +675,13 @@ const nullCancellationToken: CancellationToken = {
   onCancellationRequested: () => ({ dispose: () => {} }),
 };
 
+/** Remove the routing-only `_providerId` tag from a DocumentLink `data` object. */
+function stripProviderId(data: Record<string, unknown>): Record<string, unknown> | undefined {
+  const { _providerId: _omit, ...rest } = data;
+  void _omit;
+  return Object.keys(rest).length === 0 ? undefined : rest;
+}
+
 /** M6: Provider registration entry. */
 interface ProviderEntry<T> {
   selector: DocumentSelector;
@@ -1111,15 +1118,32 @@ export class VscodeApiShim {
   private typeDefinitionProviders: ProviderEntry<{ provideTypeDefinition: (...args: unknown[]) => unknown }>[] = [];
   private implementationProviders: ProviderEntry<{ provideImplementation: (...args: unknown[]) => unknown }>[] = [];
   private selectionRangeProviders: ProviderEntry<{ provideSelectionRanges: (...args: unknown[]) => unknown }>[] = [];
-  private documentLinkProviders: ProviderEntry<{ provideDocumentLinks: (...args: unknown[]) => unknown; resolveDocumentLink?: (...args: unknown[]) => unknown }>[] = [];
-  // Semantic tokens — provider holds a legend; for the dispatch we pass it through to the caller via the result envelope.
-  private documentSemanticTokensProviders: ProviderEntry<{
-    provideDocumentSemanticTokens: (...args: unknown[]) => unknown;
-    provideDocumentSemanticTokensEdits?: (...args: unknown[]) => unknown;
-  } & { legend?: { tokenTypes: string[]; tokenModifiers: string[] } }>[] = [];
-  private documentRangeSemanticTokensProviders: ProviderEntry<{
-    provideDocumentRangeSemanticTokens: (...args: unknown[]) => unknown;
-  } & { legend?: { tokenTypes: string[]; tokenModifiers: string[] } }>[] = [];
+  // Document links carry an opaque `providerId` so documentLink/resolve can
+  // route back to the originating provider.
+  private documentLinkProviders: Array<{
+    id: string;
+    selector: DocumentSelector;
+    provider: {
+      provideDocumentLinks: (...args: unknown[]) => unknown;
+      resolveDocumentLink?: (...args: unknown[]) => unknown;
+    };
+  }> = [];
+  private documentLinkProviderCounter = 0;
+  // Semantic tokens — legend lives alongside the provider on the entry so we
+  // never mutate the caller's provider object.
+  private documentSemanticTokensProviders: Array<{
+    selector: DocumentSelector;
+    provider: {
+      provideDocumentSemanticTokens: (...args: unknown[]) => unknown;
+      provideDocumentSemanticTokensEdits?: (previousResultId: string, token: unknown) => unknown;
+    };
+    legend?: { tokenTypes: string[]; tokenModifiers: string[] };
+  }> = [];
+  private documentRangeSemanticTokensProviders: Array<{
+    selector: DocumentSelector;
+    provider: { provideDocumentRangeSemanticTokens: (...args: unknown[]) => unknown };
+    legend?: { tokenTypes: string[]; tokenModifiers: string[] };
+  }> = [];
 
   // Events
   private _onDidOpenTextDocument = new EventEmitter<TextDocument>();
@@ -1315,8 +1339,55 @@ export class VscodeApiShim {
     }
   }
 
+  /**
+   * Position may arrive flat (`params.line` / `params.character`) or nested per
+   * LSP spec (`params.position.{line,character}`). Returns null when neither
+   * form is present so the caller can decide whether to default or bail.
+   */
+  private extractPosition(params: Record<string, unknown>): Position | null {
+    const nested = params.position as { line?: number; character?: number } | undefined;
+    if (nested && typeof nested.line === "number" && typeof nested.character === "number") {
+      return new Position(nested.line, nested.character);
+    }
+    const flatLine = params.line as number | undefined;
+    const flatChar = params.character as number | undefined;
+    if (typeof flatLine === "number" && typeof flatChar === "number") {
+      return new Position(flatLine, flatChar);
+    }
+    return null;
+  }
+
+  /**
+   * Range may arrive nested (`params.range.{start,end}.{line,character}`) or
+   * flat (`params.startLine`/`startCharacter`/`endLine`/`endCharacter`).
+   */
+  private extractRange(params: Record<string, unknown>): Range | null {
+    const nested = params.range as {
+      start?: { line?: number; character?: number };
+      end?: { line?: number; character?: number };
+    } | undefined;
+    if (
+      nested?.start && nested.end &&
+      typeof nested.start.line === "number" && typeof nested.start.character === "number" &&
+      typeof nested.end.line === "number" && typeof nested.end.character === "number"
+    ) {
+      return new Range(nested.start.line, nested.start.character, nested.end.line, nested.end.character);
+    }
+    const sl = params.startLine as number | undefined;
+    const sc = params.startCharacter as number | undefined;
+    const el = params.endLine as number | undefined;
+    const ec = params.endCharacter as number | undefined;
+    if (typeof sl === "number" && typeof sc === "number" && typeof el === "number" && typeof ec === "number") {
+      return new Range(sl, sc, el, ec);
+    }
+    return null;
+  }
+
   private async dispatchLspRequest(method: string, params: Record<string, unknown>): Promise<unknown> {
-    const uri = params.uri as string;
+    // URI may arrive flat (`params.uri`) or nested per LSP spec
+    // (`params.textDocument.uri`). Support both.
+    const td = params.textDocument as { uri?: string } | undefined;
+    const uri = (td?.uri ?? params.uri) as string;
     const doc = this.documents.get(uri);
     const doclessOk =
       method === "textDocument/formatting" ||
@@ -1329,7 +1400,8 @@ export class VscodeApiShim {
 
     switch (method) {
       case "textDocument/completion": {
-        const position = new Position(params.line as number, params.character as number);
+        const position = this.extractPosition(params);
+        if (!position) return null;
         const context: CompletionContext = {
           triggerKind: (params.triggerKind as number) ?? CompletionTriggerKind.Invoke,
           triggerCharacter: params.triggerCharacter as string | undefined,
@@ -1343,7 +1415,8 @@ export class VscodeApiShim {
         return null;
       }
       case "textDocument/hover": {
-        const position = new Position(params.line as number, params.character as number);
+        const position = this.extractPosition(params);
+        if (!position) return null;
         for (const entry of this.hoverProviders) {
           if (doc && this.matchesSelector(entry.selector, doc)) {
             const result = await entry.provider.provideHover(doc, position, nullCancellationToken);
@@ -1353,7 +1426,8 @@ export class VscodeApiShim {
         return null;
       }
       case "textDocument/definition": {
-        const position = new Position(params.line as number, params.character as number);
+        const position = this.extractPosition(params);
+        if (!position) return null;
         for (const entry of this.definitionProviders) {
           if (doc && this.matchesSelector(entry.selector, doc)) {
             const result = await entry.provider.provideDefinition(doc, position, nullCancellationToken);
@@ -1363,7 +1437,8 @@ export class VscodeApiShim {
         return null;
       }
       case "textDocument/references": {
-        const position = new Position(params.line as number, params.character as number);
+        const position = this.extractPosition(params);
+        if (!position) return null;
         const refContext = { includeDeclaration: true };
         for (const entry of this.referenceProviders) {
           if (doc && this.matchesSelector(entry.selector, doc)) {
@@ -1374,10 +1449,8 @@ export class VscodeApiShim {
         return null;
       }
       case "textDocument/codeAction": {
-        const range = new Range(
-          params.startLine as number, params.startCharacter as number,
-          params.endLine as number, params.endCharacter as number
-        );
+        const range = this.extractRange(params);
+        if (!range) return null;
         const codeActionContext = {
           diagnostics: (params.diagnostics ?? []) as Diagnostic[],
           only: params.only as string[] | undefined,
@@ -1391,7 +1464,8 @@ export class VscodeApiShim {
         return null;
       }
       case "textDocument/signatureHelp": {
-        const position = new Position(params.line as number, params.character as number);
+        const position = this.extractPosition(params);
+        if (!position) return null;
         const sigContext = {
           triggerKind: 1,
           triggerCharacter: params.triggerCharacter as string | undefined,
@@ -1432,10 +1506,8 @@ export class VscodeApiShim {
           tabSize: (params.tabSize as number) ?? 2,
           insertSpaces: (params.insertSpaces as boolean) ?? true,
         };
-        const range = new Range(
-          params.startLine as number, params.startCharacter as number,
-          params.endLine as number, params.endCharacter as number,
-        );
+        const range = this.extractRange(params);
+        if (!range) return null;
         for (const entry of this.rangeFormattingProviders) {
           if (doc && this.matchesSelector(entry.selector, doc)) {
             const result = await entry.provider.provideDocumentRangeFormattingEdits(doc, range, options, nullCancellationToken);
@@ -1477,8 +1549,8 @@ export class VscodeApiShim {
         return [];
       }
       case "textDocument/typeDefinition": {
-        const p = params as { position?: { line: number; character: number }; line?: number; character?: number };
-        const position = new Position(p.position?.line ?? p.line ?? 0, p.position?.character ?? p.character ?? 0);
+        const position = this.extractPosition(params);
+        if (!position) return null;
         for (const entry of this.typeDefinitionProviders) {
           if (doc && this.matchesSelector(entry.selector, doc)) {
             const result = await entry.provider.provideTypeDefinition(doc, position, nullCancellationToken);
@@ -1488,8 +1560,8 @@ export class VscodeApiShim {
         return null;
       }
       case "textDocument/implementation": {
-        const p = params as { position?: { line: number; character: number }; line?: number; character?: number };
-        const position = new Position(p.position?.line ?? p.line ?? 0, p.position?.character ?? p.character ?? 0);
+        const position = this.extractPosition(params);
+        if (!position) return null;
         for (const entry of this.implementationProviders) {
           if (doc && this.matchesSelector(entry.selector, doc)) {
             const result = await entry.provider.provideImplementation(doc, position, nullCancellationToken);
@@ -1516,18 +1588,36 @@ export class VscodeApiShim {
           if (doc && this.matchesSelector(entry.selector, doc)) {
             const result = await entry.provider.provideDocumentLinks(doc, nullCancellationToken);
             if (result && Array.isArray(result)) {
-              return result.map((l: unknown) => this.serializeDocumentLink(l));
+              return result.map((l: unknown) => this.serializeDocumentLink(l, entry.id));
             }
           }
         }
         return null;
       }
       case "documentLink/resolve": {
-        const link = params as { range?: Range; target?: string; tooltip?: string };
+        // `params` may be the link object directly (legacy) or wrapped as `{ link }`.
+        const linkInput = (params.link ?? params) as {
+          range?: Range; target?: string; tooltip?: string;
+          data?: { _providerId?: string; [k: string]: unknown };
+        };
+        const providerId = linkInput.data?._providerId;
+        // Strip the routing tag before handing the link back to the extension.
+        const link = providerId !== undefined && linkInput.data
+          ? { ...linkInput, data: stripProviderId(linkInput.data) }
+          : linkInput;
+        if (providerId) {
+          const entry = this.documentLinkProviders.find(e => e.id === providerId);
+          if (entry?.provider.resolveDocumentLink) {
+            const result = await entry.provider.resolveDocumentLink(link, nullCancellationToken);
+            if (result) return this.serializeDocumentLink(result, entry.id);
+          }
+          return link;
+        }
+        // No routing tag — fall back to first provider with a resolver.
         for (const entry of this.documentLinkProviders) {
           if (entry.provider.resolveDocumentLink) {
             const result = await entry.provider.resolveDocumentLink(link, nullCancellationToken);
-            if (result) return this.serializeDocumentLink(result);
+            if (result) return this.serializeDocumentLink(result, entry.id);
           }
         }
         return link;
@@ -1536,26 +1626,29 @@ export class VscodeApiShim {
         for (const entry of this.documentSemanticTokensProviders) {
           if (doc && this.matchesSelector(entry.selector, doc)) {
             const result = await entry.provider.provideDocumentSemanticTokens(doc, nullCancellationToken);
-            if (result) return this.serializeSemanticTokens(result, entry.provider.legend);
+            if (result) return this.serializeSemanticTokens(result, entry.legend);
+          }
+        }
+        return null;
+      }
+      case "textDocument/semanticTokens/full/delta": {
+        const previousResultId = params.previousResultId as string | undefined;
+        if (!previousResultId) return null;
+        for (const entry of this.documentSemanticTokensProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc) && entry.provider.provideDocumentSemanticTokensEdits) {
+            const result = await entry.provider.provideDocumentSemanticTokensEdits(previousResultId, nullCancellationToken);
+            if (result) return this.serializeSemanticTokensEdits(result, entry.legend);
           }
         }
         return null;
       }
       case "textDocument/semanticTokens/range": {
-        const p = params as {
-          range?: { start: { line: number; character: number }; end: { line: number; character: number } };
-          startLine?: number; startCharacter?: number; endLine?: number; endCharacter?: number;
-        };
-        const range = new Range(
-          p.range?.start?.line ?? p.startLine ?? 0,
-          p.range?.start?.character ?? p.startCharacter ?? 0,
-          p.range?.end?.line ?? p.endLine ?? 0,
-          p.range?.end?.character ?? p.endCharacter ?? 0,
-        );
+        const range = this.extractRange(params);
+        if (!range) return null;
         for (const entry of this.documentRangeSemanticTokensProviders) {
           if (doc && this.matchesSelector(entry.selector, doc)) {
             const result = await entry.provider.provideDocumentRangeSemanticTokens(doc, range, nullCancellationToken);
-            if (result) return this.serializeSemanticTokens(result, entry.provider.legend);
+            if (result) return this.serializeSemanticTokens(result, entry.legend);
           }
         }
         return null;
@@ -1786,13 +1879,19 @@ export class VscodeApiShim {
     };
   }
 
-  private serializeDocumentLink(link: unknown): unknown {
+  private serializeDocumentLink(link: unknown, providerId?: string): unknown {
     const l = link as { range: Range; target?: { toString(): string } | string; tooltip?: string; data?: unknown };
+    // Tag the link with `_providerId` inside `data` so a later resolve call
+    // can be routed back to the originating provider. Extension `data` is
+    // preserved alongside.
+    const data = providerId
+      ? { ...(l.data as Record<string, unknown> ?? {}), _providerId: providerId }
+      : l.data;
     return {
       range: this.serializeRange(l.range),
       target: l.target ? (typeof l.target === "string" ? l.target : l.target.toString()) : undefined,
       tooltip: l.tooltip,
-      data: l.data,
+      data,
     };
   }
 
@@ -1807,6 +1906,35 @@ export class VscodeApiShim {
       resultId: r.resultId,
       legend: legend ? { tokenTypes: legend.tokenTypes, tokenModifiers: legend.tokenModifiers } : undefined,
     };
+  }
+
+  /**
+   * Serialize a SemanticTokensEdits result (returned by
+   * `provideDocumentSemanticTokensEdits`). The shape is either a full
+   * SemanticTokens (if the provider chose to re-emit) or an edits envelope
+   * `{ resultId?, edits: [{ start, deleteCount, data? }] }`.
+   */
+  private serializeSemanticTokensEdits(
+    result: unknown,
+    legend: { tokenTypes: string[]; tokenModifiers: string[] } | undefined,
+  ): unknown {
+    const r = result as {
+      data?: Uint32Array | number[];
+      resultId?: string;
+      edits?: Array<{ start: number; deleteCount: number; data?: Uint32Array | number[] }>;
+    };
+    if (r.edits) {
+      return {
+        resultId: r.resultId,
+        edits: r.edits.map(e => ({
+          start: e.start,
+          deleteCount: e.deleteCount,
+          data: e.data instanceof Uint32Array ? Array.from(e.data) : (e.data ?? []),
+        })),
+        legend: legend ? { tokenTypes: legend.tokenTypes, tokenModifiers: legend.tokenModifiers } : undefined,
+      };
+    }
+    return this.serializeSemanticTokens(result, legend);
   }
 
   private serializeCodeActions(actions: CodeAction[]): unknown {
@@ -2354,9 +2482,10 @@ export class VscodeApiShim {
           resolveDocumentLink?: (...args: unknown[]) => unknown;
         }
       ): { dispose(): void } {
-        const entry = { selector, provider };
+        const id = `dlp-${++self.documentLinkProviderCounter}`;
+        const entry = { id, selector, provider };
         self.documentLinkProviders.push(entry);
-        console.log("[ApiShim] DocumentLinkProvider registered");
+        console.log(`[ApiShim] DocumentLinkProvider registered (id: ${id})`);
         return { dispose: () => { self.documentLinkProviders = self.documentLinkProviders.filter(e => e !== entry); } };
       },
 
@@ -2364,11 +2493,11 @@ export class VscodeApiShim {
         selector: DocumentSelector,
         provider: {
           provideDocumentSemanticTokens: (...args: unknown[]) => unknown;
-          provideDocumentSemanticTokensEdits?: (...args: unknown[]) => unknown;
+          provideDocumentSemanticTokensEdits?: (previousResultId: string, token: unknown) => unknown;
         },
         legend?: { tokenTypes: string[]; tokenModifiers: string[] }
       ): { dispose(): void } {
-        const entry = { selector, provider: Object.assign(provider, { legend }) };
+        const entry = { selector, provider, legend };
         self.documentSemanticTokensProviders.push(entry);
         console.log("[ApiShim] DocumentSemanticTokensProvider registered");
         return { dispose: () => { self.documentSemanticTokensProviders = self.documentSemanticTokensProviders.filter(e => e !== entry); } };
@@ -2379,7 +2508,7 @@ export class VscodeApiShim {
         provider: { provideDocumentRangeSemanticTokens: (...args: unknown[]) => unknown },
         legend?: { tokenTypes: string[]; tokenModifiers: string[] }
       ): { dispose(): void } {
-        const entry = { selector, provider: Object.assign(provider, { legend }) };
+        const entry = { selector, provider, legend };
         self.documentRangeSemanticTokensProviders.push(entry);
         console.log("[ApiShim] DocumentRangeSemanticTokensProvider registered");
         return { dispose: () => { self.documentRangeSemanticTokensProviders = self.documentRangeSemanticTokensProviders.filter(e => e !== entry); } };
