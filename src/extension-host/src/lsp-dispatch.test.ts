@@ -358,3 +358,459 @@ describe("dispatch: textDocument/foldingRange", () => {
     assert.deepEqual(out, []);
   });
 });
+
+// ── textDocument/typeDefinition ──────────────────────────────────────────────
+
+function serializeLocations(result: unknown): unknown {
+  if (!result) return [];
+  const items = Array.isArray(result) ? result : [result];
+  return items.map((loc: unknown) => {
+    const l = loc as { uri: string | { toString(): string }; range?: Range };
+    return {
+      uri: typeof l.uri === "string" ? l.uri : l.uri.toString(),
+      range: l.range ? serializeRange(l.range) : { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+    };
+  });
+}
+
+async function dispatchTypeDefinition(
+  providers: ProviderEntry<{
+    provideTypeDefinition: (doc: { languageId: string }, position: Position, token: unknown) => unknown;
+  }>[],
+  doc: { languageId: string } | undefined,
+  params: { position?: Position; line?: number; character?: number },
+): Promise<unknown> {
+  if (!doc) return null;
+  const position: Position = {
+    line: params.position?.line ?? params.line ?? 0,
+    character: params.position?.character ?? params.character ?? 0,
+  };
+  for (const entry of providers) {
+    if (matchesSelector(entry.selector, doc)) {
+      const result = await entry.provider.provideTypeDefinition(doc, position, nullToken);
+      if (result) return serializeLocations(result);
+    }
+  }
+  return null;
+}
+
+describe("dispatch: textDocument/typeDefinition", () => {
+  it("invokes provider with position and serializes locations", async () => {
+    let captured: Position | null = null;
+    const provider = {
+      provideTypeDefinition: (_doc: unknown, position: Position) => {
+        captured = position;
+        return { uri: "file:///foo.ts", range: { start: { line: 1, character: 0 }, end: { line: 1, character: 5 } } };
+      },
+    };
+    const out = await dispatchTypeDefinition(
+      [{ selector: { language: "ts" }, provider }],
+      { languageId: "ts" },
+      { position: { line: 4, character: 2 } },
+    );
+    assert.deepEqual(captured, { line: 4, character: 2 });
+    assert.deepEqual(out, [{ uri: "file:///foo.ts", range: { start: { line: 1, character: 0 }, end: { line: 1, character: 5 } } }]);
+  });
+
+  it("returns null when no provider matches", async () => {
+    const provider = { provideTypeDefinition: () => ({ uri: "x", range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } } }) };
+    const out = await dispatchTypeDefinition(
+      [{ selector: { language: "py" }, provider }],
+      { languageId: "ts" },
+      { line: 0, character: 0 },
+    );
+    assert.equal(out, null);
+  });
+
+  it("falls back to flat params.line/character when position omitted", async () => {
+    let captured: Position | null = null;
+    const provider = {
+      provideTypeDefinition: (_doc: unknown, position: Position) => {
+        captured = position;
+        return null;
+      },
+    };
+    await dispatchTypeDefinition(
+      [{ selector: { language: "ts" }, provider }],
+      { languageId: "ts" },
+      { line: 7, character: 3 },
+    );
+    assert.deepEqual(captured, { line: 7, character: 3 });
+  });
+});
+
+// ── textDocument/implementation ──────────────────────────────────────────────
+
+async function dispatchImplementation(
+  providers: ProviderEntry<{
+    provideImplementation: (doc: { languageId: string }, position: Position, token: unknown) => unknown;
+  }>[],
+  doc: { languageId: string } | undefined,
+  params: { position?: Position; line?: number; character?: number },
+): Promise<unknown> {
+  if (!doc) return null;
+  const position: Position = {
+    line: params.position?.line ?? params.line ?? 0,
+    character: params.position?.character ?? params.character ?? 0,
+  };
+  for (const entry of providers) {
+    if (matchesSelector(entry.selector, doc)) {
+      const result = await entry.provider.provideImplementation(doc, position, nullToken);
+      if (result) return serializeLocations(result);
+    }
+  }
+  return null;
+}
+
+describe("dispatch: textDocument/implementation", () => {
+  it("serializes Location array result", async () => {
+    const provider = {
+      provideImplementation: () => [
+        { uri: "file:///a.ts", range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } } },
+        { uri: "file:///b.ts", range: { start: { line: 1, character: 0 }, end: { line: 1, character: 2 } } },
+      ],
+    };
+    const out = await dispatchImplementation(
+      [{ selector: { language: "ts" }, provider }],
+      { languageId: "ts" },
+      { position: { line: 0, character: 0 } },
+    );
+    assert.ok(Array.isArray(out));
+    assert.equal((out as unknown[]).length, 2);
+  });
+
+  it("returns null when no provider returns a result", async () => {
+    const provider = { provideImplementation: () => null };
+    const out = await dispatchImplementation(
+      [{ selector: { language: "ts" }, provider }],
+      { languageId: "ts" },
+      { line: 0, character: 0 },
+    );
+    assert.equal(out, null);
+  });
+});
+
+// ── textDocument/selectionRange ──────────────────────────────────────────────
+
+type SelectionRange = { range: Range; parent?: SelectionRange };
+
+function serializeSelectionRange(sr: unknown): unknown {
+  if (!sr) return null;
+  const s = sr as SelectionRange;
+  return {
+    range: serializeRange(s.range),
+    parent: s.parent ? serializeSelectionRange(s.parent) : undefined,
+  };
+}
+
+async function dispatchSelectionRange(
+  providers: ProviderEntry<{
+    provideSelectionRanges: (doc: { languageId: string }, positions: Position[], token: unknown) => unknown;
+  }>[],
+  doc: { languageId: string } | undefined,
+  params: { positions?: Position[] },
+): Promise<unknown> {
+  if (!doc) return null;
+  const positions = (params.positions ?? []).map(p => ({ line: p.line, character: p.character }));
+  for (const entry of providers) {
+    if (matchesSelector(entry.selector, doc)) {
+      const result = await entry.provider.provideSelectionRanges(doc, positions, nullToken);
+      if (result && Array.isArray(result)) {
+        return result.map((sr: unknown) => serializeSelectionRange(sr));
+      }
+    }
+  }
+  return null;
+}
+
+describe("dispatch: textDocument/selectionRange", () => {
+  it("passes positions array and serializes nested parents", async () => {
+    let captured: Position[] | null = null;
+    const provider = {
+      provideSelectionRanges: (_doc: unknown, positions: Position[]) => {
+        captured = positions;
+        const inner: SelectionRange = {
+          range: { start: { line: 1, character: 0 }, end: { line: 1, character: 4 } },
+        };
+        const outer: SelectionRange = {
+          range: { start: { line: 0, character: 0 }, end: { line: 2, character: 0 } },
+          parent: undefined,
+        };
+        inner.parent = outer;
+        return [inner];
+      },
+    };
+    const out = await dispatchSelectionRange(
+      [{ selector: { language: "rust" }, provider }],
+      { languageId: "rust" },
+      { positions: [{ line: 1, character: 2 }] },
+    );
+    assert.deepEqual(captured, [{ line: 1, character: 2 }]);
+    const arr = out as Array<{ range: Range; parent?: { range: Range } }>;
+    assert.equal(arr.length, 1);
+    assert.deepEqual(arr[0].range, { start: { line: 1, character: 0 }, end: { line: 1, character: 4 } });
+    assert.deepEqual(arr[0].parent?.range, { start: { line: 0, character: 0 }, end: { line: 2, character: 0 } });
+  });
+
+  it("returns null when provider returns non-array", async () => {
+    const provider = { provideSelectionRanges: () => null };
+    const out = await dispatchSelectionRange(
+      [{ selector: { language: "rust" }, provider }],
+      { languageId: "rust" },
+      { positions: [{ line: 0, character: 0 }] },
+    );
+    assert.equal(out, null);
+  });
+});
+
+// ── textDocument/documentLink + documentLink/resolve ─────────────────────────
+
+type DocumentLink = { range: Range; target?: string; tooltip?: string; data?: unknown };
+
+function serializeDocumentLink(link: unknown): unknown {
+  const l = link as DocumentLink;
+  return {
+    range: serializeRange(l.range),
+    target: l.target,
+    tooltip: l.tooltip,
+    data: l.data,
+  };
+}
+
+async function dispatchDocumentLink(
+  providers: ProviderEntry<{
+    provideDocumentLinks: (doc: { languageId: string }, token: unknown) => unknown;
+  }>[],
+  doc: { languageId: string } | undefined,
+): Promise<unknown> {
+  if (!doc) return null;
+  for (const entry of providers) {
+    if (matchesSelector(entry.selector, doc)) {
+      const result = await entry.provider.provideDocumentLinks(doc, nullToken);
+      if (result && Array.isArray(result)) {
+        return result.map((l: unknown) => serializeDocumentLink(l));
+      }
+    }
+  }
+  return null;
+}
+
+async function dispatchDocumentLinkResolve(
+  providers: Array<{
+    provider: {
+      resolveDocumentLink?: (link: DocumentLink, token: unknown) => unknown;
+    };
+  }>,
+  link: DocumentLink,
+): Promise<unknown> {
+  for (const entry of providers) {
+    if (entry.provider.resolveDocumentLink) {
+      const result = await entry.provider.resolveDocumentLink(link, nullToken);
+      if (result) return serializeDocumentLink(result);
+    }
+  }
+  return link;
+}
+
+describe("dispatch: textDocument/documentLink", () => {
+  it("serializes link array result", async () => {
+    const provider = {
+      provideDocumentLinks: () => [
+        {
+          range: { start: { line: 0, character: 0 }, end: { line: 0, character: 10 } },
+          target: "https://example.com",
+          tooltip: "Open",
+        },
+      ],
+    };
+    const out = await dispatchDocumentLink(
+      [{ selector: { language: "md" }, provider }],
+      { languageId: "md" },
+    );
+    assert.deepEqual(out, [{
+      range: { start: { line: 0, character: 0 }, end: { line: 0, character: 10 } },
+      target: "https://example.com",
+      tooltip: "Open",
+      data: undefined,
+    }]);
+  });
+
+  it("returns null when no provider matches", async () => {
+    const provider = { provideDocumentLinks: () => [] };
+    const out = await dispatchDocumentLink(
+      [{ selector: { language: "py" }, provider }],
+      { languageId: "md" },
+    );
+    assert.equal(out, null);
+  });
+});
+
+describe("dispatch: documentLink/resolve", () => {
+  it("invokes resolveDocumentLink and returns enriched link", async () => {
+    const provider = {
+      resolveDocumentLink: (link: DocumentLink) => ({
+        ...link,
+        target: "https://resolved.example.com",
+        tooltip: "Resolved",
+      }),
+    };
+    const stubLink: DocumentLink = {
+      range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+      data: { id: 42 },
+    };
+    const out = await dispatchDocumentLinkResolve([{ provider }], stubLink);
+    assert.equal((out as DocumentLink).target, "https://resolved.example.com");
+    assert.equal((out as DocumentLink).tooltip, "Resolved");
+  });
+
+  it("returns input link when no resolver is provided", async () => {
+    const provider = {};
+    const link: DocumentLink = { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } } };
+    const out = await dispatchDocumentLinkResolve([{ provider }], link);
+    assert.equal(out, link);
+  });
+});
+
+// ── textDocument/semanticTokens/full ─────────────────────────────────────────
+
+function serializeSemanticTokens(
+  result: unknown,
+  legend: { tokenTypes: string[]; tokenModifiers: string[] } | undefined,
+): unknown {
+  const r = result as { data?: Uint32Array | number[]; resultId?: string };
+  const data = r.data instanceof Uint32Array ? Array.from(r.data) : (r.data ?? []);
+  return {
+    data,
+    resultId: r.resultId,
+    legend: legend ? { tokenTypes: legend.tokenTypes, tokenModifiers: legend.tokenModifiers } : undefined,
+  };
+}
+
+async function dispatchSemanticTokensFull(
+  providers: ProviderEntry<{
+    provideDocumentSemanticTokens: (doc: { languageId: string }, token: unknown) => unknown;
+    legend?: { tokenTypes: string[]; tokenModifiers: string[] };
+  }>[],
+  doc: { languageId: string } | undefined,
+): Promise<unknown> {
+  if (!doc) return null;
+  for (const entry of providers) {
+    if (matchesSelector(entry.selector, doc)) {
+      const result = await entry.provider.provideDocumentSemanticTokens(doc, nullToken);
+      if (result) return serializeSemanticTokens(result, entry.provider.legend);
+    }
+  }
+  return null;
+}
+
+describe("dispatch: textDocument/semanticTokens/full", () => {
+  it("returns data + resultId + legend when provider returns SemanticTokens", async () => {
+    const provider = {
+      provideDocumentSemanticTokens: () => ({
+        data: new Uint32Array([0, 0, 5, 0, 0]),
+        resultId: "r1",
+      }),
+      legend: { tokenTypes: ["keyword"], tokenModifiers: ["readonly"] },
+    };
+    const out = await dispatchSemanticTokensFull(
+      [{ selector: { language: "rust" }, provider }],
+      { languageId: "rust" },
+    );
+    assert.deepEqual(out, {
+      data: [0, 0, 5, 0, 0],
+      resultId: "r1",
+      legend: { tokenTypes: ["keyword"], tokenModifiers: ["readonly"] },
+    });
+  });
+
+  it("accepts plain number[] data", async () => {
+    const provider = {
+      provideDocumentSemanticTokens: () => ({ data: [1, 2, 3, 0, 0] }),
+      legend: { tokenTypes: ["variable"], tokenModifiers: [] },
+    };
+    const out = await dispatchSemanticTokensFull(
+      [{ selector: { language: "rust" }, provider }],
+      { languageId: "rust" },
+    );
+    assert.deepEqual((out as { data: number[] }).data, [1, 2, 3, 0, 0]);
+  });
+
+  it("returns null when no provider matches", async () => {
+    const provider = {
+      provideDocumentSemanticTokens: () => ({ data: [1] }),
+      legend: undefined,
+    };
+    const out = await dispatchSemanticTokensFull(
+      [{ selector: { language: "py" }, provider }],
+      { languageId: "rust" },
+    );
+    assert.equal(out, null);
+  });
+});
+
+// ── textDocument/semanticTokens/range ────────────────────────────────────────
+
+async function dispatchSemanticTokensRange(
+  providers: ProviderEntry<{
+    provideDocumentRangeSemanticTokens: (doc: { languageId: string }, range: Range, token: unknown) => unknown;
+    legend?: { tokenTypes: string[]; tokenModifiers: string[] };
+  }>[],
+  doc: { languageId: string } | undefined,
+  params: { range?: Range; startLine?: number; startCharacter?: number; endLine?: number; endCharacter?: number },
+): Promise<unknown> {
+  if (!doc) return null;
+  const range: Range = {
+    start: {
+      line: params.range?.start?.line ?? params.startLine ?? 0,
+      character: params.range?.start?.character ?? params.startCharacter ?? 0,
+    },
+    end: {
+      line: params.range?.end?.line ?? params.endLine ?? 0,
+      character: params.range?.end?.character ?? params.endCharacter ?? 0,
+    },
+  };
+  for (const entry of providers) {
+    if (matchesSelector(entry.selector, doc)) {
+      const result = await entry.provider.provideDocumentRangeSemanticTokens(doc, range, nullToken);
+      if (result) return serializeSemanticTokens(result, entry.provider.legend);
+    }
+  }
+  return null;
+}
+
+describe("dispatch: textDocument/semanticTokens/range", () => {
+  it("passes range derived from params.range and returns serialized tokens", async () => {
+    let captured: Range | null = null;
+    const provider = {
+      provideDocumentRangeSemanticTokens: (_doc: unknown, range: Range) => {
+        captured = range;
+        return { data: [0, 0, 4, 0, 0] };
+      },
+      legend: { tokenTypes: ["string"], tokenModifiers: [] },
+    };
+    const out = await dispatchSemanticTokensRange(
+      [{ selector: { language: "ts" }, provider }],
+      { languageId: "ts" },
+      { range: { start: { line: 3, character: 0 }, end: { line: 5, character: 10 } } },
+    );
+    assert.deepEqual(captured, { start: { line: 3, character: 0 }, end: { line: 5, character: 10 } });
+    assert.deepEqual((out as { data: number[] }).data, [0, 0, 4, 0, 0]);
+  });
+
+  it("falls back to flat startLine/startCharacter/endLine/endCharacter params", async () => {
+    let captured: Range | null = null;
+    const provider = {
+      provideDocumentRangeSemanticTokens: (_doc: unknown, range: Range) => {
+        captured = range;
+        return { data: [] };
+      },
+      legend: undefined,
+    };
+    await dispatchSemanticTokensRange(
+      [{ selector: { language: "ts" }, provider }],
+      { languageId: "ts" },
+      { startLine: 1, startCharacter: 2, endLine: 1, endCharacter: 8 },
+    );
+    assert.deepEqual(captured, { start: { line: 1, character: 2 }, end: { line: 1, character: 8 } });
+  });
+});

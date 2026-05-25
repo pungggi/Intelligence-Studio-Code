@@ -1063,6 +1063,103 @@ fn lsp_document_highlights(
     state.ipc.request_sync("textDocument/documentHighlight", params)
 }
 
+/// Go to the type definition of the symbol at the given position.
+#[tauri::command]
+fn lsp_type_definition(
+    uri: String,
+    line: usize,
+    character: usize,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": line, "character": character },
+    });
+    state.ipc.request_sync("textDocument/typeDefinition", params)
+}
+
+/// Go to the implementation of the symbol at the given position.
+#[tauri::command]
+fn lsp_implementation(
+    uri: String,
+    line: usize,
+    character: usize,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": line, "character": character },
+    });
+    state.ipc.request_sync("textDocument/implementation", params)
+}
+
+/// Request selection ranges (smart selection expand/shrink) for given positions.
+#[tauri::command]
+fn lsp_selection_ranges(
+    uri: String,
+    positions: Vec<serde_json::Value>,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+        "positions": positions,
+    });
+    state.ipc.request_sync("textDocument/selectionRange", params)
+}
+
+/// Request document links (clickable URLs/refs) for a document.
+#[tauri::command]
+fn lsp_document_links(
+    uri: String,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+    });
+    state.ipc.request_sync("textDocument/documentLink", params)
+}
+
+/// Resolve a previously returned document link (fills in `target`/`tooltip`).
+#[tauri::command]
+fn lsp_resolve_document_link(
+    link: serde_json::Value,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    state.ipc.request_sync("documentLink/resolve", link)
+}
+
+/// Request full-document semantic tokens (encoded as relative deltas per LSP spec).
+#[tauri::command]
+fn lsp_semantic_tokens_full(
+    uri: String,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+    });
+    state.ipc.request_sync("textDocument/semanticTokens/full", params)
+}
+
+/// Request semantic tokens for a range only.
+#[tauri::command]
+fn lsp_semantic_tokens_range(
+    uri: String,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+        "range": {
+            "start": { "line": start_line, "character": start_character },
+            "end":   { "line": end_line,   "character": end_character },
+        },
+    });
+    state.ipc.request_sync("textDocument/semanticTokens/range", params)
+}
+
 /// Drain showTextDocument requests from the Extension Host.
 #[tauri::command]
 fn get_show_text_document_requests(
@@ -2077,6 +2174,13 @@ pub fn run() {
             lsp_document_symbols,
             lsp_prepare_rename,
             lsp_document_highlights,
+            lsp_type_definition,
+            lsp_implementation,
+            lsp_selection_ranges,
+            lsp_document_links,
+            lsp_resolve_document_link,
+            lsp_semantic_tokens_full,
+            lsp_semantic_tokens_range,
             get_show_text_document_requests,
             // Unified Language Dispatch
             lang_completions,

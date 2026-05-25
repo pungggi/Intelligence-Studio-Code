@@ -18,6 +18,14 @@
  * - vscode.languages.registerDocumentSymbolProvider
  * - vscode.languages.registerDocumentFormattingEditProvider
  * - LSP request/response handling via lsp/request and lsp/response IPC messages
+ *
+ * Phase 4 (Tier 1) adds:
+ * - vscode.languages.registerTypeDefinitionProvider
+ * - vscode.languages.registerImplementationProvider
+ * - vscode.languages.registerSelectionRangeProvider
+ * - vscode.languages.registerDocumentLinkProvider
+ * - vscode.languages.registerDocumentSemanticTokensProvider
+ * - vscode.languages.registerDocumentRangeSemanticTokensProvider
  */
 
 import type { IpcMessage } from "./ipc-server.js";
@@ -1099,6 +1107,19 @@ export class VscodeApiShim {
   private foldingRangeProviders: ProviderEntry<{ provideFoldingRanges: (...args: unknown[]) => unknown }>[] = [];
   // Workspace symbol providers are global (no selector).
   private workspaceSymbolProviders: Array<{ provider: { provideWorkspaceSymbols: (...args: unknown[]) => unknown } }> = [];
+  // Phase 4: Tier 1 providers
+  private typeDefinitionProviders: ProviderEntry<{ provideTypeDefinition: (...args: unknown[]) => unknown }>[] = [];
+  private implementationProviders: ProviderEntry<{ provideImplementation: (...args: unknown[]) => unknown }>[] = [];
+  private selectionRangeProviders: ProviderEntry<{ provideSelectionRanges: (...args: unknown[]) => unknown }>[] = [];
+  private documentLinkProviders: ProviderEntry<{ provideDocumentLinks: (...args: unknown[]) => unknown; resolveDocumentLink?: (...args: unknown[]) => unknown }>[] = [];
+  // Semantic tokens — provider holds a legend; for the dispatch we pass it through to the caller via the result envelope.
+  private documentSemanticTokensProviders: ProviderEntry<{
+    provideDocumentSemanticTokens: (...args: unknown[]) => unknown;
+    provideDocumentSemanticTokensEdits?: (...args: unknown[]) => unknown;
+  } & { legend?: { tokenTypes: string[]; tokenModifiers: string[] } }>[] = [];
+  private documentRangeSemanticTokensProviders: ProviderEntry<{
+    provideDocumentRangeSemanticTokens: (...args: unknown[]) => unknown;
+  } & { legend?: { tokenTypes: string[]; tokenModifiers: string[] } }>[] = [];
 
   // Events
   private _onDidOpenTextDocument = new EventEmitter<TextDocument>();
@@ -1300,6 +1321,7 @@ export class VscodeApiShim {
     const doclessOk =
       method === "textDocument/formatting" ||
       method === "workspace/symbol" ||
+      method === "documentLink/resolve" ||
       method.startsWith("treeView/");
     if (!doc && !doclessOk) {
       return null;
@@ -1453,6 +1475,90 @@ export class VscodeApiShim {
           }
         }
         return [];
+      }
+      case "textDocument/typeDefinition": {
+        const p = params as { position?: { line: number; character: number }; line?: number; character?: number };
+        const position = new Position(p.position?.line ?? p.line ?? 0, p.position?.character ?? p.character ?? 0);
+        for (const entry of this.typeDefinitionProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideTypeDefinition(doc, position, nullCancellationToken);
+            if (result) return this.serializeLocations(result);
+          }
+        }
+        return null;
+      }
+      case "textDocument/implementation": {
+        const p = params as { position?: { line: number; character: number }; line?: number; character?: number };
+        const position = new Position(p.position?.line ?? p.line ?? 0, p.position?.character ?? p.character ?? 0);
+        for (const entry of this.implementationProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideImplementation(doc, position, nullCancellationToken);
+            if (result) return this.serializeLocations(result);
+          }
+        }
+        return null;
+      }
+      case "textDocument/selectionRange": {
+        const rawPositions = (params.positions as Array<{ line: number; character: number }>) ?? [];
+        const positions = rawPositions.map(p => new Position(p.line, p.character));
+        for (const entry of this.selectionRangeProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideSelectionRanges(doc, positions, nullCancellationToken);
+            if (result && Array.isArray(result)) {
+              return result.map((sr: unknown) => this.serializeSelectionRange(sr));
+            }
+          }
+        }
+        return null;
+      }
+      case "textDocument/documentLink": {
+        for (const entry of this.documentLinkProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideDocumentLinks(doc, nullCancellationToken);
+            if (result && Array.isArray(result)) {
+              return result.map((l: unknown) => this.serializeDocumentLink(l));
+            }
+          }
+        }
+        return null;
+      }
+      case "documentLink/resolve": {
+        const link = params as { range?: Range; target?: string; tooltip?: string };
+        for (const entry of this.documentLinkProviders) {
+          if (entry.provider.resolveDocumentLink) {
+            const result = await entry.provider.resolveDocumentLink(link, nullCancellationToken);
+            if (result) return this.serializeDocumentLink(result);
+          }
+        }
+        return link;
+      }
+      case "textDocument/semanticTokens/full": {
+        for (const entry of this.documentSemanticTokensProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideDocumentSemanticTokens(doc, nullCancellationToken);
+            if (result) return this.serializeSemanticTokens(result, entry.provider.legend);
+          }
+        }
+        return null;
+      }
+      case "textDocument/semanticTokens/range": {
+        const p = params as {
+          range?: { start: { line: number; character: number }; end: { line: number; character: number } };
+          startLine?: number; startCharacter?: number; endLine?: number; endCharacter?: number;
+        };
+        const range = new Range(
+          p.range?.start?.line ?? p.startLine ?? 0,
+          p.range?.start?.character ?? p.startCharacter ?? 0,
+          p.range?.end?.line ?? p.endLine ?? 0,
+          p.range?.end?.character ?? p.endCharacter ?? 0,
+        );
+        for (const entry of this.documentRangeSemanticTokensProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideDocumentRangeSemanticTokens(doc, range, nullCancellationToken);
+            if (result) return this.serializeSemanticTokens(result, entry.provider.legend);
+          }
+        }
+        return null;
       }
       case "textDocument/inlineCompletion": {
         const position = new Position(params.line as number, params.character as number);
@@ -1669,6 +1775,38 @@ export class VscodeApiShim {
       uri: typeof loc.uri === "string" ? loc.uri : loc.uri?.toString?.() ?? String(loc.uri),
       range: loc.range ? this.serializeRange(loc.range) : { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
     }));
+  }
+
+  private serializeSelectionRange(sr: unknown): unknown {
+    if (!sr) return null;
+    const s = sr as { range: Range; parent?: unknown };
+    return {
+      range: this.serializeRange(s.range),
+      parent: s.parent ? this.serializeSelectionRange(s.parent) : undefined,
+    };
+  }
+
+  private serializeDocumentLink(link: unknown): unknown {
+    const l = link as { range: Range; target?: { toString(): string } | string; tooltip?: string; data?: unknown };
+    return {
+      range: this.serializeRange(l.range),
+      target: l.target ? (typeof l.target === "string" ? l.target : l.target.toString()) : undefined,
+      tooltip: l.tooltip,
+      data: l.data,
+    };
+  }
+
+  private serializeSemanticTokens(
+    result: unknown,
+    legend: { tokenTypes: string[]; tokenModifiers: string[] } | undefined,
+  ): unknown {
+    const r = result as { data?: Uint32Array | number[]; resultId?: string };
+    const data = r.data instanceof Uint32Array ? Array.from(r.data) : (r.data ?? []);
+    return {
+      data,
+      resultId: r.resultId,
+      legend: legend ? { tokenTypes: legend.tokenTypes, tokenModifiers: legend.tokenModifiers } : undefined,
+    };
   }
 
   private serializeCodeActions(actions: CodeAction[]): unknown {
@@ -2177,6 +2315,74 @@ export class VscodeApiShim {
         self.foldingRangeProviders.push(entry);
         console.log("[ApiShim] FoldingRangeProvider registered");
         return { dispose: () => { self.foldingRangeProviders = self.foldingRangeProviders.filter(e => e !== entry); } };
+      },
+
+      registerTypeDefinitionProvider(
+        selector: DocumentSelector,
+        provider: { provideTypeDefinition: (...args: unknown[]) => unknown }
+      ): { dispose(): void } {
+        const entry = { selector, provider };
+        self.typeDefinitionProviders.push(entry);
+        console.log("[ApiShim] TypeDefinitionProvider registered");
+        return { dispose: () => { self.typeDefinitionProviders = self.typeDefinitionProviders.filter(e => e !== entry); } };
+      },
+
+      registerImplementationProvider(
+        selector: DocumentSelector,
+        provider: { provideImplementation: (...args: unknown[]) => unknown }
+      ): { dispose(): void } {
+        const entry = { selector, provider };
+        self.implementationProviders.push(entry);
+        console.log("[ApiShim] ImplementationProvider registered");
+        return { dispose: () => { self.implementationProviders = self.implementationProviders.filter(e => e !== entry); } };
+      },
+
+      registerSelectionRangeProvider(
+        selector: DocumentSelector,
+        provider: { provideSelectionRanges: (...args: unknown[]) => unknown }
+      ): { dispose(): void } {
+        const entry = { selector, provider };
+        self.selectionRangeProviders.push(entry);
+        console.log("[ApiShim] SelectionRangeProvider registered");
+        return { dispose: () => { self.selectionRangeProviders = self.selectionRangeProviders.filter(e => e !== entry); } };
+      },
+
+      registerDocumentLinkProvider(
+        selector: DocumentSelector,
+        provider: {
+          provideDocumentLinks: (...args: unknown[]) => unknown;
+          resolveDocumentLink?: (...args: unknown[]) => unknown;
+        }
+      ): { dispose(): void } {
+        const entry = { selector, provider };
+        self.documentLinkProviders.push(entry);
+        console.log("[ApiShim] DocumentLinkProvider registered");
+        return { dispose: () => { self.documentLinkProviders = self.documentLinkProviders.filter(e => e !== entry); } };
+      },
+
+      registerDocumentSemanticTokensProvider(
+        selector: DocumentSelector,
+        provider: {
+          provideDocumentSemanticTokens: (...args: unknown[]) => unknown;
+          provideDocumentSemanticTokensEdits?: (...args: unknown[]) => unknown;
+        },
+        legend?: { tokenTypes: string[]; tokenModifiers: string[] }
+      ): { dispose(): void } {
+        const entry = { selector, provider: Object.assign(provider, { legend }) };
+        self.documentSemanticTokensProviders.push(entry);
+        console.log("[ApiShim] DocumentSemanticTokensProvider registered");
+        return { dispose: () => { self.documentSemanticTokensProviders = self.documentSemanticTokensProviders.filter(e => e !== entry); } };
+      },
+
+      registerDocumentRangeSemanticTokensProvider(
+        selector: DocumentSelector,
+        provider: { provideDocumentRangeSemanticTokens: (...args: unknown[]) => unknown },
+        legend?: { tokenTypes: string[]; tokenModifiers: string[] }
+      ): { dispose(): void } {
+        const entry = { selector, provider: Object.assign(provider, { legend }) };
+        self.documentRangeSemanticTokensProviders.push(entry);
+        console.log("[ApiShim] DocumentRangeSemanticTokensProvider registered");
+        return { dispose: () => { self.documentRangeSemanticTokensProviders = self.documentRangeSemanticTokensProviders.filter(e => e !== entry); } };
       },
 
       registerInlineCompletionItemProvider(
