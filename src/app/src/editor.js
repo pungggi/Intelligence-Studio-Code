@@ -169,9 +169,13 @@ let selAnchorCol = null;
 let isDragging = false;
 
 // Selection-range expand/shrink — stack of prior selections so shrink can pop
-// back to the previous level. Cleared when the cursor moves without expand.
+// back to the previous level. Cleared when the cursor moves without expand,
+// when the active buffer changes, or when a newer expand supersedes a
+// pending in-flight request.
 let selectionRangeStack = []; // Array<{ startLine, startCol, endLine, endCol }>
 let selectionRangeAnchor = null; // { line, character } — where expand started
+let selectionRangeBuffer = null; // activeBufferPath captured at anchor time
+let selectionRangeToken = 0; // increments per expand call; in-flight stale calls bail
 
 // Multi-cursor state
 let extraCursors = []; // Array<{ line, col, anchorLine, anchorCol }>
@@ -3801,14 +3805,21 @@ editorEl.addEventListener('click', async (e) => {
 async function expandSelection() {
   const uri = getActiveUri();
   if (!uri) return;
+  const buf = activeBufferPath;
   // Anchor at first expand from current cursor — on shrink we walk back to
-  // this point. Re-anchor whenever the cursor moves outside the current
-  // top-of-stack selection between expand calls.
+  // this point. Re-anchor whenever the buffer changes, or whenever the
+  // current selection no longer contains the prior anchor (cursor moved).
   const cur = currentSelectionRange();
-  if (!selectionRangeAnchor || !selectionContains(cur, selectionRangeAnchor)) {
+  if (
+    selectionRangeBuffer !== buf ||
+    !selectionRangeAnchor ||
+    !selectionContains(cur, selectionRangeAnchor)
+  ) {
     selectionRangeStack = [];
     selectionRangeAnchor = { line: cursorLine, character: cursorCol };
+    selectionRangeBuffer = buf;
   }
+  const myToken = ++selectionRangeToken;
   let result;
   try {
     result = await invoke('lsp_selection_ranges', {
@@ -3818,6 +3829,8 @@ async function expandSelection() {
   } catch {
     return;
   }
+  // A newer expand call superseded us, or the buffer changed mid-flight.
+  if (myToken !== selectionRangeToken || activeBufferPath !== buf) return;
   if (!Array.isArray(result) || result.length === 0) return;
   // result[0] is a SelectionRange chain (range + parent + ...). Walk to the
   // first range strictly enclosing the current selection.
@@ -3833,6 +3846,13 @@ async function expandSelection() {
 }
 
 function shrinkSelection() {
+  // Stack is per-buffer; if the active buffer changed, drop everything.
+  if (selectionRangeBuffer !== activeBufferPath) {
+    selectionRangeStack = [];
+    selectionRangeAnchor = null;
+    selectionRangeBuffer = null;
+    return;
+  }
   if (selectionRangeStack.length === 0) return;
   const prev = selectionRangeStack.pop();
   applySelectionRange({
