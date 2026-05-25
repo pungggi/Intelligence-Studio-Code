@@ -1095,6 +1095,10 @@ export class VscodeApiShim {
   private inlayHintsProviders: ProviderEntry<{ provideInlayHints: (...args: unknown[]) => unknown }>[] = [];
   private renameProviders: ProviderEntry<{ provideRenameEdits: (...args: unknown[]) => unknown; prepareRename?: (...args: unknown[]) => unknown }>[] = [];
   private documentHighlightProviders: ProviderEntry<{ provideDocumentHighlights: (...args: unknown[]) => unknown }>[] = [];
+  private rangeFormattingProviders: ProviderEntry<{ provideDocumentRangeFormattingEdits: (...args: unknown[]) => unknown }>[] = [];
+  private foldingRangeProviders: ProviderEntry<{ provideFoldingRanges: (...args: unknown[]) => unknown }>[] = [];
+  // Workspace symbol providers are global (no selector).
+  private workspaceSymbolProviders: Array<{ provider: { provideWorkspaceSymbols: (...args: unknown[]) => unknown } }> = [];
 
   // Events
   private _onDidOpenTextDocument = new EventEmitter<TextDocument>();
@@ -1293,7 +1297,10 @@ export class VscodeApiShim {
   private async dispatchLspRequest(method: string, params: Record<string, unknown>): Promise<unknown> {
     const uri = params.uri as string;
     const doc = this.documents.get(uri);
-    const doclessOk = method === "textDocument/formatting" || method.startsWith("treeView/");
+    const doclessOk =
+      method === "textDocument/formatting" ||
+      method === "workspace/symbol" ||
+      method.startsWith("treeView/");
     if (!doc && !doclessOk) {
       return null;
     }
@@ -1397,6 +1404,55 @@ export class VscodeApiShim {
           }
         }
         return null;
+      }
+      case "textDocument/rangeFormatting": {
+        const options: FormattingOptions = {
+          tabSize: (params.tabSize as number) ?? 2,
+          insertSpaces: (params.insertSpaces as boolean) ?? true,
+        };
+        const range = new Range(
+          params.startLine as number, params.startCharacter as number,
+          params.endLine as number, params.endCharacter as number,
+        );
+        for (const entry of this.rangeFormattingProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideDocumentRangeFormattingEdits(doc, range, options, nullCancellationToken);
+            if (result) return this.serializeTextEdits(result as TextEdit[]);
+          }
+        }
+        return null;
+      }
+      case "workspace/symbol": {
+        const query = (params.query as string) ?? "";
+        const all: unknown[] = [];
+        for (const entry of this.workspaceSymbolProviders) {
+          const result = await entry.provider.provideWorkspaceSymbols(query, nullCancellationToken);
+          if (result) {
+            const serialized = this.serializeSymbols(result);
+            if (Array.isArray(serialized)) all.push(...serialized);
+          }
+        }
+        return all;
+      }
+      case "textDocument/foldingRange": {
+        for (const entry of this.foldingRangeProviders) {
+          if (doc && this.matchesSelector(entry.selector, doc)) {
+            const result = await entry.provider.provideFoldingRanges(doc, {}, nullCancellationToken);
+            if (result && Array.isArray(result)) {
+              return result.map((r: unknown) => {
+                const fr = r as { start: number; end: number; kind?: number | string };
+                return {
+                  startLine: fr.start,
+                  endLine: fr.end,
+                  kind: typeof fr.kind === 'number'
+                    ? (fr.kind === 1 ? 'comment' : fr.kind === 2 ? 'imports' : fr.kind === 3 ? 'region' : null)
+                    : (fr.kind ?? null),
+                };
+              });
+            }
+          }
+        }
+        return [];
       }
       case "textDocument/inlineCompletion": {
         const position = new Position(params.line as number, params.character as number);
@@ -2090,18 +2146,19 @@ export class VscodeApiShim {
         selector: DocumentSelector,
         provider: { provideDocumentRangeFormattingEdits: (...args: unknown[]) => unknown }
       ): { dispose(): void } {
-        // Wrap as a full-document formatter so LSP dispatch can pick it up
-        const wrapped = {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          provideDocumentFormattingEdits: (...args: unknown[]) => {
-            const [doc, , options, token] = args as [TextDocument, unknown, FormattingOptions, CancellationToken];
-            return provider.provideDocumentRangeFormattingEdits(doc, new Range(new Position(0, 0), new Position(doc.lineCount, 0)), options, token);
-          },
-        };
-        const entry = { selector, provider: wrapped };
-        self.formattingProviders.push(entry);
+        const entry = { selector, provider };
+        self.rangeFormattingProviders.push(entry);
         console.log("[ApiShim] DocumentRangeFormattingEditProvider registered");
-        return { dispose: () => { self.formattingProviders = self.formattingProviders.filter(e => e !== entry); } };
+        return { dispose: () => { self.rangeFormattingProviders = self.rangeFormattingProviders.filter(e => e !== entry); } };
+      },
+
+      registerWorkspaceSymbolProvider(
+        provider: { provideWorkspaceSymbols: (...args: unknown[]) => unknown }
+      ): { dispose(): void } {
+        const entry = { provider };
+        self.workspaceSymbolProviders.push(entry);
+        console.log("[ApiShim] WorkspaceSymbolProvider registered");
+        return { dispose: () => { self.workspaceSymbolProviders = self.workspaceSymbolProviders.filter(e => e !== entry); } };
       },
 
       registerCodeLensProvider(
@@ -2113,11 +2170,13 @@ export class VscodeApiShim {
       },
 
       registerFoldingRangeProvider(
-        _selector: DocumentSelector,
-        _provider: { provideFoldingRanges: (...args: unknown[]) => unknown }
+        selector: DocumentSelector,
+        provider: { provideFoldingRanges: (...args: unknown[]) => unknown }
       ): { dispose(): void } {
-        console.log("[ApiShim] FoldingRangeProvider registered (stub)");
-        return { dispose: () => {} };
+        const entry = { selector, provider };
+        self.foldingRangeProviders.push(entry);
+        console.log("[ApiShim] FoldingRangeProvider registered");
+        return { dispose: () => { self.foldingRangeProviders = self.foldingRangeProviders.filter(e => e !== entry); } };
       },
 
       registerInlineCompletionItemProvider(
