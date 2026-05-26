@@ -975,6 +975,7 @@ async function updateFromEditorContent(content) {
   documentHighlightsUri = null;
   documentLinks = [];
   documentLinksUri = null;
+  if (documentLinksRefetchTimer) { clearTimeout(documentLinksRefetchTimer); documentLinksRefetchTimer = null; }
   semanticTokens = new Map();
   semanticTokensUri = null;
   semanticTokensResultId = null;
@@ -1022,6 +1023,7 @@ async function updateFromEditResult(result) {
   await fetchVisibleContent();
   requestRender();
   scheduleSemanticTokens();
+  scheduleDocumentLinksRefetch();
 }
 
 function updateMetadataUI() {
@@ -1166,7 +1168,9 @@ async function fetchDocumentLinks() {
     documentLinks = result;
     documentLinksUri = uri;
     requestRender();
-  } catch { documentLinks = []; }
+  } catch {
+    if (myToken === documentLinksToken && activeBufferPath === buf) documentLinks = [];
+  }
 }
 
 async function fetchSemanticTokens() {
@@ -1191,9 +1195,11 @@ async function fetchSemanticTokens() {
     semanticTokensUri = uri;
     requestRender();
   } catch {
-    semanticTokens = new Map();
-    semanticTokensData = null;
-    semanticTokensResultId = null;
+    if (myToken === semanticTokensToken && activeBufferPath === buf) {
+      semanticTokens = new Map();
+      semanticTokensData = null;
+      semanticTokensResultId = null;
+    }
   }
 }
 
@@ -1213,6 +1219,17 @@ function scheduleSemanticTokens() {
   }, 400);
 }
 
+// Document links can shift when text is edited. Debounced re-fetch keeps
+// ranges aligned; runs in parallel with the semantic-tokens schedule.
+let documentLinksRefetchTimer = null;
+function scheduleDocumentLinksRefetch() {
+  if (documentLinksRefetchTimer) clearTimeout(documentLinksRefetchTimer);
+  documentLinksRefetchTimer = setTimeout(() => {
+    documentLinksRefetchTimer = null;
+    fetchDocumentLinks();
+  }, 500);
+}
+
 // Apply a SemanticTokensEdits response. Each edit is { start, deleteCount, data? }
 // where start/deleteCount index into the prior data array. Per LSP, edits are
 // sorted ascending by start; applying highest-start-first keeps earlier indices
@@ -1221,8 +1238,11 @@ function applySemanticTokensEdits(prevData, edits) {
   const next = prevData.slice();
   const sorted = edits.slice().sort((a, b) => b.start - a.start);
   for (const e of sorted) {
+    const start = Number.isInteger(e.start) ? e.start : 0;
+    const del = Number.isInteger(e.deleteCount) ? e.deleteCount : 0;
     const insert = Array.isArray(e.data) ? e.data : [];
-    next.splice(e.start, e.deleteCount | 0, ...insert);
+    if (start < 0 || start > next.length) continue;
+    next.splice(start, del, ...insert);
   }
   return next;
 }
@@ -1262,8 +1282,10 @@ async function fetchSemanticTokensDelta() {
     requestRender();
   } catch {
     // Delta failed (stale resultId, provider error). Drop cache, fall back.
-    semanticTokensResultId = null;
-    await fetchSemanticTokens();
+    if (myToken === semanticTokensToken && activeBufferPath === buf) {
+      semanticTokensResultId = null;
+      await fetchSemanticTokens();
+    }
   }
 }
 
