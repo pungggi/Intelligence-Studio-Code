@@ -103,6 +103,78 @@ const DOC_HIGHLIGHT_READ_BG  = 'rgba(137,220,235,0.15)';  // blue tint (kind=2 r
 const DOC_HIGHLIGHT_WRITE_BG = 'rgba(250,179,135,0.18)';  // orange tint (kind=3 write)
 const DOC_HIGHLIGHT_TEXT_BG  = 'rgba(166,173,200,0.12)';  // grey tint (kind=1 text)
 
+// Document link state (registerDocumentLinkProvider)
+let documentLinks = []; // Array<{ range: { start: {line,character}, end: {line,character} }, target?: string, tooltip?: string, data?: any }>
+let documentLinksUri = null;
+let documentLinksToken = 0;
+let ctrlHover = false; // Ctrl currently held — show link underlines
+const DOC_LINK_COLOR = '#89b4fa';
+
+// Semantic tokens state (registerDocumentSemanticTokensProvider)
+// Decoded into per-line spans for O(1) render lookup.
+let semanticTokens = new Map(); // lineIdx -> Array<{ startCol, endCol, kind }>
+let semanticTokensUri = null;
+let semanticTokensResultId = null;
+let semanticTokensToken = 0;
+// Map LSP standard + common-extension tokenType names to TOKEN_COLORS keys.
+const SEMANTIC_TYPE_TO_KIND = {
+  // LSP standard
+  namespace:     'type',
+  type:          'type',
+  class:         'type',
+  enum:          'type',
+  interface:     'type',
+  struct:        'type',
+  typeParameter: 'type',
+  parameter:     'variable',
+  variable:      'variable',
+  property:      'property',
+  enumMember:    'constant',
+  event:         'property',
+  function:      'function',
+  method:        'function',
+  macro:         'function',
+  keyword:       'keyword',
+  modifier:      'keyword',
+  comment:       'comment',
+  string:        'string',
+  number:        'number',
+  regexp:        'string',
+  operator:      'operator',
+  decorator:     'function',
+  // Common extensions (rust-analyzer, tsserver, etc.)
+  lifetime:        'variable',
+  selfKeyword:     'keyword',
+  selfTypeKeyword: 'type',
+  boolean:         'constant',
+  builtinType:     'type',
+  builtinAttribute:'attribute',
+  punctuation:     'punctuation',
+  escapeSequence:  'string',
+  formatSpecifier: 'string',
+  attribute:       'attribute',
+  attributeBracket:'punctuation',
+  char:            'string',
+  label:           'tag_name',
+  generic:         'type',
+  derive:          'function',
+  deriveHelper:    'function',
+  toolModule:      'type',
+  union:           'type',
+  bracket:         'punctuation',
+  brace:           'punctuation',
+  parenthesis:     'punctuation',
+  semicolon:       'punctuation',
+  colon:           'punctuation',
+  comma:           'punctuation',
+  dot:             'punctuation',
+  angle:           'punctuation',
+  arithmetic:      'operator',
+  logical:         'operator',
+  comparison:      'operator',
+  bitwise:         'operator',
+};
+
 function filePathToUri(p) {
   if (!p) return '';
   if (p.match(/^[a-zA-Z]:\\/)) return 'file:///' + p.replace(/\\/g, '/');
@@ -418,7 +490,12 @@ function paintEditorCanvas() {
     const y = vi * lineHeight + subPixelOffset;
     const textY = y + (lineHeight - fontSize) / 2;
 
-    if (line.tokens && line.tokens.length > 0) {
+    const semTokens = semanticTokens.get(lineIdx);
+    if (semTokens && semTokens.length > 0) {
+      // LSP semantic tokens take precedence over backend syntactic tokens.
+      const tokens = semTokens.map(t => ({ start: t.startCol, end: t.endCol, kind: t.kind }));
+      drawTokenizedLine(ctx, line.text, tokens, EDITOR_PADDING_LEFT, textY);
+    } else if (line.tokens && line.tokens.length > 0) {
       drawTokenizedLine(ctx, line.text, line.tokens, EDITOR_PADDING_LEFT, textY);
     } else {
       ctx.fillStyle = TOKEN_COLORS.plain;
@@ -458,9 +535,35 @@ function paintEditorCanvas() {
     }
   }
 
+  // Draw document-link underlines (clickable URL/path regions)
+  paintDocumentLinks(ctx, first, subPixelOffset);
+
   // Draw cursor
   paintCursor(ctx, first, subPixelOffset);
   paintExtraCursors(ctx, first, subPixelOffset);
+}
+
+function paintDocumentLinks(ctx, firstVisibleLine, subPixelOffset) {
+  if (!ctrlHover || !documentLinks.length) return;
+  const visH = editorCanvas.height / (window.devicePixelRatio || 1);
+  const visibleCount = Math.ceil(visH / lineHeight) + 2;
+  ctx.fillStyle = DOC_LINK_COLOR;
+  for (const lnk of documentLinks) {
+    const r = lnk.range; if (!r) continue;
+    for (let li = r.start.line; li <= r.end.line; li++) {
+      if (foldedLineSet.has(li)) continue;
+      const displayLi = foldedLineSet.size > 0 ? bufferToDisplay(li) : li;
+      const vi = displayLi - firstVisibleLine;
+      if (vi < 0 || vi >= visibleCount) continue;
+      const y = vi * lineHeight + subPixelOffset;
+      const colStart = (li === r.start.line) ? r.start.character : 0;
+      const lineText = getLineText(li);
+      const colEnd   = (li === r.end.line) ? r.end.character : lineText.length;
+      const x = EDITOR_PADDING_LEFT + colStart * cellWidth;
+      const w = Math.max(1, (colEnd - colStart)) * cellWidth;
+      ctx.fillRect(x, y + lineHeight - 2, w, 1);
+    }
+  }
 }
 
 function drawTokenizedLine(ctx, text, tokens, x, y) {
@@ -867,6 +970,11 @@ async function updateFromEditorContent(content) {
   inlayHintsUri = null;
   documentHighlights = [];
   documentHighlightsUri = null;
+  documentLinks = [];
+  documentLinksUri = null;
+  semanticTokens = new Map();
+  semanticTokensUri = null;
+  semanticTokensResultId = null;
   extraCursors = [];
   ctrlDWord = null;
   commentThreads = [];
@@ -891,6 +999,9 @@ async function updateFromEditorContent(content) {
   requestRender();
   // Fetch folding ranges in background after file loads
   fetchFoldingRanges();
+  // Fetch document links + semantic tokens in background
+  fetchDocumentLinks();
+  fetchSemanticTokens();
 }
 
 /**
@@ -1034,6 +1145,138 @@ function scheduleDocumentHighlights() {
       requestRender();
     } catch { /* no provider */ }
   }, 300);
+}
+
+async function fetchDocumentLinks() {
+  const uri = getActiveUri();
+  if (!uri) return;
+  const buf = activeBufferPath;
+  const myToken = ++documentLinksToken;
+  try {
+    const result = await invoke('lsp_document_links', { uri });
+    if (myToken !== documentLinksToken || activeBufferPath !== buf) return;
+    if (!Array.isArray(result)) { documentLinks = []; return; }
+    documentLinks = result;
+    documentLinksUri = uri;
+    requestRender();
+  } catch { documentLinks = []; }
+}
+
+async function fetchSemanticTokens() {
+  const uri = getActiveUri();
+  if (!uri) return;
+  const buf = activeBufferPath;
+  const myToken = ++semanticTokensToken;
+  try {
+    const result = await invoke('lsp_semantic_tokens_full', { uri });
+    if (myToken !== semanticTokensToken || activeBufferPath !== buf) return;
+    if (!result || !Array.isArray(result.data) || result.data.length === 0) {
+      semanticTokens = new Map();
+      semanticTokensResultId = null;
+      return;
+    }
+    const legend = result.legend || null;
+    semanticTokens = decodeSemanticTokens(result.data, legend);
+    semanticTokensResultId = result.resultId || null;
+    semanticTokensUri = uri;
+    requestRender();
+  } catch {
+    semanticTokens = new Map();
+    semanticTokensResultId = null;
+  }
+}
+
+// Decode LSP semantic tokens delta-encoded flat array into per-line spans.
+// Wire format: [deltaLine, deltaStartChar, length, tokenType, tokenModifiers] × N.
+function decodeSemanticTokens(data, legend) {
+  const out = new Map();
+  if (!Array.isArray(data) || data.length % 5 !== 0) return out;
+  const types = (legend && Array.isArray(legend.tokenTypes)) ? legend.tokenTypes : [];
+  let line = 0;
+  let col = 0;
+  for (let i = 0; i < data.length; i += 5) {
+    const dLine = data[i];
+    const dStart = data[i + 1];
+    const len = data[i + 2];
+    const tType = data[i + 3];
+    if (dLine !== 0) {
+      line += dLine;
+      col = dStart;
+    } else {
+      col += dStart;
+    }
+    const typeName = types[tType];
+    const kind = (typeName && SEMANTIC_TYPE_TO_KIND[typeName]) || 'plain';
+    if (!out.has(line)) out.set(line, []);
+    out.get(line).push({ startCol: col, endCol: col + len, kind });
+  }
+  return out;
+}
+
+// Look up a document link covering the given (line, col). Returns first match.
+function findDocumentLinkAt(line, col) {
+  for (const lnk of documentLinks) {
+    const r = lnk.range;
+    if (!r) continue;
+    const sL = r.start.line, sC = r.start.character;
+    const eL = r.end.line,   eC = r.end.character;
+    if (line < sL || line > eL) continue;
+    if (line === sL && col < sC) continue;
+    if (line === eL && col >= eC) continue;
+    return lnk;
+  }
+  return null;
+}
+
+async function openDocumentLink(link) {
+  let lnk = link;
+  const buf = activeBufferPath;
+  // Resolve if target missing.
+  if (!lnk.target) {
+    try {
+      const resolved = await invoke('lsp_resolve_document_link', { link: lnk });
+      if (activeBufferPath !== buf) return; // buffer switched mid-resolve
+      if (resolved && resolved.target) lnk = resolved;
+    } catch { /* fall through with unresolved link */ }
+  }
+  const target = lnk.target;
+  if (!target) {
+    statusEl.textContent = 'Link has no target';
+    setTimeout(() => { statusEl.textContent = ''; }, 1500);
+    return;
+  }
+  if (target.startsWith('file://')) {
+    let uri = target;
+    let frag = null;
+    const hashIdx = uri.indexOf('#');
+    if (hashIdx >= 0) { frag = uri.substring(hashIdx + 1); uri = uri.substring(0, hashIdx); }
+    let line = 0, col = 0;
+    if (frag) {
+      const m = frag.match(/^L?(\d+)(?:[,:](\d+))?$/);
+      if (m) { line = Math.max(0, parseInt(m[1], 10) - 1); col = m[2] ? Math.max(0, parseInt(m[2], 10) - 1) : 0; }
+    }
+    await navigateToLocation(uri, line, col);
+    return;
+  }
+  if (/^https?:\/\//.test(target)) {
+    const opener = window.__TAURI__ && window.__TAURI__.opener;
+    if (opener && typeof opener.openUrl === 'function') {
+      try {
+        await opener.openUrl(target);
+        return;
+      } catch (err) {
+        statusEl.textContent = `Cannot open URL: ${err}`;
+        setTimeout(() => { statusEl.textContent = ''; }, 2500);
+        return;
+      }
+    }
+    // shell:allow-open capability not granted — surface so user knows.
+    statusEl.textContent = `URL link requires 'shell:allow-open' capability: ${target}`;
+    setTimeout(() => { statusEl.textContent = ''; }, 3000);
+    return;
+  }
+  statusEl.textContent = `Unsupported link: ${target}`;
+  setTimeout(() => { statusEl.textContent = ''; }, 2000);
 }
 
 // ─── Buffer State Management ─────────────────────────────────
@@ -2596,6 +2839,23 @@ document.addEventListener('mouseup', () => {
   }
 });
 
+// Ctrl-hover: show document-link underlines only while Ctrl is held.
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Control' && !ctrlHover && documentLinks.length > 0) {
+    ctrlHover = true;
+    requestRender();
+  }
+});
+document.addEventListener('keyup', (e) => {
+  if (e.key === 'Control' && ctrlHover) {
+    ctrlHover = false;
+    requestRender();
+  }
+});
+window.addEventListener('blur', () => {
+  if (ctrlHover) { ctrlHover = false; requestRender(); }
+});
+
 // ─── File Operations ─────────────────────────────────────────
 
 async function openFileDialog() {
@@ -3796,6 +4056,8 @@ editorEl.addEventListener('click', async (e) => {
     const pos = posFromMouse(e);
     cursorLine = pos.line;
     cursorCol = pos.col;
+    const link = findDocumentLinkAt(pos.line, pos.col);
+    if (link) { await openDocumentLink(link); return; }
     await goToDefinition();
   }
 });
