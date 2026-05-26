@@ -119,64 +119,15 @@ let semanticTokensToken = 0;
 let semanticTokensData = null;   // raw last-known flat data array (for delta application)
 let semanticTokensLegend = null; // cached legend for delta-only responses
 let semanticTokensTimer = null;  // debounce on edit
-// Map LSP standard + common-extension tokenType names to TOKEN_COLORS keys.
-const SEMANTIC_TYPE_TO_KIND = {
-  // LSP standard
-  namespace:     'type',
-  type:          'type',
-  class:         'type',
-  enum:          'type',
-  interface:     'type',
-  struct:        'type',
-  typeParameter: 'type',
-  parameter:     'variable',
-  variable:      'variable',
-  property:      'property',
-  enumMember:    'constant',
-  event:         'property',
-  function:      'function',
-  method:        'function',
-  macro:         'function',
-  keyword:       'keyword',
-  modifier:      'keyword',
-  comment:       'comment',
-  string:        'string',
-  number:        'number',
-  regexp:        'string',
-  operator:      'operator',
-  decorator:     'function',
-  // Common extensions (rust-analyzer, tsserver, etc.)
-  lifetime:        'variable',
-  selfKeyword:     'keyword',
-  selfTypeKeyword: 'type',
-  boolean:         'constant',
-  builtinType:     'type',
-  builtinAttribute:'attribute',
-  punctuation:     'punctuation',
-  escapeSequence:  'string',
-  formatSpecifier: 'string',
-  attribute:       'attribute',
-  attributeBracket:'punctuation',
-  char:            'string',
-  label:           'tag_name',
-  generic:         'type',
-  derive:          'function',
-  deriveHelper:    'function',
-  toolModule:      'type',
-  union:           'type',
-  bracket:         'punctuation',
-  brace:           'punctuation',
-  parenthesis:     'punctuation',
-  semicolon:       'punctuation',
-  colon:           'punctuation',
-  comma:           'punctuation',
-  dot:             'punctuation',
-  angle:           'punctuation',
-  arithmetic:      'operator',
-  logical:         'operator',
-  comparison:      'operator',
-  bitwise:         'operator',
-};
+
+// Pure helpers (loaded from lib/editor-helpers.js via <script> before this file).
+const {
+  decodeSemanticTokens,
+  applySemanticTokensEdits,
+  findDocumentLinkAt: findDocumentLinkAtPure,
+  selectionContains,
+  rangeStrictlyContains,
+} = window.EditorHelpers;
 
 function filePathToUri(p) {
   if (!p) return '';
@@ -1230,23 +1181,6 @@ function scheduleDocumentLinksRefetch() {
   }, 500);
 }
 
-// Apply a SemanticTokensEdits response. Each edit is { start, deleteCount, data? }
-// where start/deleteCount index into the prior data array. Per LSP, edits are
-// sorted ascending by start; applying highest-start-first keeps earlier indices
-// valid as the array mutates.
-function applySemanticTokensEdits(prevData, edits) {
-  const next = prevData.slice();
-  const sorted = edits.slice().sort((a, b) => b.start - a.start);
-  for (const e of sorted) {
-    const start = Number.isInteger(e.start) ? e.start : 0;
-    const del = Number.isInteger(e.deleteCount) ? e.deleteCount : 0;
-    const insert = Array.isArray(e.data) ? e.data : [];
-    if (start < 0 || start > next.length) continue;
-    next.splice(start, del, ...insert);
-  }
-  return next;
-}
-
 async function fetchSemanticTokensDelta() {
   const uri = getActiveUri();
   if (!uri) return;
@@ -1289,46 +1223,9 @@ async function fetchSemanticTokensDelta() {
   }
 }
 
-// Decode LSP semantic tokens delta-encoded flat array into per-line spans.
-// Wire format: [deltaLine, deltaStartChar, length, tokenType, tokenModifiers] × N.
-function decodeSemanticTokens(data, legend) {
-  const out = new Map();
-  if (!Array.isArray(data) || data.length % 5 !== 0) return out;
-  const types = (legend && Array.isArray(legend.tokenTypes)) ? legend.tokenTypes : [];
-  let line = 0;
-  let col = 0;
-  for (let i = 0; i < data.length; i += 5) {
-    const dLine = data[i];
-    const dStart = data[i + 1];
-    const len = data[i + 2];
-    const tType = data[i + 3];
-    if (dLine !== 0) {
-      line += dLine;
-      col = dStart;
-    } else {
-      col += dStart;
-    }
-    const typeName = types[tType];
-    const kind = (typeName && SEMANTIC_TYPE_TO_KIND[typeName]) || 'plain';
-    if (!out.has(line)) out.set(line, []);
-    out.get(line).push({ startCol: col, endCol: col + len, kind });
-  }
-  return out;
-}
-
-// Look up a document link covering the given (line, col). Returns first match.
+// Wrapper that binds the module-local documentLinks array.
 function findDocumentLinkAt(line, col) {
-  for (const lnk of documentLinks) {
-    const r = lnk.range;
-    if (!r) continue;
-    const sL = r.start.line, sC = r.start.character;
-    const eL = r.end.line,   eC = r.end.character;
-    if (line < sL || line > eL) continue;
-    if (line === sL && col < sC) continue;
-    if (line === eL && col >= eC) continue;
-    return lnk;
-  }
-  return null;
+  return findDocumentLinkAtPure(documentLinks, line, col);
 }
 
 async function openDocumentLink(link) {
@@ -4242,24 +4139,6 @@ function applySelectionRange(range) {
   cursorLine = range.end.line;
   cursorCol = range.end.character;
   requestRender();
-}
-
-function selectionContains(sel, pos) {
-  if (pos.line < sel.startLine || pos.line > sel.endLine) return false;
-  if (pos.line === sel.startLine && pos.character < sel.startCol) return false;
-  if (pos.line === sel.endLine && pos.character > sel.endCol) return false;
-  return true;
-}
-
-function rangeStrictlyContains(range, sel) {
-  const posLE = (a, b) => a.line < b.line || (a.line === b.line && a.character <= b.character);
-  const selStart = { line: sel.startLine, character: sel.startCol };
-  const selEnd = { line: sel.endLine, character: sel.endCol };
-  if (!posLE(range.start, selStart)) return false;
-  if (!posLE(selEnd, range.end)) return false;
-  const startsEq = range.start.line === selStart.line && range.start.character === selStart.character;
-  const endsEq = range.end.line === selEnd.line && range.end.character === selEnd.character;
-  return !(startsEq && endsEq);
 }
 
 // --- Find References ---
