@@ -116,6 +116,9 @@ let semanticTokens = new Map(); // lineIdx -> Array<{ startCol, endCol, kind }>
 let semanticTokensUri = null;
 let semanticTokensResultId = null;
 let semanticTokensToken = 0;
+let semanticTokensData = null;   // raw last-known flat data array (for delta application)
+let semanticTokensLegend = null; // cached legend for delta-only responses
+let semanticTokensTimer = null;  // debounce on edit
 // Map LSP standard + common-extension tokenType names to TOKEN_COLORS keys.
 const SEMANTIC_TYPE_TO_KIND = {
   // LSP standard
@@ -975,6 +978,9 @@ async function updateFromEditorContent(content) {
   semanticTokens = new Map();
   semanticTokensUri = null;
   semanticTokensResultId = null;
+  semanticTokensData = null;
+  semanticTokensLegend = null;
+  if (semanticTokensTimer) { clearTimeout(semanticTokensTimer); semanticTokensTimer = null; }
   extraCursors = [];
   ctrlDWord = null;
   commentThreads = [];
@@ -1015,6 +1021,7 @@ async function updateFromEditResult(result) {
   ensureCursorVisible();
   await fetchVisibleContent();
   requestRender();
+  scheduleSemanticTokens();
 }
 
 function updateMetadataUI() {
@@ -1172,17 +1179,91 @@ async function fetchSemanticTokens() {
     if (myToken !== semanticTokensToken || activeBufferPath !== buf) return;
     if (!result || !Array.isArray(result.data) || result.data.length === 0) {
       semanticTokens = new Map();
+      semanticTokensData = null;
       semanticTokensResultId = null;
       return;
     }
     const legend = result.legend || null;
-    semanticTokens = decodeSemanticTokens(result.data, legend);
+    semanticTokensLegend = legend;
+    semanticTokensData = result.data.slice();
+    semanticTokens = decodeSemanticTokens(semanticTokensData, legend);
     semanticTokensResultId = result.resultId || null;
     semanticTokensUri = uri;
     requestRender();
   } catch {
     semanticTokens = new Map();
+    semanticTokensData = null;
     semanticTokensResultId = null;
+  }
+}
+
+// Debounced re-fetch after edits. Uses delta path when a prior resultId is
+// cached for the active URI; falls back to full on miss or any failure.
+function scheduleSemanticTokens() {
+  if (semanticTokensTimer) clearTimeout(semanticTokensTimer);
+  semanticTokensTimer = setTimeout(() => {
+    semanticTokensTimer = null;
+    const uri = getActiveUri();
+    if (!uri) return;
+    if (semanticTokensResultId && semanticTokensUri === uri && Array.isArray(semanticTokensData)) {
+      fetchSemanticTokensDelta();
+    } else {
+      fetchSemanticTokens();
+    }
+  }, 400);
+}
+
+// Apply a SemanticTokensEdits response. Each edit is { start, deleteCount, data? }
+// where start/deleteCount index into the prior data array. Per LSP, edits are
+// sorted ascending by start; applying highest-start-first keeps earlier indices
+// valid as the array mutates.
+function applySemanticTokensEdits(prevData, edits) {
+  const next = prevData.slice();
+  const sorted = edits.slice().sort((a, b) => b.start - a.start);
+  for (const e of sorted) {
+    const insert = Array.isArray(e.data) ? e.data : [];
+    next.splice(e.start, e.deleteCount | 0, ...insert);
+  }
+  return next;
+}
+
+async function fetchSemanticTokensDelta() {
+  const uri = getActiveUri();
+  if (!uri) return;
+  const buf = activeBufferPath;
+  const myToken = ++semanticTokensToken;
+  const prevId = semanticTokensResultId;
+  const prevData = semanticTokensData;
+  try {
+    const result = await invoke('lsp_semantic_tokens_delta', { uri, previousResultId: prevId });
+    if (myToken !== semanticTokensToken || activeBufferPath !== buf) return;
+    if (!result) {
+      // Provider returned null — fall back to full.
+      await fetchSemanticTokens();
+      return;
+    }
+    const legend = result.legend || semanticTokensLegend || null;
+    if (legend) semanticTokensLegend = legend;
+    if (Array.isArray(result.edits)) {
+      if (!Array.isArray(prevData)) {
+        await fetchSemanticTokens();
+        return;
+      }
+      semanticTokensData = applySemanticTokensEdits(prevData, result.edits);
+    } else if (Array.isArray(result.data)) {
+      semanticTokensData = result.data.slice();
+    } else {
+      await fetchSemanticTokens();
+      return;
+    }
+    semanticTokens = decodeSemanticTokens(semanticTokensData, legend);
+    semanticTokensResultId = result.resultId || null;
+    semanticTokensUri = uri;
+    requestRender();
+  } catch {
+    // Delta failed (stale resultId, provider error). Drop cache, fall back.
+    semanticTokensResultId = null;
+    await fetchSemanticTokens();
   }
 }
 
