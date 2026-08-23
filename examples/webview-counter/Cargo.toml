@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # WIT bindings generated from corecode.wit
-wit-bindgen = "0.26"
+wit-bindgen = "0.43"
 
 [profile.release]
 opt-level     = "z"

@@ -20,6 +20,9 @@ wit_bindgen::generate!({
     path: "../../src/app/src-tauri/wit/corecode.wit",
 });
 
+use corecode::extension::ui;
+use exports::corecode::extension::lifecycle::Guest;
+
 struct TomlGrammar;
 
 impl Guest for TomlGrammar {

@@ -11,6 +11,9 @@ wit_bindgen::generate!({
     path: "../../src/app/src-tauri/wit/corecode.wit",
 });
 
+use exports::corecode::extension::lifecycle::Guest;
+use corecode::extension::ui;
+
 struct HelloWasm;
 
 impl Guest for HelloWasm {

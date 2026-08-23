@@ -13,6 +13,10 @@ wit_bindgen::generate!({
     path: "../../src/app/src-tauri/wit/corecode.wit",
 });
 
+use corecode::extension::ui;
+use corecode::extension::webview;
+use exports::corecode::extension::lifecycle::Guest;
+
 struct WebviewCounter;
 
 // SAFETY: WASM components are single-threaded — no concurrent access to this global.

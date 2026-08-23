@@ -30,3 +30,7 @@ Thumbs.db
 *.dll
 
 .pi/ghost-autocomplete
+# Extension packages (cargo-corecode output)
+*.ccext
+*.vsix
+*-zed.zip

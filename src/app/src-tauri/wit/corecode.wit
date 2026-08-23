@@ -25,8 +25,8 @@ interface types {
     filter-text: option<string>,
   }
   enum completion-kind {
-    text, method, function, constructor, field, variable,
-    class, interface, module, property, unit, value, enum-member,
+    text, method, function, %constructor, field, variable,
+    class, %interface, %module, property, unit, value, enum-member,
     keyword, snippet, color, file, reference, folder,
   }
 
@@ -46,9 +46,9 @@ interface types {
     container-name: option<string>,
   }
   enum symbol-kind {
-    file, module, namespace, package, class, method, property,
-    field, constructor, enum, interface, function, variable,
-    constant, string, number, boolean, array, object, key, null,
+    file, %module, namespace, %package, class, method, property,
+    field, %constructor, %enum, %interface, function, variable,
+    constant, %string, number, boolean, array, object, key, null,
     enum-member, struct, event, operator, type-parameter,
   }
 
@@ -105,7 +105,7 @@ interface language-provider {
   use types.{
     position, range, completion-item, hover-result,
     diagnostic, text-edit, code-action, location,
-    symbol, folding-range,
+    symbol, folding-range, completion-kind, severity,
   };
 
   completions:       func(uri: string, pos: position, trigger: option<string>)

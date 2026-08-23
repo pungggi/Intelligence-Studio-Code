@@ -14,6 +14,9 @@ wit_bindgen::generate!({
     path: "../../src/app/src-tauri/wit/corecode.wit",
 });
 
+use corecode::extension::ui;
+use exports::corecode::extension::lifecycle::Guest;
+
 struct SimpleLsp;
 
 impl Guest for SimpleLsp {
@@ -34,7 +37,8 @@ impl exports::corecode::extension::language_provider::Guest for SimpleLsp {
         _pos: exports::corecode::extension::language_provider::Position,
         _trigger: Option<String>,
     ) -> Result<Vec<exports::corecode::extension::language_provider::CompletionItem>, String> {
-        use exports::corecode::extension::language_provider::{CompletionItem, CompletionKind};
+        use exports::corecode::extension::language_provider::CompletionItem;
+        use corecode::extension::types::CompletionKind;
         Ok(vec![
             CompletionItem {
                 label: "hello".to_string(),
@@ -70,7 +74,8 @@ impl exports::corecode::extension::language_provider::Guest for SimpleLsp {
         _uri: String,
         content: String,
     ) -> Result<Vec<exports::corecode::extension::language_provider::Diagnostic>, String> {
-        use exports::corecode::extension::language_provider::{Diagnostic, Position, Range, Severity};
+        use exports::corecode::extension::language_provider::{Diagnostic, Position, Range};
+        use corecode::extension::types::Severity;
         let mut diags = Vec::new();
         for (line_idx, line) in content.lines().enumerate() {
             if let Some(byte_col) = line.find("TODO") {
