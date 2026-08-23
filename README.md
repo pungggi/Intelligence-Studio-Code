@@ -35,7 +35,7 @@ docs/                  # Documentation & PRD
 
 ## Getting Started
 
-> **Status:** Initial scaffold — Milestone M0 (Technology Spike)
+> **Status:** M0–M7 complete, M8 mostly complete, M9–M12 complete; WASM extension host Phases 1–4 done, Phase 5 partial — see [STATUS.md](STATUS.md)
 
 ### Prerequisites
 

@@ -1,6 +1,6 @@
 # CoreCode — Project Status
 
-**Last updated:** 2026-03-27
+**Last updated:** 2026-08-23
 
 ---
 
@@ -16,7 +16,22 @@
 | **M5: Multi-file Editor** | Tabs, file explorer, TreeView API, workspace-tagged IPC, HTML/CSS/MD grammars, minimap | **Done** |
 | **M6: Language Intelligence** | LSP client, completions, hover, go-to-definition, code actions, formatting | **Done** |
 | **M7: Native Rendering** | Canvas2D text rendering, virtualized content, virtual scroll, large file support | **Done** |
-| **M8: Full Platform** | WebViews, terminal, settings UI, Open VSX marketplace, accessibility, multi-workspace | **In Progress** (M8a done) |
+| **M8: Full Platform** | Marketplace, settings UI, WebView, terminal, multi-workspace, themes, ARIA | **Mostly done** (accessibility + top-20 matrix in progress) |
+| **M9: Debug Adapter Protocol** | DAP sessions, debug sidebar, breakpoints, debug toolbar/console | **Done** |
+| **M10: Extension Compatibility Expansion** | `workspace.applyEdit`, `createTerminal`, inlay hints, TreeView panel | **Done** |
+| **M11: Multi-cursor + API Trio** | Multi-cursor editing, rename (F2), `showTextDocument`, document highlights | **Done** |
+| **M12: Security + Tasks + SCM + Diff** | IPC auth token, path traversal fixes, `vscode.tasks`, git SCM panel, diff viewer | **Done** |
+
+**Parallel track — WASM Extension Host** (branch `feature/wasm-extension-host-impl`, see [docs/plans/impl/00-index.md](docs/plans/impl/00-index.md)):
+
+| Phase | Scope | Status |
+|:------|:------|:-------|
+| **Phase 1** | In-process wasmtime host, WIT bindings, fuel + epoch sandboxing | **Done** (2026-03-28) |
+| **Phase 2** | Language provider APIs, `simple-lsp` example | **Done** (2026-03-29) |
+| **Phase 2.5** | Grammar registry, manifest hardening, `cargo-corecode` CLI, manual test suite | **Done** (2026-04-02) |
+| **Phase 3** | Unified `lang_*` dispatch (format/range-format, rename, code actions, workspace symbols, folding) | **Done** (2026-05-25) |
+| **Phase 4** | Tier-1 LSP providers: typeDefinition, implementation, selectionRange, documentLinks, semanticTokens (+ frontend wiring, delta refresh) | **Done** (2026-05-26) |
+| **Phase 5** | Cross-editor toolchain (`.ccext` / Zed `.zip` / `.vsix`) | **Partial** — `cargo corecode new/build/check` implemented; `publish` command not yet implemented |
 
 ---
 
@@ -122,10 +137,10 @@ All 4 spikes passed validation:
 
 ### PRD scope redistribution
 
-The original PRD defined M4 broadly as "Top 20 Extensions, Performance, macOS+Linux". Those items have been redistributed to future milestones:
+The original PRD defined M4 broadly as "Top 20 Extensions, Performance, macOS+Linux". Those items have been redistributed:
 
 | Original PRD M4 item | Now in |
-|:----------------------|:-------|
+|:---------------------|:-------|
 | Top 20 extension compatibility | M6 (top 10), M8 (top 20) |
 | Performance optimization | M7 |
 | macOS + Linux validation | M7 |
@@ -175,75 +190,20 @@ The original PRD defined M4 broadly as "Top 20 Extensions, Performance, macOS+Li
 | **TreeView API** | `vscode.window.createTreeView` / `registerTreeDataProvider` with `TreeItem`, `TreeItemCollapsibleState` | `vscode-api-shim.ts` |
 | **TreeDataProvider** | `getTreeItem`, `getChildren`, `onDidChangeTreeData` interface | `vscode-api-shim.ts` |
 
-### New Tauri Commands (M5)
-
-```
-open_file(path)           → EditorContent  (multi-buffer: doesn't close previous)
-close_buffer(path)        → Option<EditorContent>
-switch_buffer(path)       → EditorContent
-list_open_buffers()       → Vec<BufferInfo>
-read_directory(path)      → Vec<DirEntry>
-```
-
-### New Keyboard Shortcuts (M5)
-
-| Shortcut | Action |
-|:---------|:-------|
-| Ctrl+B | Toggle file explorer sidebar |
-| Ctrl+Tab | Next tab |
-| Ctrl+Shift+Tab | Previous tab |
-| Ctrl+W | Close current tab |
-
-See [milestones.md](docs/milestones.md) for full M8 details.
-
 ---
 
 ## M6: Language Intelligence — LSP — COMPLETE
 
 ### Architecture Changes
 
-- **Request/response IPC**: New `lsp/request` / `lsp/response` message pair with correlation IDs. Rust uses `oneshot` channels for blocking request/response from Tauri commands. Extension Host dispatches to registered providers asynchronously.
-- **LanguageClient**: New `language-client.ts` — spawns LSP servers via stdio, JSON-RPC 2.0 protocol with `Content-Length` headers. Auto-registers VS Code providers based on server capabilities.
+- **Request/response IPC**: `lsp/request` / `lsp/response` message pair with correlation IDs. Rust uses `oneshot` channels for blocking request/response from Tauri commands. Extension Host dispatches to registered providers asynchronously.
+- **LanguageClient**: `language-client.ts` — spawns LSP servers via stdio, JSON-RPC 2.0 protocol with `Content-Length` headers. Auto-registers VS Code providers based on server capabilities.
 - **vscode-languageclient shim**: Extensions can `require("vscode-languageclient")` or `require("vscode-languageclient/node")` — module resolution injects the built-in LanguageClient with vscodeApi pre-attached.
-- **Provider registry**: 8 new provider types in `vscode.languages.*` with document selector matching and serialization for IPC transport.
+- **Provider registry**: 8 provider types in `vscode.languages.*` with document selector matching and serialization for IPC transport.
 
-### Completed (Backend — ipc_bridge.rs, lib.rs)
+### Key Features
 
-| Feature | Description | Files |
-|:--------|:------------|:------|
-| **Request/response IPC** | `lsp/request` with `request_id`, `oneshot` channels, 10s timeout | `ipc_bridge.rs` |
-| **`lsp_hover`** | Tauri command for hover at position | `lib.rs` |
-| **`lsp_completion`** | Tauri command for completions with trigger kind/character | `lib.rs` |
-| **`lsp_definition`** | Tauri command for go-to-definition | `lib.rs` |
-| **`lsp_references`** | Tauri command for find references | `lib.rs` |
-| **`lsp_code_action`** | Tauri command for code actions on range | `lib.rs` |
-| **`lsp_signature_help`** | Tauri command for signature help | `lib.rs` |
-| **`lsp_document_symbols`** | Tauri command for document symbols | `lib.rs` |
-| **`lsp_format`** | Tauri command for document formatting | `lib.rs` |
-
-### Completed (Extension Host — vscode-api-shim.ts, language-client.ts)
-
-| Feature | Description | Files |
-|:--------|:------------|:------|
-| **Provider registration** | 8 `register*Provider` methods with document selector matching | `vscode-api-shim.ts` |
-| **LSP request dispatch** | `handleLspRequest` → `dispatchLspRequest` with provider lookup | `vscode-api-shim.ts` |
-| **Result serialization** | CompletionItem, Hover, Location, CodeAction, Symbol, TextEdit | `vscode-api-shim.ts` |
-| **LanguageClient** | JSON-RPC 2.0 stdio, initialize/shutdown, auto provider registration | `language-client.ts` |
-| **vscode-languageclient** | Module shim injected into require cache | `extension-loader.ts` |
-| **New VS Code types** | CompletionItemKind, SymbolKind, CompletionTriggerKind, CancellationTokenSource | `vscode-api-shim.ts` |
-
-### Completed (Frontend — editor.js, index.html, style.css)
-
-| Feature | Keybinding | Description |
-|:--------|:-----------|:------------|
-| **Autocomplete popup** | Ctrl+Space / `.` trigger | Multi-column with icons, detail panel, Enter/Tab accept |
-| **Hover tooltip** | Mouse hover (500ms) | Floating tooltip positioned above line, auto-dismiss |
-| **Go-to-definition** | F12 / Ctrl+Click | Cross-file navigation, opens target file at position |
-| **Find references** | Shift+F12 | Floating panel listing all references, click to navigate |
-| **Code actions** | Ctrl+. | Quick fix menu with arrow key nav, workspace edit support |
-| **Signature help** | Auto on `(` and `,` | Active parameter highlighting, documentation display |
-| **Document symbols** | Ctrl+Shift+O | Filterable outline palette with kind icons |
-| **Formatting** | Ctrl+Shift+F | Apply text edits from formatter, sorted end-to-start |
+- Autocomplete popup (Ctrl+Space / `.`), hover tooltip, go-to-definition (F12 / Ctrl+Click), find references (Shift+F12), code actions (Ctrl+.), signature help, document symbols (Ctrl+Shift+O), formatting (Ctrl+Shift+F)
 
 ### Code Review Fixes Applied (M1-M5 review, 21 findings)
 
@@ -279,29 +239,12 @@ See [milestones.md](docs/milestones.md) for full M8 details.
 
 Chromium's Canvas2D is already GPU-accelerated (Skia + D3D11). Embedding a native wgpu surface inside Tauri has unsolved z-ordering issues with popups. The real bottleneck was O(n) serialization per keystroke, not DOM vs GPU rendering. Spike code retained in `src/frontend/src/spike/` as reference.
 
-### Completed (Backend)
+### Completed
 
-| Feature | Description | Files |
-|:--------|:------------|:------|
-| **`VisibleContent` struct** | Virtualized response: only requested lines + metadata | `lib.rs` |
-| **`get_visible_content`** | Tauri command: fetch lines for visible range + buffer zone | `lib.rs`, `editor.rs` |
-| **`EditResult` responses** | All 7 edit commands return `{ total_lines, modified }` instead of full content | `lib.rs` |
-| **`do_edit()` helper** | Shared notify + reparse + result logic for edit commands | `lib.rs` |
-| **Filtered diagnostics** | `get_visible_content` only returns diagnostics in the visible range | `editor.rs` |
-
-### Completed (Frontend)
-
-| Feature | Description | Files |
-|:--------|:------------|:------|
-| **Canvas2D text rendering** | `paintEditorCanvas()` with `fillText()`, per-token color from Catppuccin Mocha | `editor.js` |
-| **Canvas gutter** | `paintGutterCanvas()` draws line numbers synced to editor scroll | `editor.js` |
-| **Virtual scrolling** | Sticky canvas over scroll-sizer div, scroll → line range mapping | `editor.js`, `style.css` |
-| **Content caching** | 30-line buffer zone, fetch on cache miss during scroll | `editor.js` |
-| **O(1) mouse mapping** | `posFromMouse()` arithmetic replaces DOM `.line` iteration | `editor.js` |
-| **Canvas overlays** | Selection, find highlights, cursor blink, diagnostic wavy underlines | `editor.js` |
-| **Popup positioning** | `getLineBoundsOnScreen()` arithmetic for LSP popup placement | `editor.js` |
-| **requestAnimationFrame** | `requestRender()` coalesces multiple requests into single frame | `editor.js` |
-| **Minimap** | Token-density minimap with viewport indicator | `editor.js` |
+| Area | Features |
+|:-----|:---------|
+| **Backend** | `VisibleContent` virtualized response, `get_visible_content` command, all 7 edit commands return O(1) `EditResult` via shared `do_edit()` helper, visible-range diagnostic filtering |
+| **Frontend** | Canvas2D text + gutter rendering (`paintEditorCanvas`, `paintGutterCanvas`), virtual scrolling with sticky canvas, 30-line content cache with buffer zone, O(1) mouse mapping (`posFromMouse`), canvas overlays (selection, find highlights, cursor, diagnostic underlines), arithmetic popup positioning, `requestAnimationFrame` render coalescing, token-density minimap |
 
 ### Performance Impact
 
@@ -314,7 +257,7 @@ Chromium's Canvas2D is already GPU-accelerated (Skia + D3D11). Embedding a nativ
 
 ---
 
-## M8: Full Platform — IN PROGRESS
+## M8: Full Platform — MOSTLY COMPLETE
 
 ### M8a: Extension Ecosystem — COMPLETE
 
@@ -338,17 +281,149 @@ New keyboard shortcuts: Ctrl+Shift+X (Extensions), Ctrl+, (Settings)
 
 New dependencies: `reqwest 0.12`, `zip 2`, `dirs 5`
 
-### M8b-c: Remaining (Planned)
+### M8b: WebView, Terminal, Themes, ARIA — COMPLETE
+
+| Feature | Description | Files |
+|:--------|:------------|:------|
+| **Integrated terminal** | PTY-based terminal panel via `portable-pty` (ConPTY/Unix), xterm.js frontend, multi-session tabs | `terminal.rs`, `editor.js`, `index.html` |
+| **WebView support** | `vscode.window.createWebviewPanel` — iframe panels with `acquireVsCodeApi`, bidirectional postMessage | `ipc_bridge.rs`, `lib.rs`, `vscode-api-shim.ts`, `editor.js` |
+| **High-contrast themes** | `hc-dark` and `hc-light` CSS classes with full token color overrides | `style.css` |
+| **Keyboard navigation / ARIA** | `role=tablist/tab/main/textbox/dialog/search/toolbar`, `aria-label`, focus rings, `.sr-only` | `index.html`, `style.css` |
+| **Multi-workspace** | Shared Extension Host serving multiple project windows with `workspace_id` routing | `ipc_bridge.rs`, `lib.rs` |
+
+New Tauri commands (M8b): `terminal_create`, `terminal_write`, `terminal_resize`, `terminal_close`, `terminal_list`, `get_terminal_events`, `respond_terminal_created`, `get_webview_events`, `webview_post_message`, `webview_close_by_user`
+
+New IPC messages (M8b): `webview/create`, `webview/setHtml`, `webview/postMessage`, `webview/reveal`, `webview/close`, `webview/messageFromWebview`, `webview/closedByUser`
+
+New Tauri events (M8b): `terminal-data`, `terminal-exit`
+
+### M8 Remaining
 
 | Feature | Status |
 |:--------|:-------|
-| WebView support | Planned |
-| Integrated terminal | Planned |
-| Multi-workspace | Planned |
-| Accessibility / Screen reader | Planned |
-| Keyboard navigation | Planned |
-| High-contrast themes | Planned |
-| Top 20 extension testing | Planned |
+| **Accessibility / screen reader** | In progress — hidden textarea proxy, ARIA live announcer |
+| **Top 20 extension testing** | In progress — compatibility matrix 52 ✅ / 5 ⚠️ / 1 ❌ across 58 extensions, see [extension-compatibility.md](docs/extension-compatibility.md) |
+
+---
+
+## M9: Debug Adapter Protocol (DAP) — COMPLETE
+
+Full DAP session lifecycle: adapter process spawn, Content-Length DAP framing, event queue.
+
+| Feature | Description | Files |
+|:--------|:------------|:------|
+| **DAP session manager** | Spawn adapter, frame parser, event queue | `debug.rs` |
+| **Debug sidebar** | Run & Debug panel: Call Stack, Variables, Breakpoints | `index.html`, `style.css`, `editor.js` |
+| **Breakpoints** | Gutter click to toggle, red dots, F9 hotkey | `editor.js` |
+| **Stopped marker** | Yellow gutter arrow at current frame | `editor.js` |
+| **Debug toolbar** | Start/Continue, Step Over/Into/Out, Restart, Stop | `editor.js` |
+| **Debug Console** | Bottom-panel tab with adapter output events | `editor.js` |
+| **Extension API** | `registerDebugAdapterDescriptorFactory`, `debug.startDebugging`, `DebugAdapterExecutable`, `DebugAdapterServer` | `vscode-api-shim.ts` |
+
+Tauri commands: `get_debug_start_requests`, `debug_start`, `debug_send`, `debug_poll_events`, `debug_stop`, `debug_list_sessions`
+
+Keyboard shortcuts: F5 (start/continue), Shift+F5 (stop), F9 (breakpoint), F10 (step over), F11 (step into), Shift+F11 (step out), Ctrl+Shift+D (Run & Debug panel)
+
+Debug adapter path validation: absolute path → canonicalize → is-file → home-dir confinement (M12).
+
+---
+
+## M10: Extension Compatibility Expansion — COMPLETE
+
+| Feature | Description |
+|:--------|:------------|
+| **A. `workspace.applyEdit` + `WorkspaceEdit`** | Multi-file edits; open buffers updated in-memory, others on disk. Frontend polls `get_workspace_edit_requests` and confirms via `apply_workspace_edit`. Supports `changes` (LSP 3.x) and `documentChanges` formats. |
+| **B. `window.createTerminal`** | Already complete from M8/M9 |
+| **C. Inlay hints** | `lsp_inlay_hints` command, canvas overlay at character positions, 600ms debounce on cursor/scroll |
+| **D. TreeView panel** | Collapsible tree panel with `onDidChangeTreeData` push and command execution; `get_tree_view_events`, `tree_view_get_children` commands |
+
+Also: code-action `applyEdit` fixed to route edits per-file URI via `apply_workspace_edit` instead of applying all edits to the active buffer.
+
+---
+
+## M11: Multi-cursor + Extension API Trio — COMPLETE
+
+### Multi-cursor Editing
+
+| Shortcut | Behaviour |
+|:---------|:----------|
+| Ctrl+Alt+Up / Down | Add cursor above / below |
+| Alt+Click | Add cursor at click position |
+| Ctrl+D | Select next occurrence of word/selection |
+| Escape | Collapse to primary cursor |
+
+All edit operations apply to all cursors simultaneously, processed bottom-to-top to avoid offset drift. Status bar shows `[N cursors]`.
+
+### Extension APIs
+
+| API | Flow |
+|:----|:-----|
+| **`registerRenameProvider` (F2)** | F2 → `lsp_prepare_rename` → input box pre-filled with symbol → `lang_rename` → `apply_workspace_edit` |
+| **`window.showTextDocument`** | Extensions open files programmatically (optional `selection`); polled via `get_show_text_document_requests` |
+| **`registerDocumentHighlightProvider`** | Symbol-under-cursor occurrences highlighted, kind-tinted (text grey / read blue / write orange), 300ms debounce |
+
+> Note: rename moved from `lsp_rename` to the unified `lang_rename` dispatch (WASM-host Phase 3, 2026-05-25).
+
+---
+
+## M12: Security Hardening + Tasks + SCM + Diff Viewer — COMPLETE
+
+### A. Security Hardening
+
+| Fix | Description |
+|:----|:------------|
+| **IPC auth token** | Shared-secret authentication before message processing | `ipc_bridge.rs`, `ext_host.rs`, `ipc-server.ts` |
+| **Path traversal prevention** | `validate_path` / `validate_dir_path` — canonicalize + home-dir confinement for all file I/O | `lib.rs` |
+| **`apply_workspace_edit` hardening** | `validate_path` on every URI before read/write | `lib.rs` |
+| **Shell path traversal** | Terminal `shell` param rejected if it contains `..` | `lib.rs` |
+| **Buffer overflow fix** | Accumulated-buffer check fires **before** `extend_from_slice` | `ipc_bridge.rs` |
+| **`iframe` sandbox** | Removed `allow-same-origin` from webview sandbox | `lib.rs` |
+| **Webview event queue cap** | `MAX_WEBVIEW_EVENTS = 100` with drop-and-warn | `ipc_bridge.rs` |
+| **Extension manifest validation** | `version`, `activationEvents`, `contributes.commands` checked | `extension-loader.ts` |
+| **URI encoding** | `url::Url::from_file_path()` for percent-encoding | `lib.rs` |
+
+### B. `vscode.tasks`
+
+Full task API wired to the integrated terminal: `TaskScope`, `TaskRevealKind`, `TaskPanelKind`, `TaskGroup`, `ShellExecution`, `ProcessExecution`, `Task`, `registerTaskProvider`, `fetchTasks`, `executeTask`, `onDidStartTask` / `onDidEndTask`.
+
+### C. `vscode.scm` + Git SCM Panel
+
+- **Rust:** `ScmResourceState` / `ScmResourceGroup` / `ScmSourceControlState` buffered per-id; `scm/update`, `scm/remove` IPC messages
+- **Extension Host:** real `vscode.scm.createSourceControl` with live `SourceControl` objects; `Proxy`-based resource groups push state on assignment
+- **Git commands:** `git_status`, `git_diff_file`, `git_stage`, `git_unstage`, `git_discard`, `git_commit`, `get_scm_state`
+- **SCM sidebar:** Ctrl+Shift+G, commit box (Ctrl+Enter), Staged/Changes/Untracked groups, status letters with colors, inline Stage/Unstage/Discard, extension SCM state merged, 5s polling
+- **Diff viewer:** full-screen overlay on SCM file click, line numbers, colored diff (added/removed/hunk/file headers), context-sensitive Stage/Unstage/Discard buttons, Escape closes
+
+---
+
+## WASM Extension Host (parallel track) — PHASES 1–4 COMPLETE, PHASE 5 PARTIAL
+
+Branch: `feature/wasm-extension-host-impl`. In-process `wasmtime` (component model) alongside the Node.js Extension Host — no subprocess. Plans: [docs/plans/impl/00-index.md](docs/plans/impl/00-index.md), architecture: [docs/plans/01-architecture.md](docs/plans/01-architecture.md).
+
+| Component | Description |
+|:----------|:------------|
+| `wasm_host/manager.rs` | Shared engine; fuel + epoch interruption sandboxing (~30s deadline) |
+| `wasm_host/instance.rs` | Per-extension `Store`, lifecycle + optional provider exports |
+| `wasm_host/api_impl.rs` | Host imports (ui, workspace) |
+| `wasm_host/manifest.rs` | `corecode.toml` parser/validator |
+| `grammar_registry.rs` | Dynamic native grammar loading (Phase 2.5) |
+| `dispatch.rs` | Unified `lang_*` dispatch layer (Phase 3) |
+
+### Unified `lang_*` dispatch (Phase 3)
+
+`lang_completions`, `lang_hover`, `lang_diagnostics`, `lang_definition`, `lang_references`, `lang_format_document`, `lang_format_range`, `lang_rename`, `lang_code_actions`, `lang_workspace_symbols`, `lang_folding_ranges` — single command surface serving both WASM and Node.js providers.
+
+### Tier-1 LSP additions (Phase 4)
+
+`lsp_type_definition`, `lsp_implementation`, `lsp_selection_ranges`, `lsp_document_links`, `lsp_resolve_document_link`, `lsp_semantic_tokens_full`, `lsp_semantic_tokens_range`, `lsp_semantic_tokens_delta` — frontend wired for type-def/implementation/selection-range navigation, document links, and semantic tokens with delta refresh on edit.
+
+### Toolchain (Phase 5 — partial)
+
+`tools/cargo-corecode`: `cargo corecode new --template <t>`, `cargo corecode build --target corecode|zed|vscode|all`, `cargo corecode check`. Packagers for `.ccext`, Zed `.zip`, VS Code `.vsix`. **`publish` command not yet implemented.**
+
+### Example WASM extensions (`examples/`)
+
+`hello-wasm` (commands), `simple-lsp` (language provider), `grammar-toml` (dynamic grammar + highlights query), `webview-counter` (webview panel).
 
 ---
 
@@ -362,21 +437,27 @@ New dependencies: `reqwest 0.12`, `zip 2`, `dirs 5`
 |  - WorkspaceState|  JSON frames     |  - VS Code API     |
 |    └ HashMap<    |  + workspace_id  |    shim             |
 |      Path,Buffer>|  + lsp req/resp  |  - Extension loader |
-|  - Tree-sitter   |                  |  - LSP providers    |
+|  - Tree-sitter   |  + auth token    |  - LSP providers    |
 |  - Find engine   |                  |  - LanguageClient   |
 |  - LSP commands  |                  |  - TreeView API     |
-+------------------+                  +--------------------+
-        |                                      |
-        v                                      v
-+--------------------+               +--------------------+
-|  HTML/CSS/JS       |               |  LSP Servers       |
-|  Frontend          |               |  (child processes) |
-|                    |               |                    |
-|  - Tab bar         |               |  - JSON-RPC 2.0   |
-|  - File explorer   |               |  - stdio transport |
-|  - Editor canvas   |               |  - Auto-registered |
-|  - Command palette |               |    providers       |
-|  - Find/Replace    |               +--------------------+
+|  - PTY terminal  |                  |  - tasks/scm/debug  |
+|  - DAP sessions  |                  +--------------------+
+|  - Git commands  |                          |
+|  - WASM host     |                          v
+|    (wasmtime,   |                  +--------------------+
+|     in-process)  |                  |  LSP Servers       |
++------------------+                  |  (child processes) |
+        |                             +--------------------+
+        v
++--------------------+          +---------------------------+
+|  HTML/CSS/JS       |          |  WASM extensions          |
+|  Frontend          |          |  (.ccext, wasmtime)       |
+|                    |          |  hello-wasm, simple-lsp,  |
+|  - Tab bar         |          |  grammar-toml,            |
+|  - File explorer   |          |  webview-counter          |
+|  - Editor canvas   |          +---------------------------+
+|  - Command palette |
+|  - Find/Replace    |
 |  - Output panel    |
 |  - Minimap         |
 |  - Autocomplete    |
@@ -385,6 +466,11 @@ New dependencies: `reqwest 0.12`, `zip 2`, `dirs 5`
 |  - References      |
 |  - Code actions    |
 |  - Symbol outline  |
+|  - Inlay hints     |
+|  - Multi-cursor    |
+|  - Terminal (xterm)|
+|  - Debug sidebar   |
+|  - SCM panel + diff|
 +--------------------+
 ```
 
@@ -401,6 +487,7 @@ New dependencies: `reqwest 0.12`, `zip 2`, `dirs 5`
 | HTML (.html, .htm) | tree-sitter-html 0.23 | Working (M5) |
 | CSS (.css, .scss) | tree-sitter-css 0.25 | Working (M5) |
 | Markdown (.md) | tree-sitter-md 0.5 | Working (M5) |
+| Any via extension | Dynamic native grammars (grammar provider) | Working (WASM Phase 2.5, e.g. `grammar-toml`) |
 
 ## VS Code API Coverage
 
@@ -411,21 +498,52 @@ New dependencies: `reqwest 0.12`, `zip 2`, `dirs 5`
 | `workspace.onDidChangeTextDocument` | Implemented | |
 | `workspace.onDidCloseTextDocument` | Implemented | |
 | `workspace.getConfiguration` | Implemented | Reads contributes.configuration |
+| `workspace.applyEdit` | Implemented (M10) | Multi-file WorkspaceEdit |
 | `commands.registerCommand` | Implemented | |
 | `commands.executeCommand` | Implemented | |
 | `languages.createDiagnosticCollection` | Implemented | Per-URI storage |
+| `languages.register*Provider` (8 core) | Implemented (M6) | Completion, hover, definition, references, code actions, signature help, symbols, formatting |
+| `languages.registerRenameProvider` | Implemented (M11) | F2 flow |
+| `languages.registerDocumentHighlightProvider` | Implemented (M11) | |
 | `window.showInformationMessage` | Implemented | Toast notification |
 | `window.showWarningMessage` | Implemented | Toast notification |
 | `window.showErrorMessage` | Implemented | Toast notification |
 | `window.showQuickPick` | Implemented | Palette overlay |
 | `window.showInputBox` | Implemented | Palette overlay |
+| `window.showTextDocument` | Implemented (M11) | With optional selection |
 | `window.createStatusBarItem` | Implemented (M4) | Full: IPC + frontend polling + click → command |
 | `window.createOutputChannel` | Implemented (M4) | Full: IPC + frontend panel with channel selector |
-| `window.createTextEditorDecorationType` | Stub (M4) | Basic plumbing |
-| `window.createTreeView` | Implemented (M5) | TreeView with data provider |
+| `window.createTextEditorDecorationType` | Implemented (M4) | IPC + frontend polling |
+| `window.createTreeView` | Implemented (M5, panel M10) | TreeView with data provider |
 | `window.registerTreeDataProvider` | Implemented (M5) | TreeDataProvider interface |
+| `window.createWebviewPanel` | Implemented (M8b) | iframe + acquireVsCodeApi + postMessage |
+| `window.createTerminal` | Implemented (M8b) | Extension terminal API |
+| `debug.startDebugging` | Implemented (M9) | + DebugAdapterDescriptorFactory |
+| `tasks.*` | Implemented (M12) | Full task lifecycle |
+| `scm.createSourceControl` | Implemented (M12) | Live Proxy resource groups |
+| `comments` | Implemented | Comment threads (`get_comment_threads`) |
+| `notebooks` | Implemented | Basic shim surface |
+| `authentication` | Implemented | Basic shim surface |
 | `Uri` | Implemented (M4) | file/parse/fsPath |
-| `Position` / `Range` | Implemented (M4) | |
+| `Position` / `Range` / `Selection` | Implemented (M4) | |
 | `DiagnosticSeverity` | Implemented | Error/Warning/Info/Hint |
 | `StatusBarAlignment` | Implemented (M4) | Left/Right |
 | `TreeItemCollapsibleState` | Implemented (M5) | None/Collapsed/Expanded |
+| `ViewColumn` | Implemented (M8b) | Active/Beside/One/Two/Three |
+
+## Testing
+
+| Suite | Scope | Size |
+|:------|:------|:-----|
+| Extension Host (TS, `*.test.ts`) | extension-loader, ipc-server, language-client, git-api, lsp-dispatch | 144 test cases |
+| Frontend (`node --test`) | `src/app/src/lib/editor-helpers.test.js` | Pure helper functions extracted from editor.js |
+| Rust | Inline `#[test]` modules (editor, ipc_bridge, wasm_host, …) | No separate `tests/` dir |
+| Manual (`docs/testing/manual/`) | 00 prerequisites → 07 security: compile extensions, cargo-corecode CLI, runtime lifecycle, language/grammar providers, webview panels, security | 8 documents |
+| Compatibility | Top-20 extension matrix | 58 extensions: 52 ✅ / 5 ⚠️ / 1 ❌ |
+
+## Open Items
+
+- [ ] **M8 accessibility** — screen reader support (hidden textarea proxy, ARIA live announcer) still in progress
+- [ ] **M8 top-20 extension testing** — 6 extensions still ⚠️/❌ (see `docs/extension-compatibility.md`)
+- [ ] **WASM Phase 5** — `cargo corecode publish` command missing from `tools/cargo-corecode`
+- [ ] **Push local commit** — `42ee255` (editor-helpers extraction + tests) is ahead of `origin/feature/wasm-extension-host-impl`

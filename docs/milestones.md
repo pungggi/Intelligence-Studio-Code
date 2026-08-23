@@ -674,7 +674,7 @@ Debounced 300ms on cursor move. Cleared on file switch and multi-cursor.
 
 | Command | Purpose |
 |:--------|:--------|
-| `lsp_rename` | Request rename edits from extension providers |
+| `lang_rename` | Request rename edits from extension providers (unified `lang_*` dispatch; originally shipped as `lsp_rename`) |
 | `lsp_prepare_rename` | Check rename availability at position |
 | `lsp_document_highlights` | Request symbol highlights at position |
 | `get_show_text_document_requests` | Poll showTextDocument requests from Extension Host |
