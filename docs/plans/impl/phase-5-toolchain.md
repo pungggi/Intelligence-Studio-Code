@@ -59,7 +59,8 @@ serde_json = "1"
 toml      = "0.8"
 zip       = "2"
 walkdir   = "2"
-wit-parser = "0.210"   # for WIT validation in `check`
+wasmparser = "0.210"   # for export inspection in `check`
+ureq       = "2"      # for `publish` uploads
 ```
 
 ---

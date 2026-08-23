@@ -44,9 +44,11 @@ pub struct Capabilities {
 
 #[derive(Deserialize)]
 pub struct Grammar {
+    #[serde(rename = "language-id")]
     pub language_id: String,
-    #[serde(default)]
+    #[serde(rename = "file-types", default)]
     pub file_types: Vec<String>,
+    #[serde(rename = "grammar-dylib")]
     pub grammar_dylib: Option<String>,
 }
 
@@ -58,4 +60,32 @@ pub fn load() -> anyhow::Result<CoreCodeManifest> {
         ))?;
     toml::from_str::<CoreCodeManifest>(&text)
         .map_err(|e| anyhow::anyhow!("Failed to parse corecode.toml: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Grammar keys are kebab-case in real manifests (as parsed by the host's
+    /// manifest.rs) — the toolchain must read the same shape.
+    #[test]
+    fn parses_grammar_section_kebab_case() {
+        let m: CoreCodeManifest = toml::from_str(
+            r#"
+[extension]
+id = "corecode.grammar-toml"
+name = "TOML"
+version = "0.1.0"
+
+[grammar]
+language-id = "toml"
+file-types = ["toml"]
+"#,
+        )
+        .unwrap();
+        let g = m.grammar.expect("grammar section dropped");
+        assert_eq!(g.language_id, "toml");
+        assert_eq!(g.file_types, vec!["toml"]);
+        assert!(g.grammar_dylib.is_none());
+    }
 }

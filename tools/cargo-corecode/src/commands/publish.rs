@@ -1,0 +1,204 @@
+//! `cargo corecode publish` — build a release `.ccext` and upload it to a
+//! CoreCode marketplace registry.
+//!
+//! The registry API is intentionally minimal (a single binary POST, see
+//! `docs/plans/05-roadmap.md` Phase 6):
+//!
+//! ```text
+//! POST {registry}/api/v1/publish
+//! Authorization: Bearer <token>
+//! Content-Type: application/octet-stream
+//! X-CoreCode-Extension: <publisher.name>
+//! X-CoreCode-Version: <semver>
+//!
+//! <.ccext bytes>
+//! ```
+//!
+//! Success: 200/201. Failures: 401/403 bad token, 409 version already
+//! published, anything else is an error with the response body surfaced.
+
+use crate::manifest::{self, CoreCodeManifest};
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// Default public registry (Phase 6 — may not be live yet).
+const DEFAULT_REGISTRY: &str = "https://marketplace.corecode.dev";
+
+pub fn run(token: Option<&str>, registry: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
+    let m = manifest::load()?;
+    validate(&m)?;
+
+    // Always publish a fresh release build — same rule as `cargo publish`.
+    crate::commands::build::run("corecode", true)?;
+
+    let package: PathBuf = format!("{}-{}.ccext", m.extension.id, m.extension.version).into();
+    anyhow::ensure!(
+        package.exists(),
+        "package not found at {}",
+        package.display()
+    );
+    let bytes = std::fs::read(&package)?;
+    let size_kb = (bytes.len() as f64 / 1024.0).ceil() as u64;
+
+    println!();
+    println!("  extension : {}", m.extension.id);
+    println!("  version   : {}", m.extension.version);
+    println!("  package   : {} ({size_kb} KB)", package.display());
+
+    if dry_run {
+        println!("  dry run   : package built and validated, upload skipped");
+        return Ok(());
+    }
+
+    let token = token
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("CORECODE_TOKEN").ok())
+        .filter(|s| !s.is_empty());
+    anyhow::ensure!(
+        token.is_some(),
+        "no API token — pass --token or set CORECODE_TOKEN"
+    );
+    let token = token.unwrap();
+
+    let registry = registry
+        .map(|s| s.trim_end_matches('/').to_string())
+        .or_else(|| std::env::var("CORECODE_REGISTRY").ok().map(|s| s.trim_end_matches('/').to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_REGISTRY.to_string());
+
+    let url = format!("{registry}/api/v1/publish");
+    println!("  registry  : {url}");
+
+    let response = ureq::post(&url)
+        .timeout(Duration::from_secs(300))
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/octet-stream")
+        .set("X-CoreCode-Extension", &m.extension.id)
+        .set("X-CoreCode-Version", &m.extension.version)
+        .send_bytes(&bytes);
+
+    match response {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.into_string().unwrap_or_default();
+            println!("  published : HTTP {status}");
+            if !body.trim().is_empty() {
+                println!("  {body}");
+            }
+            Ok(())
+        }
+        Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
+            anyhow::bail!("authentication failed — check your token (HTTP 401/403)")
+        }
+        Err(ureq::Error::Status(409, _)) => anyhow::bail!(
+            "version {} of {} is already published — bump the version in corecode.toml",
+            m.extension.version,
+            m.extension.id
+        ),
+        Err(ureq::Error::Status(status, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            anyhow::bail!("registry rejected the package: HTTP {status}\n  {body}")
+        }
+        Err(ureq::Error::Transport(t)) => anyhow::bail!(
+            "could not reach registry {registry}: {t}\n  \
+             Is the marketplace running? Set --registry or CORECODE_REGISTRY, \
+             or use --dry-run to validate the package without uploading."
+        ),
+    }
+}
+
+/// Validate manifest fields that the registry requires.
+///
+/// - `extension.id` must be exactly `publisher.name` — non-empty segments,
+///   alphanumeric plus `-`/`_`, no path characters, no leading/trailing `-`.
+/// - `extension.version` must be semantic (`x.y.z` with optional pre-release).
+pub fn validate(m: &CoreCodeManifest) -> anyhow::Result<()> {
+    let id = m.extension.id.as_str();
+    let (publisher, name) = id
+        .split_once('.')
+        .ok_or_else(|| anyhow::anyhow!("extension id must be 'publisher.name', got '{id}'"))?;
+    for (label, part) in [("publisher", publisher), ("name", name)] {
+        anyhow::ensure!(
+            is_valid_segment(part),
+            "invalid {label} '{part}' in extension id '{id}': \
+             use alphanumeric characters, '-' and '_', no path separators"
+        );
+    }
+    anyhow::ensure!(
+        is_valid_version(&m.extension.version),
+        "invalid version '{}' — expected semantic version like 1.2.3 (pre-release suffix allowed)",
+        m.extension.version
+    );
+    Ok(())
+}
+
+fn is_valid_segment(part: &str) -> bool {
+    !part.is_empty()
+        && !part.starts_with('-')
+        && !part.ends_with('-')
+        && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn is_valid_version(v: &str) -> bool {
+    let v = v.strip_prefix('v').unwrap_or(v);
+    let (core, pre) = match v.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (v, None),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3 || parts.iter().all(|p| p.parse::<u64>().is_ok()) == false {
+        return false;
+    }
+    pre.map_or(true, |p| {
+        !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::{Capabilities, Entry, ExtensionMeta};
+
+    fn manifest_with(id: &str, version: &str) -> CoreCodeManifest {
+        CoreCodeManifest {
+            extension: ExtensionMeta {
+                id: id.to_string(),
+                name: "Test".to_string(),
+                version: version.to_string(),
+            },
+            entry: Entry::default(),
+            capabilities: Capabilities::default(),
+            languages: Default::default(),
+            grammar: None,
+        }
+    }
+
+    #[test]
+    fn valid_manifest_passes() {
+        assert!(validate(&manifest_with("corecode.hello-wasm", "0.1.0")).is_ok());
+        assert!(validate(&manifest_with("my-pub.my_ext", "1.2.3-beta.1")).is_ok());
+    }
+
+    #[test]
+    fn rejects_ids_without_publisher() {
+        assert!(validate(&manifest_with("hello-wasm", "0.1.0")).is_err());
+        assert!(validate(&manifest_with("a.b.c", "0.1.0")).is_err());
+        assert!(validate(&manifest_with(".name", "0.1.0")).is_err());
+        assert!(validate(&manifest_with("pub.", "0.1.0")).is_err());
+    }
+
+    #[test]
+    fn rejects_path_characters_in_id() {
+        assert!(validate(&manifest_with("../evil", "0.1.0")).is_err());
+        assert!(validate(&manifest_with("a/b.c", "0.1.0")).is_err());
+        assert!(validate(&manifest_with("-bad-.name", "0.1.0")).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_versions() {
+        assert!(validate(&manifest_with("pub.name", "1.2")).is_err());
+        assert!(validate(&manifest_with("pub.name", "latest")).is_err());
+        assert!(validate(&manifest_with("pub.name", "1.2.x")).is_err());
+        assert!(validate(&manifest_with("pub.name", "1.2.3-")).is_err());
+    }
+}

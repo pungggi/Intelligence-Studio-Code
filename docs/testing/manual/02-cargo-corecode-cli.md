@@ -21,12 +21,14 @@ ccr corecode --help
 ccr corecode new --help
 ccr corecode build --help
 ccr corecode check --help
+ccr corecode publish --help
 ```
 
-- [ ] All 4 commands print help text without panic
+- [ ] All 5 commands print help text without panic
 - [ ] `new` shows `--template` option with default `language-provider`
 - [ ] `build` shows `--target` and `--release` options
 - [ ] `check` shows `--target` option with default `all`
+- [ ] `publish` shows `--token`, `--registry`, and `--dry-run` options
 
 ---
 
@@ -150,24 +152,24 @@ ccr corecode build --target all --release
 ```
 
 - [ ] Command completes without error
-- [ ] `dist/` directory created
+- [ ] `corecode.hello-wasm-0.1.0.ccext`, `corecode.hello-wasm-0.1.0-zed.zip`, and `corecode.hello-wasm-0.1.0.vsix` are created in the extension directory
 
 ### T2.4b — Validate .ccext (CoreCode native)
 
-- [ ] `dist/corecode.hello-wasm.ccext` exists
+- [ ] `corecode.hello-wasm-0.1.0.ccext` exists
 - [ ] It is a valid ZIP file (open with any ZIP tool)
 - [ ] Contains `corecode.toml`
-- [ ] Contains the `.wasm` binary
+- [ ] Contains `extension.wasm`
 
 ### T2.4c — Validate .zip (Zed)
 
-- [ ] `dist/corecode.hello-wasm.zip` exists
+- [ ] `corecode.hello-wasm-0.1.0-zed.zip` exists
 - [ ] Contains `extension.toml`
 - [ ] Contains the `.wasm` binary
 
 ### T2.4d — Validate .vsix (VS Code)
 
-- [ ] `dist/corecode.hello-wasm.vsix` exists
+- [ ] `corecode.hello-wasm-0.1.0.vsix` exists
 - [ ] It is a valid ZIP file
 - [ ] Contains `extension/package.json` — open it and verify:
   - [ ] `name` matches extension ID
@@ -187,13 +189,72 @@ ccr corecode build --target corecode --release
 
 ---
 
+## T2.5 — `cargo corecode publish` — Marketplace Upload
+
+Requires a compiled extension (T2.4a). The marketplace server is Phase 6 —
+until it exists, only the dry-run and error paths are testable.
+
+### T2.5a — Dry run
+
+```bash
+cd <REPO>/examples/hello-wasm
+ccr corecode publish --dry-run
+```
+
+- [ ] Builds a release `.ccext` first
+- [ ] Prints extension id, version, package name and size
+- [ ] Prints `dry run: package built and validated, upload skipped`
+- [ ] Exits 0
+
+### T2.5b — Missing token
+
+```bash
+unset CORECODE_TOKEN
+ccr corecode publish
+```
+
+- [ ] Builds the package, then fails with `no API token — pass --token or set CORECODE_TOKEN`
+- [ ] Exits non-zero
+
+### T2.5c — Unreachable registry
+
+```bash
+ccr corecode publish --token fake --registry http://127.0.0.1:1
+```
+
+- [ ] Fails with a `could not reach registry` transport error and suggests `--dry-run`
+- [ ] Exits non-zero
+
+### T2.5d — Invalid manifest
+
+```bash
+mkdir -p /tmp/corecode-test/pub-bad && cd /tmp/corecode-test/pub-bad
+echo '[extension]
+id = "nodash"
+name = "x"
+version = "0.1"
+' > corecode.toml
+ccr corecode publish --dry-run
+```
+
+- [ ] Fails with `extension id must be 'publisher.name'` or the semver message
+- [ ] Exits non-zero
+
+### T2.5e — Live publish (Phase 6, blocked)
+
+- [ ] Blocked until the marketplace endpoint exists: `POST {registry}/api/v1/publish`
+  with `Authorization: Bearer`, `X-CoreCode-Extension`, `X-CoreCode-Version` headers
+  and the `.ccext` bytes as body. 200/201 = success, 409 = version already published.
+
+---
+
 ## Cleanup
 
 ```bash
 rm -rf /tmp/corecode-test
-# Remove dist/ folders from examples
-rm -rf <REPO>/examples/hello-wasm/dist
-rm -rf <REPO>/examples/simple-lsp/dist
+# Remove generated packages from examples
+rm -f <REPO>/examples/hello-wasm/*.ccext <REPO>/examples/hello-wasm/*.zip <REPO>/examples/hello-wasm/*.vsix
+rm -f <REPO>/examples/simple-lsp/*.ccext
 ```
 
 ## Next

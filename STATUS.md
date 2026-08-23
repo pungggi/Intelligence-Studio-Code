@@ -31,7 +31,7 @@
 | **Phase 2.5** | Grammar registry, manifest hardening, `cargo-corecode` CLI, manual test suite | **Done** (2026-04-02) |
 | **Phase 3** | Unified `lang_*` dispatch (format/range-format, rename, code actions, workspace symbols, folding) | **Done** (2026-05-25) |
 | **Phase 4** | Tier-1 LSP providers: typeDefinition, implementation, selectionRange, documentLinks, semanticTokens (+ frontend wiring, delta refresh) | **Done** (2026-05-26) |
-| **Phase 5** | Cross-editor toolchain (`.ccext` / Zed `.zip` / `.vsix`) | **Partial** — `cargo corecode new/build/check` implemented; `publish` command not yet implemented |
+| **Phase 5** | Cross-editor toolchain (`.ccext` / Zed `.zip` / `.vsix`) | **Done** (2026-08-23) — `new`/`build`/`check`/`publish` |
 
 ---
 
@@ -396,7 +396,7 @@ Full task API wired to the integrated terminal: `TaskScope`, `TaskRevealKind`, `
 
 ---
 
-## WASM Extension Host (parallel track) — PHASES 1–4 COMPLETE, PHASE 5 PARTIAL
+## WASM Extension Host (parallel track) — PHASES 1–5 COMPLETE
 
 Branch: `feature/wasm-extension-host-impl`. In-process `wasmtime` (component model) alongside the Node.js Extension Host — no subprocess. Plans: [docs/plans/impl/00-index.md](docs/plans/impl/00-index.md), architecture: [docs/plans/01-architecture.md](docs/plans/01-architecture.md).
 
@@ -417,9 +417,9 @@ Branch: `feature/wasm-extension-host-impl`. In-process `wasmtime` (component mod
 
 `lsp_type_definition`, `lsp_implementation`, `lsp_selection_ranges`, `lsp_document_links`, `lsp_resolve_document_link`, `lsp_semantic_tokens_full`, `lsp_semantic_tokens_range`, `lsp_semantic_tokens_delta` — frontend wired for type-def/implementation/selection-range navigation, document links, and semantic tokens with delta refresh on edit.
 
-### Toolchain (Phase 5 — partial)
+### Toolchain (Phase 5 — complete)
 
-`tools/cargo-corecode`: `cargo corecode new --template <t>`, `cargo corecode build --target corecode|zed|vscode|all`, `cargo corecode check`. Packagers for `.ccext`, Zed `.zip`, VS Code `.vsix`. **`publish` command not yet implemented.**
+`tools/cargo-corecode`: `cargo corecode new --template <t>`, `cargo corecode build --target corecode|zed|vscode|all`, `cargo corecode check`, and `cargo corecode publish [--token <t>] [--registry <url>] [--dry-run]`. Packagers for `.ccext`, Zed `.zip`, VS Code `.vsix`. `publish` builds a release `.ccext`, validates the manifest (`publisher.name` id + semver version), and uploads via `POST {registry}/api/v1/publish` (Bearer token; 409 = version already published). Registry defaults to `$CORECODE_REGISTRY`, then `https://marketplace.corecode.dev` (the server itself is Phase 6 — not yet live; `--dry-run` validates the package without uploading).
 
 ### Example WASM extensions (`examples/`)
 
@@ -545,5 +545,5 @@ Branch: `feature/wasm-extension-host-impl`. In-process `wasmtime` (component mod
 
 - [ ] **M8 accessibility** — screen reader support (hidden textarea proxy, ARIA live announcer) still in progress
 - [ ] **M8 top-20 extension testing** — 6 extensions still ⚠️/❌ (see `docs/extension-compatibility.md`)
-- [ ] **WASM Phase 5** — `cargo corecode publish` command missing from `tools/cargo-corecode`
-- [ ] **Push local commit** — `42ee255` (editor-helpers extraction + tests) is ahead of `origin/feature/wasm-extension-host-impl`
+- [ ] **WASM Phase 6** — CoreCode marketplace server (the `publish` upload endpoint lives here; CLI side is done)
+- [ ] **Push local commits** — `status` branch is ahead of `origin/feature/wasm-extension-host-impl`

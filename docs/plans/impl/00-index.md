@@ -12,7 +12,7 @@ Start with Phase 1; later phases reference the structures introduced earlier.
 | [phase-2-language-apis.md](phase-2-language-apis.md) | Language Provider APIs | Phase 1 | **Complete** (2026-03-29; + Phase 2.5 grammar registry/CLI 2026-04-02) |
 | [phase-3-grammar.md](phase-3-grammar.md) | Grammar Provider | Phase 1 | **Complete** (2026-04-02) |
 | [phase-4-webview.md](phase-4-webview.md) | Webview Panels | Phase 1 | **Complete** (frontend wiring finished 2026-05-25/26) |
-| [phase-5-toolchain.md](phase-5-toolchain.md) | Cross-Editor Toolchain | Phase 1–4 | **Partial** — `new`/`build`/`check` implemented; `publish` pending |
+| [phase-5-toolchain.md](phase-5-toolchain.md) | Cross-Editor Toolchain | Phase 1–4 | **Complete** (2026-08-23) — `new`/`build`/`check`/`publish` implemented |
 
 > **Note:** Phase 3 of the *implementation commits* (2026-05-25) unified
 > format/rename/code-actions/symbols/folding behind the `lang_*` dispatch commands
