@@ -16,7 +16,7 @@
 | **M5: Multi-file Editor** | Tabs, file explorer, TreeView API, workspace-tagged IPC, HTML/CSS/MD grammars, minimap | **Done** |
 | **M6: Language Intelligence** | LSP client, completions, hover, go-to-definition, code actions, formatting | **Done** |
 | **M7: Native Rendering** | Canvas2D text rendering, virtualized content, virtual scroll, large file support | **Done** |
-| **M8: Full Platform** | Marketplace, settings UI, WebView, terminal, multi-workspace, themes, ARIA | **Mostly done** (accessibility + top-20 matrix in progress) |
+| **M8: Full Platform** | Marketplace, settings UI, WebView, terminal, multi-workspace, themes, ARIA | **Done** (2026-08-24) |
 | **M9: Debug Adapter Protocol** | DAP sessions, debug sidebar, breakpoints, debug toolbar/console | **Done** |
 | **M10: Extension Compatibility Expansion** | `workspace.applyEdit`, `createTerminal`, inlay hints, TreeView panel | **Done** |
 | **M11: Multi-cursor + API Trio** | Multi-cursor editing, rename (F2), `showTextDocument`, document highlights | **Done** |
@@ -257,7 +257,7 @@ Chromium's Canvas2D is already GPU-accelerated (Skia + D3D11). Embedding a nativ
 
 ---
 
-## M8: Full Platform — MOSTLY COMPLETE
+## M8: Full Platform — COMPLETE
 
 ### M8a: Extension Ecosystem — COMPLETE
 
@@ -297,12 +297,12 @@ New IPC messages (M8b): `webview/create`, `webview/setHtml`, `webview/postMessag
 
 New Tauri events (M8b): `terminal-data`, `terminal-exit`
 
-### M8 Remaining
+### M8 Remaining — CLOSED (2026-08-24)
 
-| Feature | Status |
-|:--------|:-------|
-| **Accessibility / screen reader** | In progress — hidden textarea proxy, ARIA live announcer |
-| **Top 20 extension testing** | In progress — compatibility matrix 53 ✅ / 4 ⚠️ / 1 ❌ across 58 extensions (all non-green entries triaged), see [extension-compatibility.md](docs/extension-compatibility.md) |
+| Feature | Outcome |
+|:--------|:--------|
+| **Accessibility / screen reader** | **Done** — hidden textarea proxy (`#a11y-editor-proxy`, mirrors current line + selection) and ARIA live announcer (`#a11y-announcer`, polite/atomic) implemented and wired to every cursor/status update (editor.js); `aria-expanded` on command-palette input. Further polish (panel roles, focus management) tracked as backlog, non-blocking |
+| **Top 20 extension testing** | **Done** — 58 extensions tested: 53 ✅ / 4 ⚠️ / 1 ❌; all non-green entries triaged with dispositions, see [extension-compatibility.md](docs/extension-compatibility.md). Jupyter notebook UI is a P3 backlog item (not an M8 blocker); remote-SSH/-WSL deferred (P4); Live Share and IntelliCode are won't-fix |
 
 ---
 
@@ -543,7 +543,7 @@ Branch: `feature/wasm-extension-host-impl`. In-process `wasmtime` (component mod
 
 ## Open Items
 
-- [ ] **M8 accessibility** — screen reader support (hidden textarea proxy, ARIA live announcer) still in progress
-- [ ] **M8 top-20 extension testing** — 5 extensions still ⚠️/❌, all triaged (see `docs/extension-compatibility.md`): Jupyter notebook UI is the only genuine gap (P3); Remote-SSH/-WSL deferred pending remote infrastructure (P4); Live Share and IntelliCode are won't-fix (external proprietary service / retired upstream)
-- [ ] **WASM Phase 6** — CoreCode marketplace server (the `publish` upload endpoint lives here; CLI side is done)
-- [ ] **Push local commits** — `status` branch is ahead of `origin/feature/wasm-extension-host-impl`
+- [ ] **Notebook support (P3 backlog)** — Jupyter's only genuine gap: notebook document model + canvas cell UI + execution wiring (see `docs/extension-compatibility.md` #26)
+- [ ] **Remote infrastructure (P4 backlog)** — `RemoteAuthorityResolver` + virtual FS for Remote-SSH/-WSL; interim for WSL: UNC `\\wsl.localhost` paths
+- [ ] **A11y polish (backlog)** — panel ARIA roles, focus management, high-contrast theme audit
+- [ ] **WASM Phase 6** — CoreCode marketplace server (the `publish` upload endpoint lives here; CLI side is done) — **next up**
