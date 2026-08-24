@@ -1257,6 +1257,68 @@ async fn install_extension(
 }
 
 #[tauri::command]
+async fn marketplace_get_native(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<marketplace::CcextExtensionEntry, String> {
+    state.marketplace.ccext_get(&id).await
+}
+
+#[tauri::command]
+async fn install_native_extension(
+    id: String,
+    version: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<extension_mgr::InstalledExtension, String> {
+    // id must be publisher.name — reject early (the manager validates again)
+    let (namespace, name) = id
+        .split_once('.')
+        .ok_or_else(|| format!("Native extension id must be 'publisher.name', got '{id}'"))?;
+
+    // Resolve version — latest when unspecified
+    let meta = state.marketplace.ccext_get(&id).await?;
+    let entry = match version.as_deref().filter(|v| !v.is_empty()) {
+        Some(v) => meta
+            .versions
+            .iter()
+            .find(|e| e.version == v)
+            .cloned()
+            .ok_or_else(|| format!("Version {v} of {id} not found in registry"))?,
+        None => meta
+            .versions
+            .first()
+            .cloned()
+            .ok_or_else(|| format!("No versions published for {id}"))?,
+    };
+
+    // Download and verify integrity before touching the extensions dir
+    let (bytes, expected_sha) = state.marketplace.ccext_download(&id, &entry.version).await?;
+    if !expected_sha.is_empty() {
+        use sha2::Digest;
+        let actual = hex::encode(sha2::Sha256::digest(&bytes));
+        if actual != expected_sha {
+            return Err(format!(
+                "Integrity check failed for {id} {v}: registry sha256 {expected_sha}, downloaded {actual}",
+                v = entry.version
+            ));
+        }
+    }
+
+    let installed = {
+        let mgr = state.extension_mgr.lock().map_err(|e| e.to_string())?;
+        // .ccext archives carry corecode.toml at the root — install_from_vsix
+        // extracts root-level archives and validates corecode.toml
+        mgr.install_from_vsix(namespace, name, &entry.version, None, None, &bytes)?
+    };
+
+    state.ipc.send(OutgoingMessage::ExtensionInstalled {
+        path: installed.path.clone(),
+    });
+
+    Ok(installed)
+}
+
+#[tauri::command]
 fn uninstall_extension(
     extension_id: String,
     state: tauri::State<AppState>,
@@ -2220,6 +2282,8 @@ pub fn run() {
             marketplace_list_installed,
             install_extension,
             uninstall_extension,
+            marketplace_get_native,
+            install_native_extension,
             check_extension_updates,
             get_extensions_dir,
             // M8: Settings commands

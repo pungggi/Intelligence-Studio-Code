@@ -4960,6 +4960,17 @@ function renderExtensionList(extensions, mode) {
       version.className = 'ext-downloads';
       version.textContent = 'v' + (ext.version || '?');
       actions.appendChild(version);
+
+      // Host-type badge: distinguishes native WASM extensions from Node.js ones
+      if (ext.kind) {
+        const kindBadge = document.createElement('span');
+        kindBadge.className = ext.kind === 'Native' ? 'ext-kind-native' : 'ext-kind-node';
+        kindBadge.textContent = ext.kind;
+        kindBadge.title = ext.kind === 'Native'
+          ? 'WASM extension — runs in the in-process CoreCode host'
+          : 'Node.js extension — runs in the extension host process';
+        actions.appendChild(kindBadge);
+      }
     }
 
     card.appendChild(actions);

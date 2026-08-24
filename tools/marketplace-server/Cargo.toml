@@ -1,0 +1,22 @@
+[package]
+name    = "marketplace-server"
+version = "0.1.0"
+edition = "2021"
+description = "CoreCode marketplace registry — serves .ccext packages published via `cargo corecode publish`"
+
+[[bin]]
+name = "marketplace-server"
+path = "src/main.rs"
+
+[dependencies]
+axum       = "0.7"
+tokio      = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2       = "0.10"
+hex        = "0.4"
+chrono     = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+tower      = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"

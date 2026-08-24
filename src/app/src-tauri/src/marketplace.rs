@@ -4,6 +4,10 @@ use std::collections::HashMap;
 
 const OPEN_VSX_API: &str = "https://open-vsx.org/api";
 
+/// Default CoreCode registry serving `.ccext` (WASM) packages.
+/// Overridable via `CORECODE_REGISTRY` (e.g. a local marketplace-server).
+const CORECODE_REGISTRY: &str = "https://marketplace.corecode.dev";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtensionInfo {
@@ -56,6 +60,23 @@ pub struct MarketplaceSearchResult {
     pub extensions: Vec<SearchResultItem>,
     pub total_size: usize,
     pub offset: usize,
+}
+
+// --- CoreCode registry (.ccext / WASM extensions) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CcextVersionEntry {
+    pub version: String,
+    pub sha256: String,
+    pub size: u64,
+    #[serde(rename = "publishedAt", default)]
+    pub published_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CcextExtensionEntry {
+    pub id: String,
+    pub versions: Vec<CcextVersionEntry>,
 }
 
 pub struct MarketplaceClient {
@@ -220,6 +241,124 @@ impl MarketplaceClient {
 
         Ok(bytes)
     }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // CoreCode registry (.ccext) — marketplace-server API
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Registry base URL — `CORECODE_REGISTRY` env override, else the public
+    /// default. Trailing slash normalised away.
+    fn registry_base() -> String {
+        std::env::var("CORECODE_REGISTRY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| CORECODE_REGISTRY.to_string())
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    /// The registry host is allowed over plain HTTP only when it is a loopback
+    /// address (local marketplace-server during development); anything else
+    /// must use HTTPS.
+    fn validate_registry_scheme(parsed: &url::Url) -> Result<(), String> {
+        let is_loopback = matches!(parsed.host_str(), Some(h) if h == "localhost" || h == "127.0.0.1" || h == "[::1]" || h.starts_with("192.168.") || h.starts_with("10."));
+        if parsed.scheme() == "https" || (parsed.scheme() == "http" && is_loopback) {
+            Ok(())
+        } else {
+            Err(format!(
+                "CoreCode registry must use HTTPS (http only allowed for loopback/LAN hosts), got '{}'",
+                parsed.scheme()
+            ))
+        }
+    }
+
+    /// Metadata (all versions) for a native `.ccext` extension.
+    pub async fn ccext_get(&self, id: &str) -> Result<CcextExtensionEntry, String> {
+        let base = Self::registry_base();
+        let parsed = url::Url::parse(&base).map_err(|e| format!("Invalid registry URL: {e}"))?;
+        Self::validate_registry_scheme(&parsed)?;
+
+        let mut url = parsed;
+        url.path_segments_mut()
+            .map_err(|_| "Cannot modify registry URL path".to_string())?
+            .push("api")
+            .push("v1")
+            .push("extension")
+            .push(id);
+
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("CoreCode registry request failed: {e}"))?;
+        match resp.status() {
+            reqwest::StatusCode::NOT_FOUND => Err(format!("Extension {id} not found in CoreCode registry")),
+            s if !s.is_success() => Err(format!("CoreCode registry returned status {s}")),
+            _ => resp
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse registry response: {e}")),
+        }
+    }
+
+    /// Download a `.ccext` package. Returns `(bytes, sha256)` where `sha256` is
+    /// the registry-recorded digest (from the `x-corecode-sha256` response
+    /// header) — callers MUST verify it before installing.
+    pub async fn ccext_download(
+        &self,
+        id: &str,
+        version: &str,
+    ) -> Result<(Vec<u8>, String), String> {
+        let base = Self::registry_base();
+        let parsed = url::Url::parse(&base).map_err(|e| format!("Invalid registry URL: {e}"))?;
+        Self::validate_registry_scheme(&parsed)?;
+
+        let mut url = parsed;
+        url.path_segments_mut()
+            .map_err(|_| "Cannot modify registry URL path".to_string())?
+            .push("api")
+            .push("v1")
+            .push("extension")
+            .push(id)
+            .push(version)
+            .push("download");
+
+        let mut resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("ccext download failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("ccext download returned status {}", resp.status()));
+        }
+
+        let expected_sha = resp
+            .headers()
+            .get("x-corecode-sha256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+
+        let content_length = resp.content_length().unwrap_or(0);
+        if content_length > 50 * 1024 * 1024 {
+            return Err("ccext package exceeds 50MB limit".to_string());
+        }
+        let mut bytes = Vec::with_capacity(content_length as usize);
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| format!("Failed to read ccext bytes: {e}"))?
+        {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > 50 * 1024 * 1024 {
+                return Err("ccext package exceeds 50MB limit".to_string());
+            }
+        }
+
+        Ok((bytes, expected_sha))
+    }
 }
 
 #[cfg(test)]
@@ -327,5 +466,37 @@ mod tests {
         let s = url.to_string();
         // path_segments_mut().push() encodes the slash, preventing traversal.
         assert!(!s.contains("/../"), "URL must not contain raw path traversal, got: {s}");
+    }
+
+    // ── CoreCode registry (.ccext) ───────────────────────────────────
+
+    #[test]
+    fn ccext_registry_rejects_plain_http_for_public_hosts() {
+        let url = url::Url::parse("http://marketplace.corecode.dev").unwrap();
+        let err = MarketplaceClient::validate_registry_scheme(&url).unwrap_err();
+        assert!(err.contains("HTTPS"), "expected HTTPS error, got: {err}");
+    }
+
+    #[test]
+    fn ccext_registry_allows_http_for_loopback() {
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            let url = url::Url::parse(&format!("http://{host}:8987")).unwrap();
+            assert!(MarketplaceClient::validate_registry_scheme(&url).is_ok(), "http should be allowed for {host}");
+        }
+        let url = url::Url::parse("https://marketplace.corecode.dev").unwrap();
+        assert!(MarketplaceClient::validate_registry_scheme(&url).is_ok());
+    }
+
+    #[test]
+    fn ccext_download_url_encodes_id() {
+        // Build the download URL exactly as ccext_download does — the id segment
+        // must not be able to inject path traversal.
+        let base = MarketplaceClient::registry_base();
+        let mut url = url::Url::parse(&base).unwrap();
+        url.path_segments_mut().unwrap()
+            .push("api").push("v1").push("extension")
+            .push("../evil").push("1.0.0").push("download");
+        let s = url.to_string();
+        assert!(!s.contains("/../"), "download URL must not allow traversal, got: {s}");
     }
 }

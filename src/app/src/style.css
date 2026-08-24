@@ -547,6 +547,26 @@ body {
   margin-left: auto;
 }
 
+/* Host-type badge (Phase 6): Native (WASM) vs Node.js */
+.ext-kind-native,
+.ext-kind-node {
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 8px;
+  letter-spacing: 0.02em;
+}
+
+.ext-kind-native {
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+.ext-kind-node {
+  color: var(--fg-dim);
+  border: 1px solid var(--fg-dim);
+}
+
 /* ─── M8: Settings Panel ──────────────────────────────────── */
 
 #settings-panel {

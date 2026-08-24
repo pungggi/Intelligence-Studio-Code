@@ -6,6 +6,16 @@ use std::path::{Path, PathBuf};
 /// Maximum size of a single file extracted from a VSIX archive (50 MB).
 const MAX_VSIX_FILE_SIZE: u64 = 50 * 1024 * 1024;
 
+/// Badge label shown in the UI for each host type.
+impl ExtensionKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ExtensionKind::NodeJs => "Node.js",
+            ExtensionKind::Wasm => "Native",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledExtension {
     pub id: String,
@@ -17,6 +27,14 @@ pub struct InstalledExtension {
     pub path: String,
     pub enabled: bool,
     pub installed_at: String,
+    /// Host type badge — "Native" (WASM) or "Node.js". Older registry
+    /// entries default to Node.js; recomputed from disk on every list.
+    #[serde(default = "default_kind")]
+    pub kind: String,
+}
+
+fn default_kind() -> String {
+    "Node.js".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,7 +159,15 @@ impl ExtensionManager {
     }
 
     pub fn list_installed(&self) -> Vec<InstalledExtension> {
-        self.load_registry().extensions
+        // Recompute the host-type badge from disk so it reflects the actual
+        // directory contents (also upgrades pre-badge registry entries).
+        let mut extensions = self.load_registry().extensions;
+        for ext in &mut extensions {
+            if let Some(kind) = detect_kind(std::path::Path::new(&ext.path)) {
+                ext.kind = kind.label().to_string();
+            }
+        }
+        extensions
     }
 
     pub fn install_from_vsix(
@@ -235,6 +261,11 @@ impl ExtensionManager {
             );
         }
 
+        // Determine host type from what actually landed on disk
+        let kind = detect_kind(&install_dir)
+            .map(|k| k.label().to_string())
+            .unwrap_or_else(default_kind);
+
         let now = chrono_now_iso();
         let installed = InstalledExtension {
             id: extension_id.clone(),
@@ -246,6 +277,7 @@ impl ExtensionManager {
             path: install_dir.to_string_lossy().to_string(),
             enabled: true,
             installed_at: now,
+            kind,
         };
 
         // Update registry

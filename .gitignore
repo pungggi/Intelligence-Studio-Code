@@ -34,3 +34,6 @@ Thumbs.db
 *.ccext
 *.vsix
 *-zed.zip
+
+# marketplace-server local data (default MARKETPLACE_DATA)
+marketplace-data/

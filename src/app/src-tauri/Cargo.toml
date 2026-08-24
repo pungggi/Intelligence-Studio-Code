@@ -54,6 +54,7 @@ dirs = "5"
 # Cryptographic random for IPC auth token
 getrandom = "0.2"
 hex = "0.4"
+sha2 = "0.10"
 
 # Proper URI encoding for file:// paths
 url = "2"

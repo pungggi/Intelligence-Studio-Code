@@ -13,6 +13,7 @@ Start with Phase 1; later phases reference the structures introduced earlier.
 | [phase-3-grammar.md](phase-3-grammar.md) | Grammar Provider | Phase 1 | **Complete** (2026-04-02) |
 | [phase-4-webview.md](phase-4-webview.md) | Webview Panels | Phase 1 | **Complete** (frontend wiring finished 2026-05-25/26) |
 | [phase-5-toolchain.md](phase-5-toolchain.md) | Cross-Editor Toolchain | Phase 1–4 | **Complete** (2026-08-23) — `new`/`build`/`check`/`publish` implemented |
+| [phase-6-marketplace.md](phase-6-marketplace.md) | Marketplace & Discovery | Phase 5 | **Mostly complete** (2026-08-24) — registry server, `.ccext` install, Native badge done; ed25519 signature verification pending |
 
 > **Note:** Phase 3 of the *implementation commits* (2026-05-25) unified
 > format/rename/code-actions/symbols/folding behind the `lang_*` dispatch commands
