@@ -302,7 +302,7 @@ New Tauri events (M8b): `terminal-data`, `terminal-exit`
 | Feature | Status |
 |:--------|:-------|
 | **Accessibility / screen reader** | In progress — hidden textarea proxy, ARIA live announcer |
-| **Top 20 extension testing** | In progress — compatibility matrix 52 ✅ / 5 ⚠️ / 1 ❌ across 58 extensions, see [extension-compatibility.md](docs/extension-compatibility.md) |
+| **Top 20 extension testing** | In progress — compatibility matrix 53 ✅ / 4 ⚠️ / 1 ❌ across 58 extensions (all non-green entries triaged), see [extension-compatibility.md](docs/extension-compatibility.md) |
 
 ---
 
@@ -539,11 +539,11 @@ Branch: `feature/wasm-extension-host-impl`. In-process `wasmtime` (component mod
 | Frontend (`node --test`) | `src/app/src/lib/editor-helpers.test.js` | Pure helper functions extracted from editor.js |
 | Rust | Inline `#[test]` modules (editor, ipc_bridge, wasm_host, …) | No separate `tests/` dir |
 | Manual (`docs/testing/manual/`) | 00 prerequisites → 07 security: compile extensions, cargo-corecode CLI, runtime lifecycle, language/grammar providers, webview panels, security | 8 documents |
-| Compatibility | Top-20 extension matrix | 58 extensions: 52 ✅ / 5 ⚠️ / 1 ❌ |
+| Compatibility | Top-20 extension matrix | 58 extensions: 53 ✅ / 4 ⚠️ / 1 ❌ |
 
 ## Open Items
 
 - [ ] **M8 accessibility** — screen reader support (hidden textarea proxy, ARIA live announcer) still in progress
-- [ ] **M8 top-20 extension testing** — 6 extensions still ⚠️/❌ (see `docs/extension-compatibility.md`)
+- [ ] **M8 top-20 extension testing** — 5 extensions still ⚠️/❌, all triaged (see `docs/extension-compatibility.md`): Jupyter notebook UI is the only genuine gap (P3); Remote-SSH/-WSL deferred pending remote infrastructure (P4); Live Share and IntelliCode are won't-fix (external proprietary service / retired upstream)
 - [ ] **WASM Phase 6** — CoreCode marketplace server (the `publish` upload endpoint lives here; CLI side is done)
 - [ ] **Push local commits** — `status` branch is ahead of `origin/feature/wasm-extension-host-impl`
