@@ -90,6 +90,10 @@ pub struct CcextExtensionEntry {
 
 pub struct MarketplaceClient {
     client: Client,
+    /// Registry (`.ccext`) traffic never follows redirects: a 3xx would hand
+    /// the request — and its digest/signature headers — to an arbitrary host,
+    /// and our registry is expected to serve the final URL directly.
+    registry_client: Client,
 }
 
 impl MarketplaceClient {
@@ -99,7 +103,13 @@ impl MarketplaceClient {
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
-        Ok(Self { client })
+        let registry_client = Client::builder()
+            .user_agent("CoreCode/0.1")
+            .timeout(std::time::Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("Failed to create registry HTTP client: {e}"))?;
+        Ok(Self { client, registry_client })
     }
 
     pub async fn search(
@@ -296,11 +306,22 @@ impl MarketplaceClient {
             .push(id);
 
         let resp = self
-            .client
+            .registry_client
             .get(url)
             .send()
             .await
             .map_err(|e| format!("CoreCode registry request failed: {e}"))?;
+        if resp.status().is_redirection() {
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("(no location)");
+            return Err(format!(
+                "CoreCode registry redirected to {location} — redirects are disabled for registry traffic; \
+                 set CORECODE_REGISTRY to the final URL"
+            ));
+        }
         match resp.status() {
             reqwest::StatusCode::NOT_FOUND => Err(format!("Extension {id} not found in CoreCode registry")),
             s if !s.is_success() => Err(format!("CoreCode registry returned status {s}")),
@@ -311,14 +332,18 @@ impl MarketplaceClient {
         }
     }
 
-    /// Download a `.ccext` package. Returns `(bytes, sha256)` where `sha256` is
-    /// the registry-recorded digest (from the `x-corecode-sha256` response
-    /// header) — callers MUST verify it before installing.
+    /// Download a `.ccext` package. Returns the raw bytes — callers MUST
+    /// verify them against the `sha256` recorded in the version entry from
+    /// `ccext_get()` (registry metadata) before installing. Integrity is
+    /// deliberately NOT taken from response headers: a header travels with
+    /// the response, so a compromised or redirected endpoint could supply
+    /// attacker bytes together with an attacker digest. Metadata comes from
+    /// the registry index, which signatures and key pinning protect.
     pub async fn ccext_download(
         &self,
         id: &str,
         version: &str,
-    ) -> Result<(Vec<u8>, String), String> {
+    ) -> Result<Vec<u8>, String> {
         let base = Self::registry_base();
         let parsed = url::Url::parse(&base).map_err(|e| format!("Invalid registry URL: {e}"))?;
         Self::validate_registry_scheme(&parsed)?;
@@ -334,24 +359,37 @@ impl MarketplaceClient {
             .push("download");
 
         let mut resp = self
-            .client
-            .get(url)
+            .registry_client
+            .get(url.clone())
             .send()
             .await
             .map_err(|e| format!("ccext download failed: {e}"))?;
+        if resp.status().is_redirection() {
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("(no location)");
+            return Err(format!(
+                "ccext download redirected to {location} — redirects are disabled for registry traffic; \
+                 set CORECODE_REGISTRY to the final URL"
+            ));
+        }
         if !resp.status().is_success() {
             return Err(format!("ccext download returned status {}", resp.status()));
         }
+        // Belt and braces: the response must come from the exact URL requested
+        // (no silent redirect hops even under the no-redirect policy).
+        if resp.url() != &url {
+            return Err(format!(
+                "ccext download was served from '{}' instead of the requested URL — refusing",
+                resp.url()
+            ));
+        }
 
-        let expected_sha = resp
-            .headers()
-            .get("x-corecode-sha256")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-
+        const MAX_CCEXT_BYTES: usize = 50 * 1024 * 1024;
         let content_length = resp.content_length().unwrap_or(0);
-        if content_length > 50 * 1024 * 1024 {
+        if content_length as usize > MAX_CCEXT_BYTES {
             return Err("ccext package exceeds 50MB limit".to_string());
         }
         let mut bytes = Vec::with_capacity(content_length as usize);
@@ -361,12 +399,12 @@ impl MarketplaceClient {
             .map_err(|e| format!("Failed to read ccext bytes: {e}"))?
         {
             bytes.extend_from_slice(&chunk);
-            if bytes.len() > 50 * 1024 * 1024 {
+            if bytes.len() > MAX_CCEXT_BYTES {
                 return Err("ccext package exceeds 50MB limit".to_string());
             }
         }
 
-        Ok((bytes, expected_sha))
+        Ok(bytes)
     }
 
     /// Verify a downloaded package against the version entry's ed25519

@@ -5,6 +5,13 @@ use std::path::{Path, PathBuf};
 
 /// Maximum size of a single file extracted from a VSIX archive (50 MB).
 const MAX_VSIX_FILE_SIZE: u64 = 50 * 1024 * 1024;
+/// Aggregate extraction budget across all entries — zip-bomb defence. A
+/// 50MB compressed package legitimately expands several-fold (highly
+/// compressible assets), but the total must stay bounded even when every
+/// entry is individually within `MAX_VSIX_FILE_SIZE`.
+const MAX_TOTAL_EXTRACTED_BYTES: u64 = 500 * 1024 * 1024;
+/// Entry-count cap — defends against archives of many tiny entries (inodes).
+const MAX_ARCHIVE_ENTRIES: usize = 20_000;
 
 /// Badge label shown in the UI for each host type.
 impl ExtensionKind {
@@ -199,9 +206,16 @@ impl ExtensionManager {
         let cursor = std::io::Cursor::new(vsix_bytes);
         let mut archive =
             zip::ZipArchive::new(cursor).map_err(|e| format!("Invalid VSIX archive: {e}"))?;
+        if archive.len() > MAX_ARCHIVE_ENTRIES {
+            return Err(format!(
+                "VSIX archive has {} entries (limit {MAX_ARCHIVE_ENTRIES}) — refusing",
+                archive.len()
+            ));
+        }
 
         // VSIX contains extension/ subdirectory with the actual extension files
         let mut found_extension_dir = false;
+        let mut total_extracted: u64 = 0;
         for i in 0..archive.len() {
             let mut file = archive
                 .by_index(i)
@@ -222,7 +236,10 @@ impl ExtensionManager {
                 continue;
             }
 
-            extract_zip_entry(&mut file, &raw_name, &relative_path, &install_dir)?;
+            if let Err(e) = extract_zip_entry(&mut file, &raw_name, &relative_path, &install_dir, &mut total_extracted) {
+                std::fs::remove_dir_all(&install_dir).ok();
+                return Err(e);
+            }
         }
 
         if !found_extension_dir {
@@ -231,6 +248,12 @@ impl ExtensionManager {
             let cursor = std::io::Cursor::new(vsix_bytes);
             let mut archive = zip::ZipArchive::new(cursor)
                 .map_err(|e| format!("Invalid VSIX archive: {e}"))?;
+            if archive.len() > MAX_ARCHIVE_ENTRIES {
+                return Err(format!(
+                    "VSIX archive has {} entries (limit {MAX_ARCHIVE_ENTRIES}) — refusing",
+                    archive.len()
+                ));
+            }
 
             for i in 0..archive.len() {
                 let mut file = archive
@@ -245,7 +268,10 @@ impl ExtensionManager {
                     continue;
                 }
 
-                extract_zip_entry(&mut file, &raw_name, &raw_name, &install_dir)?;
+                if let Err(e) = extract_zip_entry(&mut file, &raw_name, &raw_name, &install_dir, &mut total_extracted) {
+                    std::fs::remove_dir_all(&install_dir).ok();
+                    return Err(e);
+                }
             }
         }
 
@@ -331,6 +357,7 @@ fn extract_zip_entry(
     raw_name: &str,
     relative_path: &str,
     install_dir: &Path,
+    total_extracted: &mut u64,
 ) -> Result<(), String> {
     let target = install_dir.join(relative_path);
 
@@ -394,6 +421,15 @@ fn extract_zip_entry(
         }
         std::fs::write(&target, &contents)
             .map_err(|e| format!("Failed to write {relative_path}: {e}"))?;
+        // Aggregate zip-bomb defence: every individually-permitted entry
+        // still counts against the total budget for the whole archive.
+        *total_extracted += contents.len() as u64;
+        if *total_extracted > MAX_TOTAL_EXTRACTED_BYTES {
+            return Err(format!(
+                "VSIX archive exceeds {}MB total extracted (zip bomb?) — install aborted",
+                MAX_TOTAL_EXTRACTED_BYTES / (1024 * 1024)
+            ));
+        }
     }
 
     Ok(())

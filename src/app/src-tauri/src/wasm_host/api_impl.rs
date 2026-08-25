@@ -165,14 +165,38 @@ pub fn host_find_files(ctx: &mut HostContext, pattern: String) -> Result<Vec<Str
     let root = ctx.workspace_root.as_ref()
         .ok_or_else(|| "no workspace open".to_string())?;
 
-    // Anchor the glob pattern inside the workspace root.
+    // The pattern must stay anchored inside the workspace root.
+    // 1. Absolute patterns are rejected — `PathBuf::join` would otherwise
+    //    discard the root entirely.
+    let rel = std::path::Path::new(&pattern);
+    if rel.is_absolute() {
+        return Err(format!("find_files: pattern must be relative, got '{pattern}'"));
+    }
+    // 2. Lexical `..` guard — glob metacharacters (* ? []) pass through as
+    //    normal components, so this only rejects literal parent traversal.
+    for component in rel.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(format!("find_files: pattern '{pattern}' traverses outside the workspace"));
+        }
+    }
+
     let full_pattern = root.join(&pattern);
     let full_str = full_pattern.to_string_lossy();
+
+    // Canonical root for post-match containment: a symlink inside the
+    // workspace can point outside it, so verify every match resolves within.
+    let root_canonical = std::fs::canonicalize(root)
+        .map_err(|e| format!("find_files: cannot resolve workspace root: {e}"))?;
 
     let paths = glob::glob(&full_str)
         .map_err(|e| format!("find_files: invalid pattern '{pattern}': {e}"))?
         .filter_map(|entry| entry.ok())
         .filter(|p| p.is_file())
+        .filter(|p| {
+            std::fs::canonicalize(p)
+                .map(|c| c.starts_with(&root_canonical))
+                .unwrap_or(false) // unresolvable paths are dropped
+        })
         .take(1_000)
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
@@ -451,6 +475,44 @@ mod tests {
     }
 
     // ── find_files result cap ─────────────────────────────────────────────────
+
+    #[test]
+    fn find_files_rejects_absolute_pattern() {
+        let dir = TempDir::new().unwrap();
+        let mut ctx = ctx_with_workspace(dir.path(), true);
+        let abs = if cfg!(windows) { "C:\\Windows\\*" } else { "/etc/*" };
+        let err = host_find_files(&mut ctx, abs.to_string()).unwrap_err();
+        assert!(err.contains("relative"), "got: {err}");
+    }
+
+    #[test]
+    fn find_files_rejects_dotdot_pattern() {
+        let dir = TempDir::new().unwrap();
+        let mut ctx = ctx_with_workspace(dir.path(), true);
+        let err = host_find_files(&mut ctx, "../**/*".to_string()).unwrap_err();
+        assert!(err.contains("outside"), "got: {err}");
+        let err = host_find_files(&mut ctx, "sub/../../**/*".to_string()).unwrap_err();
+        assert!(err.contains("outside"), "got: {err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn find_files_drops_symlinks_pointing_outside_workspace() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("inside.txt"), b"").unwrap();
+        // Outside target + symlink inside the workspace pointing to it
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), b"").unwrap();
+        symlink(outside.path().join("secret.txt"), dir.path().join("leak.txt")).unwrap();
+        let mut ctx = ctx_with_workspace(dir.path(), true);
+        let results = host_find_files(&mut ctx, "*.txt".to_string()).unwrap();
+        assert!(
+            !results.iter().any(|r| r.contains("leak") || r.contains("secret")),
+            "symlink outside workspace must not be enumerated: {results:?}"
+        );
+        assert!(results.iter().any(|r| r.contains("inside.txt")));
+    }
 
     #[test]
     fn find_files_caps_results_at_1000() {

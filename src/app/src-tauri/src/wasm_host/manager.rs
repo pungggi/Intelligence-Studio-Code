@@ -51,6 +51,24 @@ pub struct WasmHostManager {
 //   and `wasmtime::component::Func` is `Send` (holds only store-internal indices).
 // No `unsafe impl` is required — the compiler derives these automatically.
 
+/// True iff `panel_id` is currently owned by `ext_id`. Panel IDs are a
+/// global namespace shared across extensions, so every non-open operation
+/// must verify ownership — otherwise one extension could post to, rewrite,
+/// or close another extension's panel by reusing its ID.
+fn panel_owned_by(owners: &std::collections::HashMap<String, String>, panel_id: &str, ext_id: &str) -> bool {
+    match owners.get(panel_id) {
+        Some(o) if o == ext_id => true,
+        Some(o) => {
+            log::warn!("[wasm-ext:{ext_id}] panel '{panel_id}' is owned by {o} — operation dropped");
+            false
+        }
+        None => {
+            log::warn!("[wasm-ext:{ext_id}] panel '{panel_id}' is not open — operation dropped");
+            false
+        }
+    }
+}
+
 impl WasmHostManager {
     /// Create the shared WASM engine with component model support.
     pub fn new() -> Result<Self, String> {
@@ -422,6 +440,18 @@ impl WasmHostManager {
         for op in ops {
             match op {
                 PendingWebviewOp::Open { panel_id, title, column } => {
+                    // Panel IDs are a shared namespace: opening an ID owned by
+                    // another extension would silently steal it (and all its
+                    // webview messages) — refuse instead.
+                    if let Some(existing) = owners.get(&panel_id) {
+                        if existing != ext_id {
+                            log::warn!(
+                                "[wasm-ext:{ext_id}] refusing to open panel '{panel_id}' — already owned by {existing}"
+                            );
+                            continue;
+                        }
+                    }
+
                     // Get initial HTML from the extension's webview-provider export.
                     // If the call traps (fuel/epoch), skip the panel entirely —
                     // emitting a "create" with no content would show a blank panel.
@@ -470,6 +500,9 @@ impl WasmHostManager {
                     }
                 }
                 PendingWebviewOp::SetHtml { panel_id, html } => {
+                    if !panel_owned_by(&owners, &panel_id, ext_id) {
+                        continue;
+                    }
                     events.push(WebviewPanelEvent {
                         kind: "setHtml".to_string(),
                         panel_id,
@@ -482,6 +515,9 @@ impl WasmHostManager {
                     });
                 }
                 PendingWebviewOp::PostMessage { panel_id, message } => {
+                    if !panel_owned_by(&owners, &panel_id, ext_id) {
+                        continue;
+                    }
                     events.push(WebviewPanelEvent {
                         kind: "postMessage".to_string(),
                         panel_id,
@@ -494,6 +530,9 @@ impl WasmHostManager {
                     });
                 }
                 PendingWebviewOp::Close { panel_id } => {
+                    if !panel_owned_by(&owners, &panel_id, ext_id) {
+                        continue;
+                    }
                     owners.remove(&panel_id);
                     events.push(WebviewPanelEvent {
                         kind: "close".to_string(),
@@ -1078,6 +1117,18 @@ mod tests {
         let mgr = make_manager();
         let result = mgr.route_webview_close("nonexistent");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn panel_ownership_enforced_for_foreign_extension() {
+        // panel_owned_by is the guard every non-open webview op passes through:
+        // only the owning extension may set HTML, post, or close a panel.
+        let mut owners = std::collections::HashMap::new();
+        owners.insert("panel-1".to_string(), "a.ext".to_string());
+
+        assert!(panel_owned_by(&owners, "panel-1", "a.ext"), "owner must pass");
+        assert!(!panel_owned_by(&owners, "panel-1", "b.ext"), "foreign extension must be rejected");
+        assert!(!panel_owned_by(&owners, "unknown-panel", "a.ext"), "unowned panel must be rejected");
     }
 
     #[test]

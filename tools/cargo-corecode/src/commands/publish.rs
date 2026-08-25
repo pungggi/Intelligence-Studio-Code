@@ -196,9 +196,15 @@ fn is_valid_segment(part: &str) -> bool {
 
 fn is_valid_version(v: &str) -> bool {
     // Mirrors the registry's rules exactly (server `valid_version`):
-    // x.y.z numeric core without leading zeros + optional pre-release suffix.
+    // x.y.z numeric core without leading zeros + optional pre-release suffix
+    // whose numeric identifiers also carry no leading zeros (semver §9).
     let valid_core_part = |p: &str| {
         !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) && (p.len() == 1 || !p.starts_with('0'))
+    };
+    let valid_pre_part = |p: &str| {
+        let chars_ok = !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        let numeric = !p.is_empty() && p.chars().all(|c| c.is_ascii_digit());
+        chars_ok && (!numeric || p.len() == 1 || !p.starts_with('0'))
     };
     let Some((core, pre)) = v.split_once('-') else {
         return v.split('.').count() == 3 && v.split('.').all(valid_core_part);
@@ -206,7 +212,7 @@ fn is_valid_version(v: &str) -> bool {
     if core.split('.').count() != 3 || !core.split('.').all(valid_core_part) {
         return false;
     }
-    !pre.is_empty() && pre.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    !pre.is_empty() && pre.split('.').all(valid_pre_part)
 }
 
 #[cfg(test)]
@@ -255,12 +261,16 @@ mod tests {
         assert!(validate(&manifest_with("pub.name", "latest")).is_err());
         assert!(validate(&manifest_with("pub.name", "1.2.x")).is_err());
         assert!(validate(&manifest_with("pub.name", "1.2.3-")).is_err());
-        // v-prefix, leading zeros, and 4-part cores all diverge from the
-        // registry's rules — reject locally instead of failing at upload.
+        // v-prefix, leading zeros (core and pre-release), and 4-part cores all
+        // diverge from the registry's rules — reject locally instead of
+        // failing at upload.
         assert!(validate(&manifest_with("pub.name", "v1.2.3")).is_err());
         assert!(validate(&manifest_with("pub.name", "01.2.3")).is_err());
         assert!(validate(&manifest_with("pub.name", "1.2.3.4")).is_err());
+        assert!(validate(&manifest_with("pub.name", "1.2.3-01")).is_err());
+        assert!(validate(&manifest_with("pub.name", "1.2.3-beta.02")).is_err());
         // single-zero pre-release identifier is valid semver
         assert!(validate(&manifest_with("pub.name", "1.2.3-0")).is_ok());
+        assert!(validate(&manifest_with("pub.name", "1.2.3-0.1")).is_ok());
     }
 }

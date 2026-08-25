@@ -56,9 +56,12 @@ ordering, reopen persistence; API auth/roundtrip/malformed paths/search).
 - `marketplace_get_native(id)` — version listing for the install UI
 - `install_native_extension(id, version?)` — resolves latest when version is
   omitted, downloads, **verifies SHA-256 against the registry-recorded
-  digest**, then unpacks via `install_from_vsix` (`.ccext` archives carry
+  digest** (from `ccext_get` metadata — never from response headers, which a
+  hostile endpoint could forge; registry traffic also refuses redirects),
+  then unpacks via `install_from_vsix` (`.ccext` archives carry
   `corecode.toml` at the root; the manager validates it and routes the
-  extension to the WASM host via `detect_kind`)
+  extension to the WASM host via `detect_kind`) with aggregate extraction
+  limits (500MB total, 20k entries) against zip bombs
 
 ### 4. Native badge — `extension_mgr.rs` + `editor.js` + `style.css`
 

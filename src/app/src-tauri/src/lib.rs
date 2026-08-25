@@ -1292,12 +1292,15 @@ async fn install_native_extension(
     };
 
     // Download and verify integrity before touching the extensions dir.
-    // A missing digest header is an error, not a skip: our registry always
-    // sets it, so absence means a misconfigured proxy or a non-registry URL.
-    let (bytes, expected_sha) = state.marketplace.ccext_download(&id, &entry.version).await?;
-    if expected_sha.trim().is_empty() {
+    // The expected digest comes from the registry metadata (ccext_get), not
+    // from response headers — a hostile endpoint could otherwise serve its
+    // own bytes with its own digest.
+    let bytes = state.marketplace.ccext_download(&id, &entry.version).await?;
+    let expected_sha = entry.sha256.trim();
+    if expected_sha.is_empty() {
         return Err(format!(
-            "registry did not provide an integrity digest (x-corecode-sha256) for {id} — refusing to install"
+            "registry metadata for {id} {v} has no sha256 digest — refusing to install",
+            v = entry.version
         ));
     }
     {

@@ -109,6 +109,15 @@ impl Store {
         !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) && (p.len() == 1 || !p.starts_with('0'))
     }
 
+    /// Pre-release identifier (dot-separated): alphanumeric identifiers may
+    /// contain hyphens; numeric identifiers must not have leading zeros
+    /// (semver §9 — `1.0.0-01` is invalid, `1.0.0-0` and `1.0.0-a-1` are fine).
+    fn valid_pre_part(p: &str) -> bool {
+        let chars_ok = !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        let numeric = !p.is_empty() && p.chars().all(|c| c.is_ascii_digit());
+        chars_ok && (!numeric || p.len() == 1 || !p.starts_with('0'))
+    }
+
     /// Semantic version `x.y.z` with optional pre-release suffix.
     /// (Build metadata `+meta` is intentionally not accepted — versions are
     /// used as package filenames and offer no precedence.)
@@ -119,7 +128,7 @@ impl Store {
         if core.split('.').count() != 3 || !core.split('.').all(Self::valid_core_part) {
             return false;
         }
-        !pre.is_empty() && pre.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        !pre.is_empty() && pre.split('.').all(Self::valid_pre_part)
     }
 
     /// Store a package. `sig` is `(pubkey_b64, signature_b64)` for signed
@@ -446,6 +455,15 @@ mod tests {
             let expect_err = v != "1.0.0-0";
             let result = store.publish("pub.a", v, b"x", None);
             assert_eq!(result.is_err(), expect_err, "version {v}: err={result:?}");
+        }
+        // semver §9: numeric pre-release identifiers must not carry leading zeros
+        for v in ["1.0.0-01", "1.0.0-beta.02", "1.0.0-0.01"] {
+            assert!(store.publish("pub.a", v, b"x", None).is_err(), "must reject {v}");
+        }
+        // ...but hyphenated alphanumeric identifiers are fine
+        // (`1.0.0-0` was already accepted above; re-publishing would 409)
+        for v in ["1.0.0-alpha-1", "1.0.0-x.7.z.92"] {
+            assert!(store.publish("pub.a", v, b"x", None).is_ok(), "must accept {v}");
         }
         std::fs::remove_dir_all(&dir).ok();
     }
