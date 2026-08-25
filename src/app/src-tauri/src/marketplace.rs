@@ -69,7 +69,7 @@ pub struct CcextVersionEntry {
     pub version: String,
     pub sha256: String,
     pub size: u64,
-    #[serde(rename = "publishedAt", default)]
+    #[serde(default)]
     pub published_at: String,
     /// base64 ed25519 signature over the package bytes (signed publishes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -370,10 +370,38 @@ impl MarketplaceClient {
     }
 
     /// Verify a downloaded package against the version entry's ed25519
+    /// signature, enforcing the registry's pinned publisher key when one
+    /// exists.
+    ///
+    /// - Pinned extension: the entry MUST be signed by exactly the pinned key
+    ///   (unsigned or differently-signed entries are rejected — the registry
+    ///   enforces the same rule at publish time, so a mismatch means tampered
+    ///   metadata or a compromised registry).
+    /// - Unpinned extension: unsigned entries pass (SHA-256 integrity still
+    ///   applies); signed entries are verified against their `signed_by` key.
+    pub fn verify_ccext_package(
+        pinned_key: Option<&str>,
+        entry: &CcextVersionEntry,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        if let Some(pinned) = pinned_key.map(str::trim).filter(|s| !s.is_empty()) {
+            let signed_by = entry.signed_by.as_deref().map(str::trim);
+            if signed_by != Some(pinned) {
+                return Err(format!(
+                    "publisher key mismatch: version is signed by {} but the extension is pinned to {pinned}",
+                    signed_by.unwrap_or("(nobody — unsigned)")
+                ));
+            }
+            // Some(pinned) == signed_by here, so a signature must exist.
+        }
+        Self::verify_ccext_signature(entry, bytes)
+    }
+
+    /// Verify a downloaded package against the version entry's ed25519
     /// signature. Unsigned (legacy/dev) entries pass — the registry only
     /// records signatures for publishers that opted in; once signed, the
     /// registry pins the key and clients authenticate against it.
-    pub fn verify_ccext_signature(
+    fn verify_ccext_signature(
         entry: &CcextVersionEntry,
         bytes: &[u8],
     ) -> Result<(), String> {
@@ -581,7 +609,39 @@ mod tests {
         use rand::rngs::OsRng;
         let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
         let entry = signed_entry(&key, b"package");
-        assert!(MarketplaceClient::verify_ccext_signature(&entry, b"package").is_ok());
+        // unpinned: verified against the entry's own key
+        assert!(MarketplaceClient::verify_ccext_package(None, &entry, b"package").is_ok());
+        // pinned to the same key: passes
+        let pinned = b64(key.verifying_key().as_bytes());
+        assert!(MarketplaceClient::verify_ccext_package(Some(&pinned), &entry, b"package").is_ok());
+    }
+
+    #[test]
+    fn ccext_pinned_key_mismatch_rejected() {
+        use ed25519_dalek::Signer;
+        use rand::rngs::OsRng;
+        let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let entry = signed_entry(&key, b"package");
+        // entry signed by a different key than the registry pin → reject even
+        // though the signature itself is internally consistent
+        let other = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let wrong_pin = b64(other.verifying_key().as_bytes());
+        let err = MarketplaceClient::verify_ccext_package(Some(&wrong_pin), &entry, b"package").unwrap_err();
+        assert!(err.contains("mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn ccext_pinned_unsigned_rejected() {
+        use rand::rngs::OsRng;
+        let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let pinned = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(key.verifying_key().as_bytes())
+        };
+        // unsigned entry for a pinned extension → reject (tampered metadata)
+        let entry = unsigned_entry();
+        let err = MarketplaceClient::verify_ccext_package(Some(&pinned), &entry, b"package").unwrap_err();
+        assert!(err.contains("mismatch"), "got: {err}");
     }
 
     #[test]
@@ -589,7 +649,7 @@ mod tests {
         use rand::rngs::OsRng;
         let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
         let entry = signed_entry(&key, b"package");
-        let err = MarketplaceClient::verify_ccext_signature(&entry, b"tampered").unwrap_err();
+        let err = MarketplaceClient::verify_ccext_package(None, &entry, b"tampered").unwrap_err();
         assert!(err.contains("tampered"), "got: {err}");
     }
 
@@ -602,12 +662,31 @@ mod tests {
         // re-sign with a different key but keep the original signed_by
         let other = ed25519_dalek::SigningKey::generate(&mut OsRng);
         entry.signature = Some(b64(&other.sign(b"package").to_bytes()));
-        assert!(MarketplaceClient::verify_ccext_signature(&entry, b"package").is_err());
+        assert!(MarketplaceClient::verify_ccext_package(None, &entry, b"package").is_err());
     }
 
     #[test]
     fn ccext_unsigned_entry_passes() {
         let entry = unsigned_entry();
-        assert!(MarketplaceClient::verify_ccext_signature(&entry, b"anything").is_ok());
+        assert!(MarketplaceClient::verify_ccext_package(None, &entry, b"anything").is_ok());
+    }
+
+    #[test]
+    fn ccext_entry_parses_server_wire_format() {
+        // Exact JSON shape the marketplace-server emits — guards against
+        // serde rename drift between the two crates (published_at was
+        // previously renamed to publishedAt and silently dropped).
+        let wire = r#"{
+            "version": "1.0.0",
+            "sha256": "aa",
+            "size": 7,
+            "published_at": "2026-08-25T00:00:00Z",
+            "signature": "c2ln",
+            "signed_by": "a2V5"
+        }"#;
+        let entry: CcextVersionEntry = serde_json::from_str(wire).expect("wire format must parse");
+        assert_eq!(entry.published_at, "2026-08-25T00:00:00Z");
+        assert_eq!(entry.signature.as_deref(), Some("c2ln"));
+        assert_eq!(entry.signed_by.as_deref(), Some("a2V5"));
     }
 }

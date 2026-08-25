@@ -1291,9 +1291,16 @@ async fn install_native_extension(
             .ok_or_else(|| format!("No versions published for {id}"))?,
     };
 
-    // Download and verify integrity before touching the extensions dir
+    // Download and verify integrity before touching the extensions dir.
+    // A missing digest header is an error, not a skip: our registry always
+    // sets it, so absence means a misconfigured proxy or a non-registry URL.
     let (bytes, expected_sha) = state.marketplace.ccext_download(&id, &entry.version).await?;
-    if !expected_sha.is_empty() {
+    if expected_sha.trim().is_empty() {
+        return Err(format!(
+            "registry did not provide an integrity digest (x-corecode-sha256) for {id} — refusing to install"
+        ));
+    }
+    {
         use sha2::Digest;
         let actual = hex::encode(sha2::Sha256::digest(&bytes));
         if actual != expected_sha {
@@ -1304,7 +1311,7 @@ async fn install_native_extension(
         }
     }
     // Authenticate signed packages against the registry-pinned publisher key
-    marketplace::MarketplaceClient::verify_ccext_signature(&entry, &bytes)?;
+    marketplace::MarketplaceClient::verify_ccext_package(meta.pinned_key.as_deref(), &entry, &bytes)?;
 
     let installed = {
         let mgr = state.extension_mgr.lock().map_err(|e| e.to_string())?;

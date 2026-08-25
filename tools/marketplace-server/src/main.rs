@@ -25,7 +25,8 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| default.to_string())
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let data_dir = PathBuf::from(env_or("MARKETPLACE_DATA", "./marketplace-data"));
     let token = std::env::var("MARKETPLACE_TOKEN").ok().filter(|s| !s.is_empty());
     let bind = env_or("MARKETPLACE_BIND", "127.0.0.1:8987");
@@ -41,13 +42,9 @@ fn main() {
     println!("  data dir : {}", data_dir.display());
     println!("  publish  : {}", if has_token { "token required" } else { "disabled" });
 
-    tokio::runtime::Runtime::new()
-        .expect("start tokio runtime")
-        .block_on(async {
-            let listener = tokio::net::TcpListener::bind(&bind)
-                .await
-                .unwrap_or_else(|e| panic!("cannot bind {bind}: {e}"));
-            println!("  listening on http://{bind}");
-            axum::serve(listener, app).await.expect("server error");
-        });
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
+        .unwrap_or_else(|e| panic!("cannot bind {bind}: {e}"));
+    println!("  listening on http://{bind}");
+    axum::serve(listener, app).await.expect("server error");
 }

@@ -103,19 +103,23 @@ impl Store {
         }
     }
 
+    /// Numeric core component: digits only, no leading zeros (`01` invalid,
+    /// `0` valid) per semver §2.
+    fn valid_core_part(p: &str) -> bool {
+        !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) && (p.len() == 1 || !p.starts_with('0'))
+    }
+
     /// Semantic version `x.y.z` with optional pre-release suffix.
+    /// (Build metadata `+meta` is intentionally not accepted — versions are
+    /// used as package filenames and offer no precedence.)
     pub fn valid_version(v: &str) -> bool {
-        let (core, pre) = match v.split_once('-') {
-            Some((core, pre)) => (core, Some(pre)),
-            None => (v, None),
+        let Some((core, pre)) = v.split_once('-') else {
+            return v.split('.').count() == 3 && v.split('.').all(Self::valid_core_part);
         };
-        let parts: Vec<&str> = core.split('.').collect();
-        if parts.len() != 3 || !parts.iter().all(|p| p.parse::<u64>().is_ok()) {
+        if core.split('.').count() != 3 || !core.split('.').all(Self::valid_core_part) {
             return false;
         }
-        pre.map_or(true, |p| {
-            !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-        })
+        !pre.is_empty() && pre.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
     }
 
     /// Store a package. `sig` is `(pubkey_b64, signature_b64)` for signed
@@ -205,7 +209,7 @@ impl Store {
             pinned_key: None,
         });
         ext.versions.push(entry.clone());
-        ext.versions.sort_by(|a, b| version_key(&b.version).cmp(&version_key(&a.version)));
+        ext.versions.sort_by(|a, b| version_cmp(&b.version, &a.version)); // newest first
         if ext.pinned_key.is_none() {
             ext.pinned_key = signed_by;
         }
@@ -283,18 +287,55 @@ fn verify_signature(pubkey_b64: &str, signature_b64: &str, bytes: &[u8]) -> Resu
     key.verify(bytes, &signature).map_err(|e| format!("verification failed: {e}"))
 }
 
-/// Sort key so `1.0.0` > `1.0.0-rc.1` > `0.9.0`, newest first.
-fn version_key(v: &str) -> (u64, u64, u64, u8) {
-    let (core, pre) = match v.split_once('-') {
-        Some((c, p)) => (c, Some(p)),
+/// Full semver precedence comparison (semver §11): core numeric fields first;
+/// a release outranks any pre-release; pre-release identifiers compare
+/// numerically when both numeric (so `beta.11` > `beta.2`), numeric ranks
+/// below alphanumeric, and more identifiers rank higher on equal prefixes.
+fn split_version(v: &str) -> (&str, Option<&str>) {
+    match v.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
         None => (v, None),
+    }
+}
+
+fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (a_core, a_pre) = split_version(a);
+    let (b_core, b_pre) = split_version(b);
+
+    let nums = |core: &str| {
+        let mut it = core.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+        [it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0)]
     };
-    let mut parts = core.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
-    let major = parts.next().unwrap_or(0);
-    let minor = parts.next().unwrap_or(0);
-    let patch = parts.next().unwrap_or(0);
-    let is_release = u8::from(pre.is_none());
-    (major, minor, patch, is_release)
+    let core_ord = nums(a_core).cmp(&nums(b_core));
+    if core_ord != Ordering::Equal {
+        return core_ord;
+    }
+
+    match (a_pre, b_pre) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater, // release > pre-release
+        (Some(_), None) => Ordering::Less,
+        (Some(a), Some(b)) => cmp_pre_release(a, b),
+    }
+}
+
+fn cmp_pre_release(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let a_ids: Vec<&str> = a.split('.').collect();
+    let b_ids: Vec<&str> = b.split('.').collect();
+    for (x, y) in a_ids.iter().zip(b_ids.iter()) {
+        let ord = match (x.parse::<u64>().ok(), y.parse::<u64>().ok()) {
+            (Some(xn), Some(yn)) => xn.cmp(&yn),       // numeric < numeric
+            (Some(_), None) => Ordering::Less,        // numeric < alphanumeric
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => x.cmp(y),                 // ASCII lexical
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a_ids.len().cmp(&b_ids.len()) // more identifiers > fewer
 }
 
 #[cfg(test)]
@@ -373,13 +414,39 @@ mod tests {
     #[test]
     fn latest_orders_by_semver() {
         let (store, dir) = tmp_store("semver");
-        for v in ["1.0.0", "0.9.0", "1.0.0-rc.1", "1.1.0"] {
+        // Ordered per semver §11 — including the cases a naive sort gets wrong
+        for v in [
+            "1.0.0-alpha",
+            "1.0.0-alpha.1",
+            "1.0.0-alpha.beta",
+            "1.0.0-beta",
+            "1.0.0-beta.2",
+            "1.0.0-beta.11", // numeric: 11 > 2
+            "1.0.0-rc.1",
+            "1.0.0",
+            "1.1.0",
+            "0.9.0",
+        ] {
             store.publish("pub.a", v, b"x", None).unwrap();
         }
         assert_eq!(store.latest("pub.a").unwrap().version, "1.1.0");
-        // 1.0.0 release ranks above 1.0.0-rc.1
         let versions: Vec<String> = store.get("pub.a").unwrap().versions.iter().map(|v| v.version.clone()).collect();
-        assert_eq!(versions, ["1.1.0", "1.0.0", "1.0.0-rc.1", "0.9.0"]);
+        assert_eq!(
+            versions,
+            ["1.1.0", "1.0.0", "1.0.0-rc.1", "1.0.0-beta.11", "1.0.0-beta.2", "1.0.0-beta", "1.0.0-alpha.beta", "1.0.0-alpha.1", "1.0.0-alpha", "0.9.0"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_leading_zero_versions() {
+        let (store, dir) = tmp_store("leadingzero");
+        for v in ["01.0.0", "1.00.0", "1.0.000", "1.0.0-0"] {
+            // `1.0.0-0` is VALID per semver (single zero pre-release identifier)
+            let expect_err = v != "1.0.0-0";
+            let result = store.publish("pub.a", v, b"x", None);
+            assert_eq!(result.is_err(), expect_err, "version {v}: err={result:?}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

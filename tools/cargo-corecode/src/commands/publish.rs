@@ -95,8 +95,15 @@ pub fn run(
     let url = format!("{registry}/api/v1/publish");
     println!("  registry  : {url}");
 
-    let mut request = ureq::post(&url)
+    // No redirects: following one would forward the Bearer token and the
+    // signature headers to an arbitrary host. Operators should point
+    // --registry at the final URL.
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
         .timeout(Duration::from_secs(300))
+        .build();
+    let mut request = agent
+        .post(&url)
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/octet-stream")
         .set("X-CoreCode-Extension", &m.extension.id)
@@ -136,6 +143,13 @@ pub fn run(
             m.extension.version,
             m.extension.id
         ),
+        Err(ureq::Error::Status(status, resp)) if (300..400).contains(&status) => {
+            let location = resp.header("location").unwrap_or("(no location)");
+            anyhow::bail!(
+                "registry redirected (HTTP {status} → {location}) — redirects are disabled to \
+                 protect the token and signature headers; set --registry to the final URL"
+            )
+        }
         Err(ureq::Error::Status(status, resp)) => {
             let body = resp.into_string().unwrap_or_default();
             anyhow::bail!("registry rejected the package: HTTP {status}\n  {body}")
@@ -181,18 +195,18 @@ fn is_valid_segment(part: &str) -> bool {
 }
 
 fn is_valid_version(v: &str) -> bool {
-    let v = v.strip_prefix('v').unwrap_or(v);
-    let (core, pre) = match v.split_once('-') {
-        Some((core, pre)) => (core, Some(pre)),
-        None => (v, None),
+    // Mirrors the registry's rules exactly (server `valid_version`):
+    // x.y.z numeric core without leading zeros + optional pre-release suffix.
+    let valid_core_part = |p: &str| {
+        !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) && (p.len() == 1 || !p.starts_with('0'))
     };
-    let parts: Vec<&str> = core.split('.').collect();
-    if parts.len() != 3 || parts.iter().all(|p| p.parse::<u64>().is_ok()) == false {
+    let Some((core, pre)) = v.split_once('-') else {
+        return v.split('.').count() == 3 && v.split('.').all(valid_core_part);
+    };
+    if core.split('.').count() != 3 || !core.split('.').all(valid_core_part) {
         return false;
     }
-    pre.map_or(true, |p| {
-        !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-    })
+    !pre.is_empty() && pre.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
 }
 
 #[cfg(test)]
@@ -241,5 +255,12 @@ mod tests {
         assert!(validate(&manifest_with("pub.name", "latest")).is_err());
         assert!(validate(&manifest_with("pub.name", "1.2.x")).is_err());
         assert!(validate(&manifest_with("pub.name", "1.2.3-")).is_err());
+        // v-prefix, leading zeros, and 4-part cores all diverge from the
+        // registry's rules — reject locally instead of failing at upload.
+        assert!(validate(&manifest_with("pub.name", "v1.2.3")).is_err());
+        assert!(validate(&manifest_with("pub.name", "01.2.3")).is_err());
+        assert!(validate(&manifest_with("pub.name", "1.2.3.4")).is_err());
+        // single-zero pre-release identifier is valid semver
+        assert!(validate(&manifest_with("pub.name", "1.2.3-0")).is_ok());
     }
 }

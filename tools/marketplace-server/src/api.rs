@@ -49,13 +49,23 @@ pub fn router(data_dir: PathBuf, token: Option<String>) -> Router {
         .with_state(state)
 }
 
+/// Constant-time string equality — avoids leaking the token prefix-by-prefix
+/// through response-timing differences.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 fn bearer_authorized(headers: &HeaderMap, expected: &Option<String>) -> bool {
     let Some(expected) = expected else { return false };
     let Some(value) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
         return false;
     };
     match value.strip_prefix("Bearer ") {
-        Some(token) => token.trim() == expected,
+        Some(token) => ct_eq(token.trim(), expected),
         None => false,
     }
 }
