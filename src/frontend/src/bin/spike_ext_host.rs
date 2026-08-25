@@ -12,10 +12,10 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::net::TcpStream;
 use std::time::Instant;
 
-const SOCKET_PATH: &str = "/tmp/corecode-spike-ext-host.sock";
+const TCP_ADDRESS: &str = "127.0.0.1:17533";
 
 // --- Protocol: length-prefixed JSON ---
 
@@ -39,8 +39,13 @@ struct ErrorInfo {
     message: String,
 }
 
-fn send_request(stream: &mut UnixStream, req: &Request) -> Result<Response> {
+fn send_request(stream: &mut TcpStream, req: &Request) -> Result<Response> {
+    const DEFAULT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    stream.set_write_timeout(Some(DEFAULT_IO_TIMEOUT))?;
+    stream.set_read_timeout(Some(DEFAULT_IO_TIMEOUT))?;
+
     let json = serde_json::to_vec(req)?;
+    let request_id = req.id;
 
     // Write length-prefixed frame
     let len = json.len() as u32;
@@ -52,18 +57,44 @@ fn send_request(stream: &mut UnixStream, req: &Request) -> Result<Response> {
     stream.read_exact(&mut len_buf)?;
     let resp_len = u32::from_le_bytes(len_buf) as usize;
 
+    const MAX_RESP_LEN: usize = 10 * 1024 * 1024;
+    if resp_len == 0 || resp_len > MAX_RESP_LEN {
+        return Err(anyhow::anyhow!("Invalid response length: {}", resp_len));
+    }
+
     let mut resp_buf = vec![0u8; resp_len];
     stream.read_exact(&mut resp_buf)?;
 
     let resp: Response = serde_json::from_slice(&resp_buf)?;
+
+    // Guard: reject out-of-order or corrupted responses before any result processing
+    if resp.id != request_id {
+        eprintln!(
+            "ERROR: Response ID mismatch — expected {}, got {}; ignoring response",
+            request_id, resp.id
+        );
+        return Err(anyhow::anyhow!(
+            "Response ID mismatch: expected {}, got {}",
+            request_id,
+            resp.id
+        ));
+    }
+
     Ok(resp)
 }
 
 fn main() -> Result<()> {
     println!("=== CoreCode Spike 3: Extension Host Client ===\n");
 
-    println!("Connecting to Extension Host at {SOCKET_PATH}...");
-    let mut stream = UnixStream::connect(SOCKET_PATH)?;
+    // Pass/fail flags — set inside each test's success branch
+    let mut extension_loaded_ok = false;
+    let mut activate_called_ok = false;
+    let mut command_exec_ok = false;
+    let mut args_ok = false;
+    let mut data_roundtrip_ok = false;
+
+    println!("Connecting to Extension Host at {TCP_ADDRESS}...");
+    let mut stream = TcpStream::connect(TCP_ADDRESS)?;
     println!("Connected!\n");
 
     // --- Test 1: Get extension info ---
@@ -79,9 +110,11 @@ fn main() -> Result<()> {
     println!("Response: {}", serde_json::to_string_pretty(&resp.result)?);
 
     if let Some(result) = &resp.result {
+        extension_loaded_ok = true;
         if let Some(commands) = result.get("commands") {
             let count = commands.as_array().map(|a| a.len()).unwrap_or(0);
             if count > 0 {
+                activate_called_ok = true;
                 println!("[Test 1] PASS: {} commands registered", count);
             } else {
                 println!("[Test 1] FAIL: No commands registered");
@@ -109,7 +142,11 @@ fn main() -> Result<()> {
     for cmd in &commands {
         println!("  - {}", cmd);
     }
-    println!("[Test 2] PASS: {} commands listed", commands.len());
+    if commands.is_empty() {
+        println!("[Test 2] FAIL: 0 commands listed");
+    } else {
+        println!("[Test 2] PASS: {} commands listed", commands.len());
+    }
 
     // --- Test 3: Execute corecode.helloWorld ---
     println!("\n--- Test 3: Execute corecode.helloWorld ---");
@@ -132,6 +169,7 @@ fn main() -> Result<()> {
     if let Some(result) = &resp.result {
         if let Some(value) = result.get("value") {
             if value.as_str() == Some("Hello, World!") {
+                command_exec_ok = true;
                 println!("[Test 3] PASS: Correct return value");
             } else {
                 println!("[Test 3] FAIL: Unexpected return value: {}", value);
@@ -160,6 +198,7 @@ fn main() -> Result<()> {
     if let Some(result) = &resp.result {
         if let Some(value) = result.get("value").and_then(|v| v.as_str()) {
             if value.contains("Rust") {
+                args_ok = true;
                 println!("[Test 4] PASS: Argument passed correctly");
             } else {
                 println!("[Test 4] FAIL: Argument not in response");
@@ -189,6 +228,7 @@ fn main() -> Result<()> {
         if let Some(value) = result.get("value") {
             let sum = value.get("result").and_then(|v| v.as_i64());
             if sum == Some(42) {
+                data_roundtrip_ok = true;
                 println!("[Test 5] PASS: 17 + 25 = 42 (computed correctly)");
             } else {
                 println!("[Test 5] FAIL: Expected 42, got {:?}", sum);
@@ -199,9 +239,10 @@ fn main() -> Result<()> {
     // --- Test 6: Latency benchmark (100 command invocations) ---
     println!("\n--- Test 6: Command Execution Latency (100 calls) ---");
     let mut rtts = Vec::with_capacity(100);
-    for i in 0..100 {
+    let mut bench_errors: u32 = 0;
+    for i in 0u64..100 {
         let start = Instant::now();
-        let _resp = send_request(
+        let resp = send_request(
             &mut stream,
             &Request {
                 id: 100 + i,
@@ -212,7 +253,31 @@ fn main() -> Result<()> {
                 })),
             },
         )?;
+        // RTT is pushed before validation so timing is not polluted by the checks
         rtts.push(start.elapsed());
+
+        // Validate: no protocol-level error in the response
+        if let Some(err) = &resp.error {
+            eprintln!("  [bench i={}] ERROR from host: {}", i, err.message);
+            bench_errors += 1;
+            continue;
+        }
+
+        // Validate: result equals the expected sum i + (i + 1)
+        let expected = (i + (i + 1)) as i64;
+        let got = resp
+            .result
+            .as_ref()
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.get("result"))
+            .and_then(|v| v.as_i64());
+        if got != Some(expected) {
+            eprintln!(
+                "  [bench i={}] VALUE MISMATCH: expected {}, got {:?}",
+                i, expected, got
+            );
+            bench_errors += 1;
+        }
     }
 
     let rtt_us: Vec<f64> = rtts.iter().map(|d| d.as_secs_f64() * 1_000_000.0).collect();
@@ -228,26 +293,36 @@ fn main() -> Result<()> {
     );
 
     let avg_ms = avg / 1000.0;
-    if avg_ms < 5.0 {
+    let latency_ok = avg_ms < 5.0;
+    if bench_errors == 0 && latency_ok {
         println!(
-            "[Test 6] PASS: avg RTT {:.3}ms < 5ms target",
+            "[Test 6] PASS: avg RTT {:.3}ms < 5ms target, all 100 responses valid",
             avg_ms
         );
     } else {
-        println!(
-            "[Test 6] FAIL: avg RTT {:.3}ms >= 5ms target",
-            avg_ms
-        );
+        if bench_errors > 0 {
+            println!(
+                "[Test 6] FAIL: {}/100 responses had errors or value mismatches",
+                bench_errors
+            );
+        }
+        if !latency_ok {
+            println!(
+                "[Test 6] FAIL: avg RTT {:.3}ms >= 5ms target",
+                avg_ms
+            );
+        }
     }
 
     // --- Summary ---
+    let status = |ok: bool| if ok { "OK" } else { "FAIL" };
     println!("\n=== SPIKE 3 SUMMARY ===");
-    println!("Extension loading:     OK");
-    println!("activate() called:     OK");
+    println!("Extension loading:     {}", status(extension_loaded_ok));
+    println!("activate() called:     {}", status(activate_called_ok));
     println!("Commands registered:   {} commands", commands.len());
-    println!("Command execution:     OK (return values verified)");
-    println!("Argument passing:      OK (string + numeric args)");
-    println!("Data round-trip:       OK (computed result returned)");
+    println!("Command execution:     {} (return values verified)", status(command_exec_ok));
+    println!("Argument passing:      {} (string + numeric args)", status(args_ok));
+    println!("Data round-trip:       {} (computed result returned)", status(data_roundtrip_ok));
     println!("Avg command RTT:       {:.3}ms", avg_ms);
     println!("========================\n");
 

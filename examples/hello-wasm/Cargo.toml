@@ -1,0 +1,18 @@
+[package]
+name    = "hello-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# WIT bindings generated from corecode.wit
+wit-bindgen = "0.43"
+
+[profile.release]
+opt-level     = "z"   # optimise for size (smallest binary)
+lto           = true  # enable link-time optimisation
+codegen-units = 1     # single codegen unit for maximum optimisation
+strip         = true  # strip debug symbols from the final binary
+panic         = "abort" # remove panic unwinding code for smaller WASM binaries

@@ -19,9 +19,18 @@
 
 const net = require('net');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
-const SOCKET_PATH = '/tmp/corecode-spike-ext-host.sock';
+function getDefaultSocketPath() {
+  const socketName = 'corecode-spike-ext-host.sock';
+  if (process.platform === 'win32') {
+    return path.join('\\\\.\\pipe', socketName);
+  }
+  return path.join(os.tmpdir(), socketName);
+}
+
+const SOCKET_PATH = process.env.CORECODE_SPIKE_SOCKET_PATH || getDefaultSocketPath();
 
 // ============================================================
 // VS Code API Shim — Minimal subset for Spike 3
@@ -235,23 +244,36 @@ class ExtensionLoader {
       throw new Error(`Main entry not found: ${mainPath}`);
     }
 
-    // Inject our vscode API shim into the module resolution
     const vscodeApi = this.apiShim.buildApi(extensionId);
 
-    // Patch require to intercept 'vscode' imports
-    const originalResolveFilename = module.constructor._resolveFilename;
-    module.constructor._resolveFilename = function (request, parent, isMain, options) {
+    // ---------------------------------------------------------------------------
+    // Module resolution override — intercept require('vscode')
+    // ---------------------------------------------------------------------------
+    // This monkey-patches Module._resolveFilename (a Node.js internal) so that
+    // `require('vscode')` resolves to our in-memory shim instead of searching
+    // node_modules.  The sentinel "vscode" is placed directly in require.cache.
+    //
+    // Compatibility: relies on Module._resolveFilename which is present in every
+    // Node.js LTS version from v6 onward (tested through v22).  If Node ever
+    // removes or renames this internal, this block and the matching cache entry
+    // must be updated together — search for "Module._resolveFilename" and the
+    // cache key "vscode" below.
+    //
+    // The same pattern is used in the production extension-loader.ts; keep both
+    // in sync.
+    // ---------------------------------------------------------------------------
+    const Module = require('module');
+    const originalResolveFilename = Module._resolveFilename;
+    Module._resolveFilename = function (request, parent, isMain, options) {
       if (request === 'vscode') {
-        // Return a sentinel that we'll handle in the cache
-        return '__vscode_shim__';
+        return 'vscode';
       }
       return originalResolveFilename.call(this, request, parent, isMain, options);
     };
 
-    // Place our shim in the require cache
-    require.cache['__vscode_shim__'] = {
-      id: '__vscode_shim__',
-      filename: '__vscode_shim__',
+    require.cache['vscode'] = {
+      id: 'vscode',
+      filename: 'vscode',
       loaded: true,
       exports: vscodeApi,
     };
@@ -261,22 +283,22 @@ class ExtensionLoader {
     try {
       extensionModule = require(mainPath);
     } finally {
-      module.constructor._resolveFilename = originalResolveFilename;
-      delete require.cache['__vscode_shim__'];
+      Module._resolveFilename = originalResolveFilename;
+      delete require.cache['vscode'];
     }
 
     // Create a minimal ExtensionContext
-    const storagePath = path.join('/tmp', 'corecode-ext-storage', extensionId);
+    const storagePath = path.join(os.tmpdir(), 'corecode-ext-storage', extensionId);
     const context = {
       subscriptions: [],
       extensionPath: extensionDir,
       storagePath,
-      globalStoragePath: path.join('/tmp', 'corecode-ext-global-storage'),
+      globalStoragePath: path.join(os.tmpdir(), 'corecode-ext-global-storage'),
       extensionUri: vscodeApi.Uri.file(extensionDir),
       storageUri: vscodeApi.Uri.file(storagePath),
-      globalStorageUri: vscodeApi.Uri.file(path.join('/tmp', 'corecode-ext-global-storage')),
-      extensionMode: 1, // Production
-      logUri: vscodeApi.Uri.file(path.join('/tmp', 'corecode-ext-logs', extensionId)),
+      globalStorageUri: vscodeApi.Uri.file(path.join(os.tmpdir(), 'corecode-ext-global-storage')),
+      extensionMode: 1,
+      logUri: vscodeApi.Uri.file(path.join(os.tmpdir(), 'corecode-ext-logs', extensionId)),
       asAbsolutePath(relativePath) {
         return path.join(extensionDir, relativePath);
       },
@@ -394,6 +416,11 @@ function startIpcServer(apiShim) {
     socket.on('error', (err) => {
       if (err.code !== 'ECONNRESET') console.error('[IPC] Error:', err.message);
     });
+  });
+
+  server.on('error', (err) => {
+    console.error(`[IPC] Failed to listen on ${SOCKET_PATH}:`, err.message);
+    process.exit(1);
   });
 
   server.listen(SOCKET_PATH, () => {

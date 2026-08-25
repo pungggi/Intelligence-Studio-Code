@@ -48,13 +48,13 @@ Messen der Round-Trip-Latenz zwischen Rust und Node.js über Unix Domain Sockets
 ### Erfolgskriterien & Ergebnisse
 - [x] Einzelnachricht RTT < 1ms — **PASS** (45µs binary, 60µs JSON)
 - [ ] Durchsatz > 50.000 Nachrichten/Sekunde — **PARTIAL** (22k, aber sync R/R-Muster; Batching löst das)
-- [ ] FlatBuffers mindestens 3x schneller als JSON-RPC — **PARTIAL** (1.3x, Syscall-Overhead dominiert)
+- [ ] Binary-Format mindestens 3x schneller als JSON-RPC — **PARTIAL** (1.3x, Syscall-Overhead dominiert)
 
 ### Erkenntnisse
 - IPC ist **kein Bottleneck** — RTT weit unter Budget
 - Bei kleinen Payloads dominiert Syscall-Overhead; Binary-Vorteil wächst mit Payload-Größe
 - Kein Shared-Memory-Fallback nötig
-- Empfehlung: JSON-RPC für Prototyp verwenden, FlatBuffers bei Bedarf nachrüsten
+- Empfehlung: JSON-RPC für Prototyp verwenden, Binary-Format / FlatBuffers bei Bedarf nachrüsten
 
 ### Implementierung
 - `src/frontend/src/bin/spike_ipc.rs` — Rust-Benchmark-Client
@@ -145,11 +145,11 @@ Die 1-2ms liegen leicht über dem ambitionierten 1ms-Ziel, sind aber für einen 
 | Accessibility | Manuell | Browser-nativ | Tauri+ |
 
 ### Empfehlung: Option C (Hybrid)
-**Tauri-Shell mit wgpu-Canvas für den Text-Editor-Bereich.**
-- Tauri für Fenster-Management, Menüs, Dialoge, File-Picker, Notifications
-- wgpu für den Text-Editor-Canvas (dort wo Performance zählt)
+**Option C kombiniert Elemente aus Option A (wgpu + Custom) und Option B (Tauri v2 WebView).**
+- Von **Option A (wgpu)**: wgpu für den Text-Editor-Canvas (dort wo Performance zählt); < 16ms Frame-Zeit
+- Von **Option B (Tauri WebView)**: Tauri für Fenster-Management, Menüs, Dialoge, File-Picker, Notifications, und Accessibility
 - Maximale Performance bei reduziertem Entwicklungsaufwand
-- Accessibility für UI-Elemente gratis via Tauri, Editor-Canvas manuell
+- Accessibility für UI-Elemente gratis via Tauri (Option B), Editor-Canvas manuell (Option A)
 
 ### Nächster Schritt: M1 (Hello World)
 Minimaler Rust-Editor mit:

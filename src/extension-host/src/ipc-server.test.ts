@@ -7,17 +7,10 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { timingSafeEqual } from "node:crypto";
+import { MAX_FRAME_SIZE, tokensMatch } from "./ipc-server.ts";
 
 // ── timingSafeEqual token comparison ─────────────────────────────────────────
-// Mirror the exact comparison logic used in IpcServer.onData so we can
-// assert its correctness in isolation.
-
-function tokensMatch(provided: string | null | undefined, expected: string): boolean {
-  if (provided == null) return false;
-  if (provided.length !== expected.length) return false;
-  return timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
-}
+// Use the exported function from IpcServer so we can assert its correctness in isolation.
 
 describe("IPC auth — timing-safe token comparison", () => {
   it("accepts the correct token", () => {
@@ -61,8 +54,6 @@ describe("IPC auth — timing-safe token comparison", () => {
 
 // ── Frame size validation ─────────────────────────────────────────────────────
 // Mirror the MAX_FRAME_SIZE guard logic.
-
-const MAX_FRAME_SIZE = 10 * 1024 * 1024; // 10 MB, must match ipc-server.ts
 
 function isFrameOversized(frameLen: number): boolean {
   return frameLen > MAX_FRAME_SIZE;

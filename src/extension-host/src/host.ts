@@ -7,11 +7,15 @@
  * 3. Routes messages between extensions and the frontend
  */
 
-import { resolve, relative, isAbsolute } from "path";
+import { resolve, relative, isAbsolute, dirname } from "path";
 import { realpathSync, existsSync } from "fs";
-import { ExtensionLoader } from "./extension-loader";
-import { IpcServer } from "./ipc-server";
-import { VscodeApiShim } from "./vscode-api-shim";
+import { fileURLToPath } from "url";
+import { ExtensionLoader } from "./extension-loader.js";
+import { IpcServer, IpcMessage } from "./ipc-server.js";
+import { VscodeApiShim } from "./vscode-api-shim.js";
+
+// ESM equivalent of CommonJS __dirname.
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const IPC_HOST = process.env.CORECODE_IPC_HOST ?? "127.0.0.1";
 const IPC_PORT = parseInt(process.env.CORECODE_IPC_PORT ?? "17532", 10);
@@ -33,8 +37,8 @@ async function main(): Promise<void> {
   const ipcServer = new IpcServer(IPC_HOST, IPC_PORT, IPC_TOKEN);
 
   // Start IPC server and wait for frontend connection
-  await ipcServer.start();
-  console.log(`[ExtensionHost] IPC server listening on ${IPC_HOST}:${IPC_PORT}`);
+  const actualPort = await ipcServer.start();
+  console.log(`[ExtensionHost] IPC server listening on ${IPC_HOST}:${actualPort}`);
 
   // Collect allowed extension directories for path validation
   const bundledDir =
@@ -65,7 +69,7 @@ async function main(): Promise<void> {
   }
 
   // Forward IPC messages to the API shim, with M8 extension lifecycle hooks
-  ipcServer.onMessage(async (msg) => {
+  ipcServer.onMessage(async (msg: IpcMessage) => {
     // M8: Handle extension install/uninstall at host level
     if (msg.method === "extension/installed") {
       const p = msg.params as { path: string };
@@ -89,7 +93,11 @@ async function main(): Promise<void> {
       const p = msg.params as { id: string };
       if (p?.id) {
         console.log(`[ExtensionHost] Deactivating extension: ${p.id}`);
-        await extensionLoader.deactivateExtension(p.id);
+        try {
+          await extensionLoader.deactivateExtension(p.id);
+        } catch (err) {
+          console.error(`[ExtensionHost] Failed to deactivate extension: ${p.id}`, err);
+        }
       }
       return;
     }
@@ -115,7 +123,7 @@ async function main(): Promise<void> {
   });
 
   // Forward API shim events back to frontend
-  apiShim.onOutgoing((msg) => {
+  apiShim.onOutgoing((msg: IpcMessage) => {
     ipcServer.send(msg);
   });
 
@@ -127,7 +135,11 @@ async function main(): Promise<void> {
 
   for (const dir of extensionDirs) {
     console.log(`[ExtensionHost] Scanning extensions in: ${dir}`);
-    await extensionLoader.scanAndActivate(dir);
+    try {
+      await extensionLoader.scanAndActivate(dir);
+    } catch (err) {
+      console.error(`[ExtensionHost] Error scanning extensions in: ${dir}`, err);
+    }
   }
 
   const active = extensionLoader.getActiveExtensions();
@@ -141,9 +153,15 @@ async function main(): Promise<void> {
     if (shutdownStarted) return;
     shutdownStarted = true;
     console.log("[ExtensionHost] Shutting down...");
-    await extensionLoader.deactivateAll();
-    await ipcServer.stop();
-    process.exit(0);
+    try {
+      await extensionLoader.deactivateAll();
+      await ipcServer.stop();
+    } catch (err) {
+      console.error("[ExtensionHost] Error during shutdown cleanup:", err);
+      process.exitCode = 1;
+    } finally {
+      process.exit(process.exitCode || 0);
+    }
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);

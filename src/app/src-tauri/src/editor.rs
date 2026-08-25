@@ -453,34 +453,66 @@ impl DocumentBuffer {
 
         let mut matches = Vec::new();
         let text = self.rope.to_string();
-
-        let (search_text, search_query) = if case_sensitive {
-            (std::borrow::Cow::Borrowed(text.as_str()), std::borrow::Cow::Borrowed(query))
-        } else {
-            (std::borrow::Cow::Owned(text.to_lowercase()), std::borrow::Cow::Owned(query.to_lowercase()))
-        };
-
         let query_char_len = query.chars().count();
-        let mut start = 0;
-        let mut char_offset_at_start: usize = 0;
-        while let Some(pos) = search_text[start..].find(&*search_query) {
-            let byte_pos = start + pos;
-            // Count chars only in the segment since last position (incremental, not O(n))
-            char_offset_at_start += text[start..byte_pos].chars().count();
-            let char_pos = char_offset_at_start;
-            let line = self.rope.char_to_line(char_pos);
-            let line_start = self.rope.line_to_char(line);
-            let col = char_pos - line_start;
 
-            matches.push(FindMatch {
-                line,
-                col,
-                length: query_char_len,
-            });
+        if case_sensitive {
+            let mut start = 0;
+            let mut char_offset_at_start: usize = 0;
+            while let Some(pos) = text[start..].find(query) {
+                let byte_pos = start + pos;
+                // Count chars only in the segment since last position (incremental, not O(n))
+                char_offset_at_start += text[start..byte_pos].chars().count();
+                let char_pos = char_offset_at_start;
+                let line = self.rope.char_to_line(char_pos);
+                let line_start = self.rope.line_to_char(line);
+                let col = char_pos - line_start;
+                matches.push(FindMatch { line, col, length: query_char_len });
+                let next_start = byte_pos + query.len();
+                char_offset_at_start += text[byte_pos..next_start].chars().count();
+                start = next_start;
+            }
+        } else {
+            // Case-insensitive: build a mapping from byte positions in the lowercased text
+            // back to char indices in the original text. This correctly handles non-ASCII
+            // characters whose lowercase form differs in byte length (e.g., Turkish dotted-I).
+            let query_lower = query.to_lowercase();
 
-            let next_start = byte_pos + search_query.len();
-            char_offset_at_start += text[byte_pos..next_start].chars().count();
-            start = next_start;
+            // lower_to_orig_char[i] = original char index for byte i of the lowercased text.
+            let mut lower_to_orig_char: Vec<usize> = Vec::with_capacity(text.len());
+            let mut lower_text = String::with_capacity(text.len());
+            for (char_idx, ch) in text.chars().enumerate() {
+                for lc in ch.to_lowercase() {
+                    let lc_len = lc.len_utf8();
+                    lower_text.push(lc);
+                    for _ in 0..lc_len {
+                        lower_to_orig_char.push(char_idx);
+                    }
+                }
+            }
+
+            let mut start_lower = 0; // byte offset into lower_text
+            while let Some(pos) = lower_text[start_lower..].find(query_lower.as_str()) {
+                let lower_byte_pos = start_lower + pos;
+                // Map the match start back to an original char index.
+                let orig_char_pos = lower_to_orig_char
+                    .get(lower_byte_pos)
+                    .copied()
+                    .unwrap_or(0);
+                // rope.char_to_line is O(log n) — no need for incremental char counting here.
+                let line = self.rope.char_to_line(orig_char_pos);
+                let line_start = self.rope.line_to_char(line);
+                let col = orig_char_pos - line_start;
+                // Compute actual match length in the original text: the lowercased
+                // match may span a different number of original chars (e.g. "ß" ↔ "ss").
+                let lower_end_byte = lower_byte_pos + query_lower.len() - 1;
+                let orig_char_pos_end = lower_to_orig_char
+                    .get(lower_end_byte)
+                    .copied()
+                    .unwrap_or(orig_char_pos);
+                let length = orig_char_pos_end - orig_char_pos + 1;
+                matches.push(FindMatch { line, col, length });
+                start_lower = lower_byte_pos + query_lower.len();
+            }
         }
 
         matches
@@ -517,6 +549,10 @@ impl DocumentBuffer {
         self.rope.len_lines()
     }
 
+    pub fn len_bytes(&self) -> usize {
+        self.rope.len_bytes()
+    }
+
     pub fn set_modified(&mut self, val: bool) {
         self.modified = val;
     }
@@ -530,7 +566,7 @@ impl DocumentBuffer {
         let lines: Vec<HighlightedLine> = (start..end)
             .map(|i| {
                 let line_text = self.rope.line(i).to_string();
-                let line_text_trimmed = line_text.trim_end_matches('\n').to_string();
+                let line_text_trimmed = line_text.trim_end_matches(&['\r', '\n'][..]).to_string();
                 let tokens = if let Some(tree) = &self.tree {
                     highlighting::highlight_line(tree, &self.rope, i)
                 } else {
@@ -562,7 +598,7 @@ impl DocumentBuffer {
         let lines: Vec<HighlightedLine> = (0..self.rope.len_lines())
             .map(|i| {
                 let line_text = self.rope.line(i).to_string();
-                let line_text_trimmed = line_text.trim_end_matches('\n').to_string();
+                let line_text_trimmed = line_text.trim_end_matches(&['\r', '\n'][..]).to_string();
 
                 let tokens = if let Some(tree) = &self.tree {
                     highlighting::highlight_line(tree, &self.rope, i)
@@ -598,6 +634,10 @@ pub struct WorkspaceState {
     buffers: HashMap<PathBuf, DocumentBuffer>,
     active_path: Option<PathBuf>,
     parser: tree_sitter::Parser,
+    /// Canonicalized root of the open workspace folder, if any.
+    workspace_root: Option<PathBuf>,
+    /// Shared grammar registry for dynamic tree-sitter grammars (set after init).
+    grammar_registry: Option<std::sync::Arc<crate::grammar_registry::GrammarRegistry>>,
 }
 
 #[allow(dead_code)]
@@ -610,7 +650,24 @@ impl WorkspaceState {
             buffers: HashMap::new(),
             active_path: None,
             parser,
+            workspace_root: None,
+            grammar_registry: None,
         }
+    }
+
+    /// Attach the shared grammar registry for dynamic tree-sitter grammar support.
+    pub fn set_grammar_registry(&mut self, registry: std::sync::Arc<crate::grammar_registry::GrammarRegistry>) {
+        self.grammar_registry = Some(registry);
+    }
+
+    /// Record the workspace root so that out-of-buffer write paths can be
+    /// restricted to files within the workspace folder.
+    pub fn set_workspace_root(&mut self, root: PathBuf) {
+        self.workspace_root = Some(root);
+    }
+
+    pub fn workspace_root(&self) -> Option<&PathBuf> {
+        self.workspace_root.as_ref()
     }
 
     /// Open a file into a new buffer (or switch to it if already open).
@@ -641,7 +698,11 @@ impl WorkspaceState {
             .unwrap_or("")
             .to_string();
 
-        self.set_language_from_ext(&ext);
+        if let Some(ref reg) = self.grammar_registry {
+            self.set_language_from_ext_with_registry(&ext, &reg.clone());
+        } else {
+            self.set_language_from_ext(&ext);
+        }
         let tree = self.parser.parse(&content, None);
         if tree.is_none() {
             log::warn!("Tree-sitter parse returned None for {}", path);
@@ -713,6 +774,11 @@ impl WorkspaceState {
         path.and_then(move |p| self.buffers.get_mut(&p))
     }
 
+    /// Get a reference to a buffer by path (any open buffer, not just active).
+    pub fn get_buffer_by_path(&self, path: &Path) -> Option<&DocumentBuffer> {
+        self.buffers.get(path)
+    }
+
     /// Get a mutable reference to a buffer by path (any open buffer, not just active).
     pub fn get_buffer_mut_by_path(&mut self, path: &Path) -> Option<&mut DocumentBuffer> {
         self.buffers.get_mut(path)
@@ -738,7 +804,11 @@ impl WorkspaceState {
         // Set the correct language first (needs &mut self for parser)
         let lang = self.buffers.get(&path).and_then(|b| b.language.clone());
         if let Some(lang) = &lang {
-            self.set_language_from_ext(lang);
+            if let Some(ref reg) = self.grammar_registry {
+                self.set_language_from_ext_with_registry(lang, &reg.clone());
+            } else {
+                self.set_language_from_ext(lang);
+            }
         }
 
         // Now borrow the buffer mutably for reparsing
@@ -790,34 +860,78 @@ impl WorkspaceState {
     fn set_language_from_ext(&mut self, ext: &str) {
         match ext {
             "js" | "jsx" | "mjs" | "cjs" => {
-                let _ = self.parser.set_language(&tree_sitter_javascript::LANGUAGE.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_javascript::LANGUAGE.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             "ts" => {
-                let _ = self.parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             "tsx" => {
-                let _ = self.parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             "rs" => {
-                let _ = self.parser.set_language(&tree_sitter_rust::LANGUAGE.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_rust::LANGUAGE.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             "py" | "pyw" => {
-                let _ = self.parser.set_language(&tree_sitter_python::LANGUAGE.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_python::LANGUAGE.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             "json" | "jsonc" => {
-                let _ = self.parser.set_language(&tree_sitter_json::LANGUAGE.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_json::LANGUAGE.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             "html" | "htm" => {
-                let _ = self.parser.set_language(&tree_sitter_html::LANGUAGE.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_html::LANGUAGE.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             "css" | "scss" => {
-                let _ = self.parser.set_language(&tree_sitter_css::LANGUAGE.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_css::LANGUAGE.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             "md" | "markdown" => {
-                let _ = self.parser.set_language(&tree_sitter_md::LANGUAGE.into());
+                if let Err(e) = self.parser.set_language(&tree_sitter_md::LANGUAGE.into()) {
+                    log::warn!("Failed to set tree-sitter language for extension {}: {}", ext, e);
+                }
             }
             _ => {
                 // Unknown language — no tree-sitter support
+            }
+        }
+    }
+
+    /// Extended language detection that falls through to the dynamic grammar
+    /// registry for file types not built in.
+    pub fn set_language_from_ext_with_registry(
+        &mut self,
+        ext: &str,
+        registry: &crate::grammar_registry::GrammarRegistry,
+    ) {
+        // Try built-in grammars first.
+        match ext {
+            "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "rs" | "py" | "pyw"
+            | "json" | "jsonc" | "html" | "htm" | "css" | "scss" | "md" | "markdown" => {
+                self.set_language_from_ext(ext);
+                return;
+            }
+            _ => {}
+        }
+
+        // Fall through to dynamic registry.
+        if let Some(lang) = registry.language_by_extension(ext) {
+            // `Arc<tree_sitter::Language>` — dereference to get the Language ref.
+            if let Err(e) = self.parser.set_language(&*lang) {
+                log::warn!("Failed to set dynamic tree-sitter language for '.{}': {e}", ext);
             }
         }
     }

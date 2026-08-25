@@ -7,11 +7,7 @@
   "engines": {
     "vscode": "^1.80.0"
   },
-  "activationEvents": [
-    "onCommand:corecode.helloWorld",
-    "onCommand:corecode.greet",
-    "onCommand:corecode.add"
-  ],
+  "activationEvents": [],
   "main": "./extension.js",
   "contributes": {
     "commands": [

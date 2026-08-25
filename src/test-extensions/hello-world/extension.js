@@ -33,7 +33,7 @@ function activate(context) {
 
   // Command 3: Compute and return (proves data flows back)
   const addCmd = vscode.commands.registerCommand('corecode.add', (a, b) => {
-    const result = (a || 0) + (b || 0);
+    const result = (a ?? 0) + (b ?? 0);
     return { operation: 'add', a, b, result };
   });
 

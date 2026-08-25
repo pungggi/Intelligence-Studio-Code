@@ -1,0 +1,18 @@
+[extension]
+id      = "corecode.grammar-toml"
+name    = "TOML Grammar"
+version = "0.1.0"
+
+[entry]
+wasm = "grammar_toml.wasm"
+
+[grammar]
+language-id = "toml"
+file-types  = ["toml"]
+# Path to the pre-built native tree-sitter grammar shared library.
+# To use this extension, compile tree-sitter-toml as a cdylib for your
+# host platform and place the resulting .so/.dylib/.dll here.
+# grammar-dylib = "tree-sitter-toml.so"
+
+[capabilities]
+workspace_read = false

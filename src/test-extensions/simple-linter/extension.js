@@ -117,11 +117,13 @@ function lintDocument(doc) {
     const line = lines[i];
     const trimmed = line.trim();
 
-    // Rule: console.log
+    // Rule: console.log — iterate all matches per line, skip strings/comments
     if (warnConsoleLog) {
-      const consoleMatch = line.match(/\bconsole\.(log|warn|error|debug|info)\s*\(/);
-      if (consoleMatch) {
-        const col = line.indexOf(consoleMatch[0]);
+      const consoleRe = /\bconsole\.(log|warn|error|debug|info)\s*\(/g;
+      let consoleMatch;
+      while ((consoleMatch = consoleRe.exec(line)) !== null) {
+        const col = consoleMatch.index;
+        if (isInsideString(line, col) || isInsideComment(line, col)) continue;
         diagnostics.push({
           range: {
             start: { line: i, character: col },

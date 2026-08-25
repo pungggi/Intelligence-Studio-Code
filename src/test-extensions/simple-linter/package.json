@@ -4,6 +4,22 @@
   "description": "A simple linter that checks JavaScript/TypeScript files for common issues",
   "version": "0.1.0",
   "publisher": "corecode-test",
+  "categories": [
+    "Linters",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "linter",
+    "javascript",
+    "typescript",
+    "diagnostics",
+    "code-quality"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pungggi/Intelligence-Studio-Code.git"
+  },
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -29,8 +45,10 @@
       "title": "Simple Linter",
       "properties": {
         "simpleLinter.maxLineLength": {
-          "type": "number",
+          "type": "integer",
           "default": 120,
+          "minimum": 1,
+          "maximum": 1000,
           "description": "Maximum line length before warning"
         },
         "simpleLinter.warnConsoleLog": {

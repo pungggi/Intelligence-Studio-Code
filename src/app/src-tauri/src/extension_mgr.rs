@@ -5,6 +5,23 @@ use std::path::{Path, PathBuf};
 
 /// Maximum size of a single file extracted from a VSIX archive (50 MB).
 const MAX_VSIX_FILE_SIZE: u64 = 50 * 1024 * 1024;
+/// Aggregate extraction budget across all entries — zip-bomb defence. A
+/// 50MB compressed package legitimately expands several-fold (highly
+/// compressible assets), but the total must stay bounded even when every
+/// entry is individually within `MAX_VSIX_FILE_SIZE`.
+const MAX_TOTAL_EXTRACTED_BYTES: u64 = 500 * 1024 * 1024;
+/// Entry-count cap — defends against archives of many tiny entries (inodes).
+const MAX_ARCHIVE_ENTRIES: usize = 20_000;
+
+/// Badge label shown in the UI for each host type.
+impl ExtensionKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ExtensionKind::NodeJs => "Node.js",
+            ExtensionKind::Wasm => "Native",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledExtension {
@@ -17,6 +34,14 @@ pub struct InstalledExtension {
     pub path: String,
     pub enabled: bool,
     pub installed_at: String,
+    /// Host type badge — "Native" (WASM) or "Node.js". Older registry
+    /// entries default to Node.js; recomputed from disk on every list.
+    #[serde(default = "default_kind")]
+    pub kind: String,
+}
+
+fn default_kind() -> String {
+    "Node.js".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +70,37 @@ impl ExtensionRegistry {
 pub struct ExtensionManager {
     extensions_dir: PathBuf,
     registry_path: PathBuf,
+}
+
+/// Which host type an extension directory targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionKind {
+    /// Has `package.json` — routed to the Node.js extension host.
+    NodeJs,
+    /// Has `corecode.toml` — routed to the in-process WASM host.
+    Wasm,
+}
+
+/// Detect the host type for an extension directory.
+///
+/// Returns `None` if neither manifest file is present (not a recognised extension).
+/// If both manifests are present, `Wasm` wins and a warning is logged.
+pub fn detect_kind(ext_dir: &std::path::Path) -> Option<ExtensionKind> {
+    let has_toml = ext_dir.join("corecode.toml").exists();
+    let has_pkg  = ext_dir.join("package.json").exists();
+    match (has_toml, has_pkg) {
+        (true, true) => {
+            log::warn!(
+                "Extension '{}' has both corecode.toml and package.json; \
+                 treating as WASM extension",
+                ext_dir.display()
+            );
+            Some(ExtensionKind::Wasm)
+        }
+        (true, false) => Some(ExtensionKind::Wasm),
+        (false, true) => Some(ExtensionKind::NodeJs),
+        (false, false) => None,
+    }
 }
 
 /// Validate that an extension identifier component contains no path traversal sequences.
@@ -81,10 +137,23 @@ impl ExtensionManager {
 
     fn load_registry(&self) -> ExtensionRegistry {
         match std::fs::read_to_string(&self.registry_path) {
-            Ok(contents) => {
-                serde_json::from_str(&contents).unwrap_or_else(|_| ExtensionRegistry::empty())
+            Ok(contents) => match serde_json::from_str(&contents) {
+                Ok(registry) => registry,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to parse extension registry at '{}': {e}",
+                        self.registry_path.display()
+                    );
+                    ExtensionRegistry::empty()
+                }
+            },
+            Err(e) => {
+                log::warn!(
+                    "Failed to read extension registry at '{}': {e}",
+                    self.registry_path.display()
+                );
+                ExtensionRegistry::empty()
             }
-            Err(_) => ExtensionRegistry::empty(),
         }
     }
 
@@ -97,7 +166,15 @@ impl ExtensionManager {
     }
 
     pub fn list_installed(&self) -> Vec<InstalledExtension> {
-        self.load_registry().extensions
+        // Recompute the host-type badge from disk so it reflects the actual
+        // directory contents (also upgrades pre-badge registry entries).
+        let mut extensions = self.load_registry().extensions;
+        for ext in &mut extensions {
+            if let Some(kind) = detect_kind(std::path::Path::new(&ext.path)) {
+                ext.kind = kind.label().to_string();
+            }
+        }
+        extensions
     }
 
     pub fn install_from_vsix(
@@ -129,9 +206,16 @@ impl ExtensionManager {
         let cursor = std::io::Cursor::new(vsix_bytes);
         let mut archive =
             zip::ZipArchive::new(cursor).map_err(|e| format!("Invalid VSIX archive: {e}"))?;
+        if archive.len() > MAX_ARCHIVE_ENTRIES {
+            return Err(format!(
+                "VSIX archive has {} entries (limit {MAX_ARCHIVE_ENTRIES}) — refusing",
+                archive.len()
+            ));
+        }
 
         // VSIX contains extension/ subdirectory with the actual extension files
         let mut found_extension_dir = false;
+        let mut total_extracted: u64 = 0;
         for i in 0..archive.len() {
             let mut file = archive
                 .by_index(i)
@@ -152,55 +236,9 @@ impl ExtensionManager {
                 continue;
             }
 
-            let target = install_dir.join(&relative_path);
-
-            // Security: lexical path traversal check (prevent zip-slip)
-            // We must check BEFORE creating directories or writing files.
-            // Use lexical normalization: resolve the target relative to install_dir
-            // and verify it stays within bounds. This works for paths that don't exist yet.
-            {
-                use std::path::Component;
-                let mut depth: i32 = 0;
-                for component in target.strip_prefix(&install_dir).unwrap_or(&target).components() {
-                    match component {
-                        Component::ParentDir => depth -= 1,
-                        Component::Normal(_) => depth += 1,
-                        _ => {}
-                    }
-                    if depth < 0 {
-                        log::warn!("Skipping zip entry with path traversal: {raw_name}");
-                        break;
-                    }
-                }
-                if depth < 0 {
-                    continue;
-                }
-            }
-            if let Some(parent) = target.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    log::warn!("Failed to create directory {}: {}", parent.display(), e);
-                }
-            }
-
-            if file.is_dir() {
-                std::fs::create_dir_all(&target)
-                    .map_err(|e| format!("Failed to create directory {relative_path}: {e}"))?;
-            } else {
-                // Check declared size before allocating memory
-                if file.size() > MAX_VSIX_FILE_SIZE {
-                    log::warn!("Skipping oversized file in VSIX: {relative_path}");
-                    continue;
-                }
-                let mut contents = Vec::new();
-                file.read_to_end(&mut contents)
-                    .map_err(|e| format!("Failed to read {relative_path}: {e}"))?;
-                // Double-check actual decompressed size
-                if contents.len() > MAX_VSIX_FILE_SIZE as usize {
-                    log::warn!("Skipping oversized file in VSIX: {relative_path}");
-                    continue;
-                }
-                std::fs::write(&target, &contents)
-                    .map_err(|e| format!("Failed to write {relative_path}: {e}"))?;
+            if let Err(e) = extract_zip_entry(&mut file, &raw_name, &relative_path, &install_dir, &mut total_extracted) {
+                std::fs::remove_dir_all(&install_dir).ok();
+                return Err(e);
             }
         }
 
@@ -210,6 +248,12 @@ impl ExtensionManager {
             let cursor = std::io::Cursor::new(vsix_bytes);
             let mut archive = zip::ZipArchive::new(cursor)
                 .map_err(|e| format!("Invalid VSIX archive: {e}"))?;
+            if archive.len() > MAX_ARCHIVE_ENTRIES {
+                return Err(format!(
+                    "VSIX archive has {} entries (limit {MAX_ARCHIVE_ENTRIES}) — refusing",
+                    archive.len()
+                ));
+            }
 
             for i in 0..archive.len() {
                 let mut file = archive
@@ -224,58 +268,29 @@ impl ExtensionManager {
                     continue;
                 }
 
-                let target = install_dir.join(&raw_name);
-
-                // Security: lexical path traversal check (prevent zip-slip)
-                {
-                    use std::path::Component;
-                    let mut depth: i32 = 0;
-                    for component in target.strip_prefix(&install_dir).unwrap_or(&target).components() {
-                        match component {
-                            Component::ParentDir => depth -= 1,
-                            Component::Normal(_) => depth += 1,
-                            _ => {}
-                        }
-                        if depth < 0 {
-                            break;
-                        }
-                    }
-                    if depth < 0 {
-                        log::warn!("Skipping zip entry with path traversal: {raw_name}");
-                        continue;
-                    }
-                }
-
-                if let Some(parent) = target.parent() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        log::warn!("Failed to create directory {}: {}", parent.display(), e);
-                    }
-                }
-
-                if file.is_dir() {
-                    std::fs::create_dir_all(&target).ok();
-                } else {
-                    if file.size() > MAX_VSIX_FILE_SIZE {
-                        log::warn!("Skipping oversized file in VSIX: {raw_name}");
-                        continue;
-                    }
-                    let mut contents = Vec::new();
-                    file.read_to_end(&mut contents)
-                        .map_err(|e| format!("Failed to read {raw_name}: {e}"))?;
-                    if contents.len() <= MAX_VSIX_FILE_SIZE as usize {
-                        std::fs::write(&target, &contents)
-                            .map_err(|e| format!("Failed to write {raw_name}: {e}"))?;
-                    }
+                if let Err(e) = extract_zip_entry(&mut file, &raw_name, &raw_name, &install_dir, &mut total_extracted) {
+                    std::fs::remove_dir_all(&install_dir).ok();
+                    return Err(e);
                 }
             }
         }
 
-        // Validate package.json exists
-        let package_json = install_dir.join("package.json");
-        if !package_json.exists() {
+        // Validate that at least one recognised manifest exists (package.json for Node.js
+        // extensions, corecode.toml for WASM extensions).
+        let has_package_json = install_dir.join("package.json").exists();
+        let has_corecode_toml = install_dir.join("corecode.toml").exists();
+        if !has_package_json && !has_corecode_toml {
             std::fs::remove_dir_all(&install_dir).ok();
-            return Err("Invalid extension: package.json not found after extraction".to_string());
+            return Err(
+                "Invalid extension: neither package.json nor corecode.toml found after extraction"
+                    .to_string(),
+            );
         }
+
+        // Determine host type from what actually landed on disk
+        let kind = detect_kind(&install_dir)
+            .map(|k| k.label().to_string())
+            .unwrap_or_else(default_kind);
 
         let now = chrono_now_iso();
         let installed = InstalledExtension {
@@ -288,6 +303,7 @@ impl ExtensionManager {
             path: install_dir.to_string_lossy().to_string(),
             enabled: true,
             installed_at: now,
+            kind,
         };
 
         // Update registry
@@ -325,6 +341,98 @@ impl ExtensionManager {
             .map(|e| (e.id, e.version))
             .collect()
     }
+}
+
+/// Extract a single ZIP entry into `install_dir`.
+///
+/// * `file`         – the open `ZipFile` to read from.
+/// * `raw_name`     – the original name stored in the archive (used in log/error messages).
+/// * `relative_path`– the path to write relative to `install_dir` (may equal `raw_name`).
+/// * `install_dir`  – the root directory for the installation.
+///
+/// Returns `Ok(())` if the entry was extracted (or safely skipped due to traversal/size),
+/// or an `Err` string if an I/O error occurred that should abort the whole install.
+fn extract_zip_entry(
+    file: &mut zip::read::ZipFile<'_>,
+    raw_name: &str,
+    relative_path: &str,
+    install_dir: &Path,
+    total_extracted: &mut u64,
+) -> Result<(), String> {
+    let target = install_dir.join(relative_path);
+
+    // Security: zip-slip prevention (two layers).
+    // 1. Lexical depth check rejects `..` sequences.
+    // 2. Canonical prefix check catches absolute paths and symlink tricks.
+    {
+        use std::path::Component;
+        let stripped = match target.strip_prefix(install_dir) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => {
+                // target is not under install_dir (e.g. absolute path in zip entry)
+                log::warn!("Skipping zip entry outside install dir: {raw_name}");
+                return Ok(());
+            }
+        };
+        let mut depth: i32 = 0;
+        for component in stripped.components() {
+            match component {
+                Component::ParentDir => depth -= 1,
+                Component::Normal(_) => depth += 1,
+                _ => {}
+            }
+            if depth < 0 {
+                break;
+            }
+        }
+        if depth < 0 {
+            log::warn!("Skipping zip entry with path traversal: {raw_name}");
+            return Ok(());
+        }
+    }
+
+    if let Some(parent) = target.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::warn!("Failed to create directory {}: {}", parent.display(), e);
+        }
+    }
+
+    if file.is_dir() {
+        std::fs::create_dir_all(&target)
+            .map_err(|e| format!("Failed to create directory {relative_path}: {e}"))?;
+    } else {
+        // Check declared size before allocating memory.
+        if file.size() > MAX_VSIX_FILE_SIZE {
+            log::warn!("Skipping oversized file in VSIX: {relative_path}");
+            return Ok(());
+        }
+        let mut contents = Vec::new();
+        // Cap the read to MAX_VSIX_FILE_SIZE to prevent unbounded allocation
+        // even if the declared size was tampered with.
+        file.by_ref()
+            .take(MAX_VSIX_FILE_SIZE)
+            .read_to_end(&mut contents)
+            .map_err(|e| format!("Failed to read {relative_path}: {e}"))?;
+        // Detect truncation: if the read filled the entire budget, the file
+        // was likely larger than MAX_VSIX_FILE_SIZE and was silently cut off.
+        if contents.len() as u64 >= MAX_VSIX_FILE_SIZE {
+            log::warn!("Skipping oversized/truncated file in VSIX: {relative_path}");
+            return Ok(());
+        }
+        std::fs::write(&target, &contents)
+            .map_err(|e| format!("Failed to write {relative_path}: {e}"))?;
+        // Aggregate zip-bomb defence: every individually-permitted entry
+        // still counts against the total budget for the whole archive.
+        *total_extracted += contents.len() as u64;
+        if *total_extracted > MAX_TOTAL_EXTRACTED_BYTES {
+            return Err(format!(
+                "VSIX archive exceeds {}MB total extracted (zip bomb?) — install aborted",
+                MAX_TOTAL_EXTRACTED_BYTES / (1024 * 1024)
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn chrono_now_iso() -> String {

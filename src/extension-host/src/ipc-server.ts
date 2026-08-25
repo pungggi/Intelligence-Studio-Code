@@ -13,11 +13,17 @@
 import { createServer, Server, Socket } from "net";
 import { timingSafeEqual } from "node:crypto";
 
+export function tokensMatch(provided: string | null | undefined, expected: string): boolean {
+  if (provided == null) return false;
+  if (provided.length !== expected.length) return false;
+  return timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+}
+
 const IPC_HOST = "127.0.0.1";
 const IPC_PORT = parseInt(process.env.CORECODE_IPC_PORT ?? "0", 10);
 
 /** Maximum IPC frame size (10 MB). Must match Rust side. */
-const MAX_FRAME_SIZE = 10 * 1024 * 1024;
+export const MAX_FRAME_SIZE = 10 * 1024 * 1024;
 
 /** Timeout for authentication handshake (5 seconds). */
 const AUTH_TIMEOUT_MS = 5000;
@@ -37,6 +43,7 @@ export class IpcServer {
   private bufferLength: number = 0;
   private host: string;
   private port: number;
+  private actualPort: number = 0;
   private authToken: string;
   private authenticated: boolean = false;
   private authTimer: ReturnType<typeof setTimeout> | null = null;
@@ -47,7 +54,7 @@ export class IpcServer {
     this.authToken = authToken ?? "";
   }
 
-  async start(): Promise<void> {
+  async start(): Promise<number> {
     return new Promise((resolve, reject) => {
       this.server = createServer((socket: Socket) => {
         console.log("[IPC] Frontend connected");
@@ -87,6 +94,8 @@ export class IpcServer {
           console.log("[IPC] Frontend disconnected");
           this.client = null;
           this.authenticated = false;
+          this.bufferChunks = [];
+          this.bufferLength = 0;
           if (this.authTimer) {
             clearTimeout(this.authTimer);
             this.authTimer = null;
@@ -99,7 +108,11 @@ export class IpcServer {
       });
 
       this.server.listen(this.port, this.host, () => {
-        resolve();
+        const addr = this.server!.address();
+        if (addr && typeof addr === "object") {
+          this.actualPort = addr.port;
+        }
+        resolve(this.actualPort);
       });
 
       this.server.on("error", reject);
@@ -143,17 +156,20 @@ export class IpcServer {
       this.bufferChunks = remaining.length > 0 ? [remaining] : [];
       this.bufferLength = remaining.length;
 
+      let msg: IpcMessage;
       try {
-        const msg: IpcMessage = JSON.parse(payload.toString("utf-8"));
+        msg = JSON.parse(payload.toString("utf-8"));
+      } catch (err) {
+        console.error("[IPC] Failed to parse message:", err, "raw payload:", payload.toString("utf-8"));
+        continue;
+      }
 
+      try {
         // Gate on authentication: first message must be ipc/auth with correct token
         if (!this.authenticated) {
           if (msg.method === "ipc/auth" && this.authToken) {
             const providedToken = (msg.params as { token?: string })?.token;
-            const tokensMatch = providedToken != null &&
-              providedToken.length === this.authToken.length &&
-              timingSafeEqual(Buffer.from(providedToken), Buffer.from(this.authToken));
-            if (tokensMatch) {
+            if (tokensMatch(providedToken, this.authToken)) {
               this.authenticated = true;
               if (this.authTimer) {
                 clearTimeout(this.authTimer);
@@ -179,7 +195,7 @@ export class IpcServer {
 
         this.messageHandler?.(msg);
       } catch (err) {
-        console.error("[IPC] Failed to parse message:", err);
+        console.error("[IPC] Runtime error handling message:", err);
       }
     }
 
@@ -199,6 +215,10 @@ export class IpcServer {
   /** Send a JSON message with length-prefix framing. */
   send(msg: IpcMessage): void {
     if (!this.client || this.client.destroyed) return;
+    if (!this.authenticated) {
+      console.warn("[IPC] Dropping outgoing message — client not authenticated");
+      return;
+    }
 
     const json = Buffer.from(JSON.stringify(msg), "utf-8");
 
@@ -217,6 +237,10 @@ export class IpcServer {
 
   isConnected(): boolean {
     return this.client !== null && !this.client.destroyed;
+  }
+
+  getPort(): number {
+    return this.actualPort;
   }
 
   async stop(): Promise<void> {

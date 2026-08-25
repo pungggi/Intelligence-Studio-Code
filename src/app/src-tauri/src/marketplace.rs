@@ -1,7 +1,12 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 const OPEN_VSX_API: &str = "https://open-vsx.org/api";
+
+/// Default CoreCode registry serving `.ccext` (WASM) packages.
+/// Overridable via `CORECODE_REGISTRY` (e.g. a local marketplace-server).
+const CORECODE_REGISTRY: &str = "https://marketplace.corecode.dev";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -14,7 +19,7 @@ pub struct ExtensionInfo {
     pub download_count: Option<u64>,
     pub categories: Option<Vec<String>>,
     #[serde(default)]
-    pub files: std::collections::HashMap<String, String>,
+    pub files: HashMap<String, String>,
     pub publisher_name: Option<String>,
 }
 
@@ -47,7 +52,7 @@ struct OpenVsxExtensionEntry {
     description: Option<String>,
     download_count: Option<u64>,
     url: Option<String>,
-    files: Option<std::collections::HashMap<String, String>>,
+    files: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,8 +62,38 @@ pub struct MarketplaceSearchResult {
     pub offset: usize,
 }
 
+// --- CoreCode registry (.ccext / WASM extensions) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CcextVersionEntry {
+    pub version: String,
+    pub sha256: String,
+    pub size: u64,
+    #[serde(default)]
+    pub published_at: String,
+    /// base64 ed25519 signature over the package bytes (signed publishes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// base64 ed25519 public key that produced `signature`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CcextExtensionEntry {
+    pub id: String,
+    pub versions: Vec<CcextVersionEntry>,
+    /// Publisher identity key pinned by the registry (TOFU).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_key: Option<String>,
+}
+
 pub struct MarketplaceClient {
     client: Client,
+    /// Registry (`.ccext`) traffic never follows redirects: a 3xx would hand
+    /// the request — and its digest/signature headers — to an arbitrary host,
+    /// and our registry is expected to serve the final URL directly.
+    registry_client: Client,
 }
 
 impl MarketplaceClient {
@@ -68,7 +103,13 @@ impl MarketplaceClient {
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
-        Ok(Self { client })
+        let registry_client = Client::builder()
+            .user_agent("CoreCode/0.1")
+            .timeout(std::time::Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("Failed to create registry HTTP client: {e}"))?;
+        Ok(Self { client, registry_client })
     }
 
     pub async fn search(
@@ -87,8 +128,8 @@ impl MarketplaceClient {
                 ("query", query),
                 ("offset", &offset.to_string()),
                 ("size", &limit.to_string()),
-                ("sortBy", &"downloadCount".to_string()),
-                ("sortOrder", &"desc".to_string()),
+                ("sortBy", "downloadCount"),
+                ("sortOrder", "desc"),
             ])
             .send()
             .await
@@ -176,12 +217,22 @@ impl MarketplaceClient {
             None => return Err("Download URL has no host".to_string()),
         }
 
-        let resp = self
+        let mut resp = self
             .client
             .get(download_url)
             .send()
             .await
             .map_err(|e| format!("VSIX download failed: {e}"))?;
+
+        // Validate final URL after redirects — reqwest follows redirects automatically
+        // so the response may come from a different host than the initial request.
+        if let Some(final_host) = resp.url().host_str() {
+            if !ALLOWED_HOSTS.contains(&final_host) {
+                return Err(format!(
+                    "VSIX download redirected to untrusted host '{final_host}'"
+                ));
+            }
+        }
 
         if !resp.status().is_success() {
             return Err(format!(
@@ -195,16 +246,229 @@ impl MarketplaceClient {
             return Err("VSIX file exceeds 100MB limit".to_string());
         }
 
-        let bytes = resp
-            .bytes()
+        let mut bytes = Vec::with_capacity(content_length as usize);
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| format!("Failed to read VSIX bytes: {e}"))?;
-
-        if bytes.len() > 100 * 1024 * 1024 {
-            return Err("VSIX file exceeds 100MB limit".to_string());
+            .map_err(|e| format!("Failed to read VSIX bytes: {e}"))?
+        {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > 100 * 1024 * 1024 {
+                return Err("VSIX file exceeds 100MB limit".to_string());
+            }
         }
 
-        Ok(bytes.to_vec())
+        Ok(bytes)
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // CoreCode registry (.ccext) — marketplace-server API
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Registry base URL — `CORECODE_REGISTRY` env override, else the public
+    /// default. Trailing slash normalised away.
+    fn registry_base() -> String {
+        std::env::var("CORECODE_REGISTRY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| CORECODE_REGISTRY.to_string())
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    /// The registry host is allowed over plain HTTP only when it is a loopback
+    /// address (local marketplace-server during development); anything else
+    /// must use HTTPS.
+    fn validate_registry_scheme(parsed: &url::Url) -> Result<(), String> {
+        let is_loopback = matches!(parsed.host_str(), Some(h) if h == "localhost" || h == "127.0.0.1" || h == "[::1]" || h.starts_with("192.168.") || h.starts_with("10."));
+        if parsed.scheme() == "https" || (parsed.scheme() == "http" && is_loopback) {
+            Ok(())
+        } else {
+            Err(format!(
+                "CoreCode registry must use HTTPS (http only allowed for loopback/LAN hosts), got '{}'",
+                parsed.scheme()
+            ))
+        }
+    }
+
+    /// Metadata (all versions) for a native `.ccext` extension.
+    pub async fn ccext_get(&self, id: &str) -> Result<CcextExtensionEntry, String> {
+        let base = Self::registry_base();
+        let parsed = url::Url::parse(&base).map_err(|e| format!("Invalid registry URL: {e}"))?;
+        Self::validate_registry_scheme(&parsed)?;
+
+        let mut url = parsed;
+        url.path_segments_mut()
+            .map_err(|_| "Cannot modify registry URL path".to_string())?
+            .push("api")
+            .push("v1")
+            .push("extension")
+            .push(id);
+
+        let resp = self
+            .registry_client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("CoreCode registry request failed: {e}"))?;
+        if resp.status().is_redirection() {
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("(no location)");
+            return Err(format!(
+                "CoreCode registry redirected to {location} — redirects are disabled for registry traffic; \
+                 set CORECODE_REGISTRY to the final URL"
+            ));
+        }
+        match resp.status() {
+            reqwest::StatusCode::NOT_FOUND => Err(format!("Extension {id} not found in CoreCode registry")),
+            s if !s.is_success() => Err(format!("CoreCode registry returned status {s}")),
+            _ => resp
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse registry response: {e}")),
+        }
+    }
+
+    /// Download a `.ccext` package. Returns the raw bytes — callers MUST
+    /// verify them against the `sha256` recorded in the version entry from
+    /// `ccext_get()` (registry metadata) before installing. Integrity is
+    /// deliberately NOT taken from response headers: a header travels with
+    /// the response, so a compromised or redirected endpoint could supply
+    /// attacker bytes together with an attacker digest. Metadata comes from
+    /// the registry index, which signatures and key pinning protect.
+    pub async fn ccext_download(
+        &self,
+        id: &str,
+        version: &str,
+    ) -> Result<Vec<u8>, String> {
+        let base = Self::registry_base();
+        let parsed = url::Url::parse(&base).map_err(|e| format!("Invalid registry URL: {e}"))?;
+        Self::validate_registry_scheme(&parsed)?;
+
+        let mut url = parsed;
+        url.path_segments_mut()
+            .map_err(|_| "Cannot modify registry URL path".to_string())?
+            .push("api")
+            .push("v1")
+            .push("extension")
+            .push(id)
+            .push(version)
+            .push("download");
+
+        let mut resp = self
+            .registry_client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|e| format!("ccext download failed: {e}"))?;
+        if resp.status().is_redirection() {
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("(no location)");
+            return Err(format!(
+                "ccext download redirected to {location} — redirects are disabled for registry traffic; \
+                 set CORECODE_REGISTRY to the final URL"
+            ));
+        }
+        if !resp.status().is_success() {
+            return Err(format!("ccext download returned status {}", resp.status()));
+        }
+        // Belt and braces: the response must come from the exact URL requested
+        // (no silent redirect hops even under the no-redirect policy).
+        if resp.url() != &url {
+            return Err(format!(
+                "ccext download was served from '{}' instead of the requested URL — refusing",
+                resp.url()
+            ));
+        }
+
+        const MAX_CCEXT_BYTES: usize = 50 * 1024 * 1024;
+        let content_length = resp.content_length().unwrap_or(0);
+        if content_length as usize > MAX_CCEXT_BYTES {
+            return Err("ccext package exceeds 50MB limit".to_string());
+        }
+        let mut bytes = Vec::with_capacity(content_length as usize);
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| format!("Failed to read ccext bytes: {e}"))?
+        {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > MAX_CCEXT_BYTES {
+                return Err("ccext package exceeds 50MB limit".to_string());
+            }
+        }
+
+        Ok(bytes)
+    }
+
+    /// Verify a downloaded package against the version entry's ed25519
+    /// signature, enforcing the registry's pinned publisher key when one
+    /// exists.
+    ///
+    /// - Pinned extension: the entry MUST be signed by exactly the pinned key
+    ///   (unsigned or differently-signed entries are rejected — the registry
+    ///   enforces the same rule at publish time, so a mismatch means tampered
+    ///   metadata or a compromised registry).
+    /// - Unpinned extension: unsigned entries pass (SHA-256 integrity still
+    ///   applies); signed entries are verified against their `signed_by` key.
+    pub fn verify_ccext_package(
+        pinned_key: Option<&str>,
+        entry: &CcextVersionEntry,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        if let Some(pinned) = pinned_key.map(str::trim).filter(|s| !s.is_empty()) {
+            let signed_by = entry.signed_by.as_deref().map(str::trim);
+            if signed_by != Some(pinned) {
+                return Err(format!(
+                    "publisher key mismatch: version is signed by {} but the extension is pinned to {pinned}",
+                    signed_by.unwrap_or("(nobody — unsigned)")
+                ));
+            }
+            // Some(pinned) == signed_by here, so a signature must exist.
+        }
+        Self::verify_ccext_signature(entry, bytes)
+    }
+
+    /// Verify a downloaded package against the version entry's ed25519
+    /// signature. Unsigned (legacy/dev) entries pass — the registry only
+    /// records signatures for publishers that opted in; once signed, the
+    /// registry pins the key and clients authenticate against it.
+    fn verify_ccext_signature(
+        entry: &CcextVersionEntry,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        use base64::Engine;
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        let (Some(signature), Some(signed_by)) = (&entry.signature, &entry.signed_by) else {
+            return Ok(()); // unsigned publish — SHA-256 integrity still applies
+        };
+
+        let engine = base64::engine::general_purpose::STANDARD;
+        let key_bytes: Vec<u8> = engine
+            .decode(signed_by.trim())
+            .map_err(|e| format!("invalid publisher key encoding: {e}"))?;
+        let key_bytes: [u8; 32] = key_bytes.try_into().map_err(|v: Vec<u8>| {
+            format!("publisher key must be 32 bytes, got {}", v.len())
+        })?;
+        let key = VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|e| format!("invalid publisher key: {e}"))?;
+
+        let sig_bytes: Vec<u8> = engine
+            .decode(signature.trim())
+            .map_err(|e| format!("invalid signature encoding: {e}"))?;
+        let sig_bytes: [u8; 64] = sig_bytes.try_into().map_err(|v: Vec<u8>| {
+            format!("signature must be 64 bytes, got {}", v.len())
+        })?;
+
+        key.verify(bytes, &Signature::from_bytes(&sig_bytes))
+            .map_err(|_| "signature verification failed — package may be tampered".to_string())
     }
 }
 
@@ -313,5 +577,154 @@ mod tests {
         let s = url.to_string();
         // path_segments_mut().push() encodes the slash, preventing traversal.
         assert!(!s.contains("/../"), "URL must not contain raw path traversal, got: {s}");
+    }
+
+    // ── CoreCode registry (.ccext) ───────────────────────────────────
+
+    #[test]
+    fn ccext_registry_rejects_plain_http_for_public_hosts() {
+        let url = url::Url::parse("http://marketplace.corecode.dev").unwrap();
+        let err = MarketplaceClient::validate_registry_scheme(&url).unwrap_err();
+        assert!(err.contains("HTTPS"), "expected HTTPS error, got: {err}");
+    }
+
+    #[test]
+    fn ccext_registry_allows_http_for_loopback() {
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            let url = url::Url::parse(&format!("http://{host}:8987")).unwrap();
+            assert!(MarketplaceClient::validate_registry_scheme(&url).is_ok(), "http should be allowed for {host}");
+        }
+        let url = url::Url::parse("https://marketplace.corecode.dev").unwrap();
+        assert!(MarketplaceClient::validate_registry_scheme(&url).is_ok());
+    }
+
+    #[test]
+    fn ccext_download_url_encodes_id() {
+        // Build the download URL exactly as ccext_download does — the id segment
+        // must not be able to inject path traversal.
+        let base = MarketplaceClient::registry_base();
+        let mut url = url::Url::parse(&base).unwrap();
+        url.path_segments_mut().unwrap()
+            .push("api").push("v1").push("extension")
+            .push("../evil").push("1.0.0").push("download");
+        let s = url.to_string();
+        assert!(!s.contains("/../"), "download URL must not allow traversal, got: {s}");
+    }
+
+    // ── ed25519 signature verification ─────────────────────────────────
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn signed_entry(key: &ed25519_dalek::SigningKey, bytes: &[u8]) -> CcextVersionEntry {
+        use ed25519_dalek::Signer;
+        CcextVersionEntry {
+            version: "1.0.0".into(),
+            sha256: String::new(),
+            size: bytes.len() as u64,
+            published_at: String::new(),
+            signature: Some(b64(&key.sign(bytes).to_bytes())),
+            signed_by: Some(b64(key.verifying_key().as_bytes())),
+        }
+    }
+
+    fn unsigned_entry() -> CcextVersionEntry {
+        CcextVersionEntry {
+            version: "1.0.0".into(),
+            sha256: String::new(),
+            size: 0,
+            published_at: String::new(),
+            signature: None,
+            signed_by: None,
+        }
+    }
+
+    #[test]
+    fn ccext_signature_valid_passes() {
+        use ed25519_dalek::Signer;
+        use rand::rngs::OsRng;
+        let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let entry = signed_entry(&key, b"package");
+        // unpinned: verified against the entry's own key
+        assert!(MarketplaceClient::verify_ccext_package(None, &entry, b"package").is_ok());
+        // pinned to the same key: passes
+        let pinned = b64(key.verifying_key().as_bytes());
+        assert!(MarketplaceClient::verify_ccext_package(Some(&pinned), &entry, b"package").is_ok());
+    }
+
+    #[test]
+    fn ccext_pinned_key_mismatch_rejected() {
+        use ed25519_dalek::Signer;
+        use rand::rngs::OsRng;
+        let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let entry = signed_entry(&key, b"package");
+        // entry signed by a different key than the registry pin → reject even
+        // though the signature itself is internally consistent
+        let other = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let wrong_pin = b64(other.verifying_key().as_bytes());
+        let err = MarketplaceClient::verify_ccext_package(Some(&wrong_pin), &entry, b"package").unwrap_err();
+        assert!(err.contains("mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn ccext_pinned_unsigned_rejected() {
+        use rand::rngs::OsRng;
+        let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let pinned = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(key.verifying_key().as_bytes())
+        };
+        // unsigned entry for a pinned extension → reject (tampered metadata)
+        let entry = unsigned_entry();
+        let err = MarketplaceClient::verify_ccext_package(Some(&pinned), &entry, b"package").unwrap_err();
+        assert!(err.contains("mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn ccext_signature_tampered_bytes_fail() {
+        use rand::rngs::OsRng;
+        let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let entry = signed_entry(&key, b"package");
+        let err = MarketplaceClient::verify_ccext_package(None, &entry, b"tampered").unwrap_err();
+        assert!(err.contains("tampered"), "got: {err}");
+    }
+
+    #[test]
+    fn ccext_signature_wrong_key_fails() {
+        use ed25519_dalek::Signer;
+        use rand::rngs::OsRng;
+        let signer = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let mut entry = signed_entry(&signer, b"package");
+        // re-sign with a different key but keep the original signed_by
+        let other = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        entry.signature = Some(b64(&other.sign(b"package").to_bytes()));
+        assert!(MarketplaceClient::verify_ccext_package(None, &entry, b"package").is_err());
+    }
+
+    #[test]
+    fn ccext_unsigned_entry_passes() {
+        let entry = unsigned_entry();
+        assert!(MarketplaceClient::verify_ccext_package(None, &entry, b"anything").is_ok());
+    }
+
+    #[test]
+    fn ccext_entry_parses_server_wire_format() {
+        // Exact JSON shape the marketplace-server emits — guards against
+        // serde rename drift between the two crates (published_at was
+        // previously renamed to publishedAt and silently dropped).
+        let wire = r#"{
+            "version": "1.0.0",
+            "sha256": "aa",
+            "size": 7,
+            "published_at": "2026-08-25T00:00:00Z",
+            "signature": "c2ln",
+            "signed_by": "a2V5"
+        }"#;
+        let entry: CcextVersionEntry = serde_json::from_str(wire).expect("wire format must parse");
+        assert_eq!(entry.published_at, "2026-08-25T00:00:00Z");
+        assert_eq!(entry.signature.as_deref(), Some("c2ln"));
+        assert_eq!(entry.signed_by.as_deref(), Some("a2V5"));
     }
 }

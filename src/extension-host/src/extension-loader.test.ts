@@ -17,7 +17,6 @@ import { tmpdir } from "node:os";
 interface ExtensionManifest {
   name?: unknown;
   version?: unknown;
-  publisher?: string;
 }
 
 function validateManifest(manifest: ExtensionManifest): void {
@@ -172,7 +171,11 @@ describe("extension-loader isActive flag", () => {
     }
     if (ext.context) {
       for (const sub of ext.context.subscriptions) {
-        try { sub.dispose(); } catch { /* ignore */ }
+        try {
+          sub.dispose();
+        } catch (err) {
+          console.warn(`[ExtLoader] Error disposing subscription in mock:`, err);
+        }
       }
     }
 
@@ -193,7 +196,11 @@ describe("extension-loader isActive flag", () => {
 
     assert.doesNotThrow(() => {
       for (const sub of ext.context.subscriptions) {
-        try { sub.dispose(); } catch { /* ignore */ }
+        try {
+          sub.dispose();
+        } catch (err) {
+          console.warn(`[ExtLoader] Error disposing subscription in mock:`, err);
+        }
       }
     });
   });

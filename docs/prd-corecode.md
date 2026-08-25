@@ -1,25 +1,27 @@
 # Product Requirements Document (PRD)
 
-**Projektname:** CoreCode (Arbeitstitel)
-**Dokumentenstatus:** Überarbeitete Definition / Architektur-Konzept
-**Letztes Update:** 26. März 2026
-**Version:** 1.1 (überarbeitet auf Basis des initialen Reviews)
+**Projektname:** CoreCode (Arbeitstititel)
+**Dokumentenstatus:** Überarbeitete Definition / Architektur-Konzept mit AI-Strategie
+**Letztes Update:** 25. Mai 2026
+**Version:** 2.0 (inkl. AI-Native Strategy + pi.dev Integration)
 
 ---
 
 ## 1. Executive Summary & Vision
 
-**Vision:** Entwicklung eines hybriden, extrem performanten Code-Editors, der die Geschwindigkeit und Ressourceneffizienz einer nativen Applikation mit dem weitreichenden Ökosystem der Visual Studio Code-Erweiterungen vereint.
+**Vision:** Entwicklung eines hybriden, extrem performanten **AI-native Code-Editors**, der die Geschwindigkeit und Ressourceneffizienz einer nativen Applikation mit dem weitreichenden Ökosystem der Visual Studio Code-Erweiterungen vereint — und gleichzeitig eine tief integrierte, kontextbewusste KI-Erfahrung bietet.
 
-**Das Problem:** Traditionelle Electron-basierte Editoren (wie VS Code) leiden unter hohem RAM-Bedarf und langsamen Startzeiten aufgrund der gebündelten Chromium- und Node.js-Prozesse für das UI. Native Editoren (wie Zed) sind performant, haben aber kein vergleichbares Extension-Ökosystem.
+**Das Problem:** Traditionelle Electron-basierte Editoren (wie VS Code) leiden unter hohem RAM-Bedarf und langsamen Startzeiten aufgrund der gebündelten Chromium- und Node.js-Prozesse für das UI. Native Editoren (wie Zed) sind performant, haben aber kein vergleichbares Extension-Ökosystem. AI-first Editoren (Cursor, Windsurf) sind oft proprietär und schwer erweiterbar.
 
-**Die Lösung:** Eine strikte Entkopplung ("Frankenstein"-Architektur). Das Rendering und die UI-Logik erfolgen in einer nativen, speichersicheren Umgebung (Rust/GPU-beschleunigt). Die VS Code-Erweiterungen laufen in einem isolierten, unsichtbaren Node.js-Hintergrundprozess (dem Extension Host). Die massive Fleißarbeit der API-Anbindung wird durch eine gestufte KI-Agenten-Pipeline mit manueller Qualitätssicherung gelöst.
+**Die Lösung:** Eine strikte Entkopplung ("Frankenstein"-Architektur). Das Rendering und die UI-Logik erfolgen in einer nativen, speichersicheren Umgebung (Rust/GPU-beschleunigt). Die VS Code-Erweiterungen laufen in einem isolierten, unsichtbaren Node.js-Hintergrundprozess (dem Extension Host). Zusätzlich wird eine **AI Context Engine** + **pi.dev** als primäres Agenten-Framework integriert, um kontextreiche, agenten-basierte Workflows nativ zu ermöglichen. Die massive Fleißarbeit der API-Anbindung wird durch eine gestufte KI-Agenten-Pipeline mit manueller Qualitätssicherung gelöst.
+
+**Neu in v2.0:** CoreCode wird zu einer **AI-native Plattform** — KI ist kein Add-on, sondern ein erster Bürger der Architektur.
 
 ---
 
 ## 2. Systemarchitektur
 
-Das System besteht aus vier isolierten Kernkomponenten:
+Das System besteht aus fünf isolierten Kernkomponenten:
 
 ### 2.1. Natives Frontend (Der "Körper")
 
@@ -34,7 +36,7 @@ Das System besteht aus vier isolierten Kernkomponenten:
 
 ### 2.2. Text-Editing Engine (Das "Herz")
 
-* **Text-Buffer:** Rope-Datenstruktur (basierend auf `ropey` oder eigenem Implementation).
+* **Text-Buffer:** Rope-Datenstruktur (basierend auf `ropey` oder eigener Implementation).
   * *Begründung:* O(log n) für Einfüge-/Löschoperationen, effiziente Zeilenindexierung, bewährt bei Zed und Lapce.
 * **Syntax Highlighting:** Tree-sitter für inkrementelles Parsing.
   * *Begründung:* Fehlertolerant, inkrementell (nur geänderte Bereiche werden neu geparst), sprach-agnostisch durch Grammar-Dateien.
@@ -71,7 +73,26 @@ Das System besteht aus vier isolierten Kernkomponenten:
   ```
   Natives Frontend ←→ IPC-Brücke ←→ Extension Host ←→ LSP-Server
   ```
-* **Optimierung:** Diagnostics (Fehler/Warnungen) und Completion-Ergebnisse werden vom Extension Host gecacht und nur Deltas ans Frontend übertragen.
+* **Optimierung:** Diagnostics (Fehlermeldungen) und Completion-Ergebnisse werden vom Extension Host gecacht und nur Deltas ans Frontend übertragen.
+
+### 2.6. AI Context Engine + pi.dev (Der "Intuitionsteil") — NEU in v2.0
+
+* **Technologie:** pi.dev als primäres Agenten-Framework, integriert als WASM-Modul oder via dediziertem Node.js-Host.
+* **Zuständigkeiten:**
+  * **Context Extraction:** Extraktion strukturierter Kontexte aus dem aktuellen Buffer (Rope-Snapshot), umgebenden Dateien, Tree-sitter AST, LSP-Symbolen und Workspace-Index.
+  * **pi Integration:** pi als primärer Coding Agent für inline Completions, Chat, Natural-Language-Commands und agenten-basierte Workflows.
+  * **Streaming & Debouncing:** Latenzoptimierte Streaming-Antworten (< 200ms für Completions).
+  * **Multi-Agent Orchestrierung:** Fähigkeit, mehrere pi-Agents parallel zu koordinieren (Planer, Coder, Reviewer, Tester).
+  * **On-Device vs. Cloud:** Unterstützung lokaler Modelle (z.B. via Ollama, llama.cpp) sowie Cloud-Provider (OpenAI, Anthropic, Groq) mit einheitlicher API.
+* **Sicherheitsmodell:**
+  * Explizite User-Bestätigung bei Datei-Änderungen durch Agents.
+  * Capability-basiertes System: `ai_context_read`, `ai_generate`, `ai_agent_spawn`.
+  * Context-Filtering (z.B. keine Geheimnisse aus `.env`).
+
+**Begründung für pi.dev:**
+- pi ist speziell für hybride Rust + Node.js + WASM-Projekte optimiert.
+- Bietet bereits fertige Patterns für Agenten-Orchestrierung, Tool-Use und TUI-Integration.
+- Ermöglicht es, CoreCode selbst mit pi zu entwickeln (Self-Hosting-Effekt).
 
 ---
 
@@ -112,7 +133,40 @@ Die ~20 kritischsten APIs werden handschriftlich implementiert und dienen als Re
 
 ---
 
-## 4. Nicht-funktionale Anforderungen
+## 4. AI-Strategie (NEU in v2.0)
+
+### 4.1 Kern-Use-Cases (priorisiert)
+
+| Priorität | Use-Case                        | Beschreibung                                                                 | UX-Modell                  |
+|-----------|---------------------------------|------------------------------------------------------------------------------|----------------------------|
+| P0        | Inline Completions              | Ghost-Text Vorschläge während des Tippens                                    | Cursor-ähnlich             |
+| P0        | Explain Code                    | Natürlichsprachige Erklärung markierten Codes                                | Sidebar + Inline Highlights |
+| P0        | Generate Tests                  | Unit-/Integrationstests aus vorhandenem Code generieren                      | Diff-Preview + Accept      |
+| P1        | Natural Language Commands       | "Refactor this to async", "Add error handling", "Extract to function"        | Command Palette            |
+| P1        | Chat Sidebar                    | Konversation mit Projektkontext (ähnlich Copilot Chat)                       | Side Panel                 |
+| P1        | Intelligent Diagnostics         | KI-gestützte Erklärungen von LSP-Diagnostics + Auto-Fixes                    | Gutter + Quick Fix         |
+| P2        | Multi-File Refactoring          | Agent plant und führt projektweite Refactorings aus (mit Confirmation)       | Plan-Review UI             |
+| P2        | Agent Workflows                 | "Implement Feature X" → Planer + Coder + Reviewer + Tester                   | TUI / Sidebar              |
+
+### 4.2 Context-Engine Anforderungen
+
+* **Rope Snapshot:** Snapshot des aktuellen Buffers bei AI-Aufruf (inkl. Cursor-Position, Selektion).
+* **Tree-sitter AST:** Strukturierte Repräsentation der umgebenden Funktion/Klasse.
+* **LSP Symbols:** Verfügbare Symbole im Scope (via Language Server).
+* **Workspace Index:** Leichter Datei- und Symbol-Index (Dateiname, Exports, Imports).
+* **File Context:** Relevante umgebende Dateien (max. 3–5 Dateien, configurable).
+* **Privacy Filter:** Automatisches Entfernen von Geheimnissen (`.env`, Private Keys) aus dem Context.
+
+### 4.3 pi.dev als primäres Agenten-Framework
+
+* **Integration Point:** pi läuft als WASM-Modul (in-process) oder als dedizierter Node.js Prozess.
+* **WIT API Erweiterung:** Neue Interfaces für AI-Context-Queries und Agent-Spawning.
+* **Self-Hosting:** CoreCode-Entwicklung selbst nutzt pi (Dogfooding).
+* **Extension Points:** pi-Agents können als WASM-Extensions von Drittanbietern installiert werden.
+
+---
+
+## 5. Nicht-funktionale Anforderungen
 
 | Metrik | Ziel (MVP) | Messmethode |
 |:---|:---|:---|
@@ -121,9 +175,11 @@ Die ~20 kritischsten APIs werden handschriftlich implementiert und dienen als Re
 | **RAM (Baseline)** | < 150MB ohne Extensions | OS-Prozessmonitor |
 | **RAM (mit 5 Extensions)** | < 400MB | OS-Prozessmonitor |
 | **IPC-Latenz** | < 5ms für einzelne Nachrichten | Instrumentierte Benchmarks |
-| **Extension-Kompatibilität** | Top 20 VS Code Extensions funktionsfähig | Kompatibilitätsmatrix (siehe Abschnitt 7) |
+| **Extension-Kompatibilität** | Top 20 VS Code Extensions funktionsfähig | Kompatibilitätsmatrix (siehe Abschnitt 8) |
 | **Plattformen (MVP)** | Linux, macOS | CI-Tests auf beiden Plattformen |
 | **Plattformen (Post-MVP)** | + Windows | Windows-spezifische Anpassungen (Named Pipes, DirectWrite) |
+| **AI Completion Latency** | < 200ms (P95) für Inline Completions | Instrumentierte Benchmarks |
+| **AI Context Size** | ≤ 32k Tokens pro Request (configurable) | Token-Zählung |
 
 ### Accessibility (Post-MVP)
 
@@ -133,47 +189,56 @@ Die ~20 kritischsten APIs werden handschriftlich implementiert und dienen als Re
 
 ---
 
-## 5. Kernanforderungen für das MVP (Minimum Viable Product)
+## 6. Kernanforderungen für das MVP (Minimum Viable Product)
 
-### 5.1. Lifecycle Management
+### 6.1. Lifecycle Management
 
 * Das native Frontend startet den Node.js-Prozess beim Start.
 * Überwachung des Node.js-Prozesses (Restart bei Crash, Graceful Shutdown beim Beenden des Editors).
 * Startup-Sequenz: Frontend-Fenster sofort anzeigen, Extension Host im Hintergrund starten (Progressive Loading).
 
-### 5.2. Extension Loading & Activation
+### 6.2. Extension Loading & Activation
 
 * Parsen der `package.json` einer Standard-Extension.
 * Unterstützung der grundlegenden VS Code *Activation Events* (z.B. `onLanguage:javascript`, `onCommand:extension.helloWorld`, `*`).
 * Extension-Discovery: Lokales Verzeichnis scannen (kein Marketplace im MVP).
 
-### 5.3. Text & Workspace Synchronisation (Der kritische Pfad)
+### 6.3. Text & Workspace Synchronisation (Der kritische Pfad)
 
 * Implementierung von `vscode.workspace.textDocuments`.
 * Verzögerungsfreie Übertragung von Textänderungen (Deltas) vom Frontend an den Extension Host via FlatBuffers.
 * Konfliktfreie Synchronisation bei gleichzeitigen Änderungen von Extension und User (OT oder CRDT als Fallback).
 
-### 5.4. Basis-UI-Mapping
+### 6.4. Basis-UI-Mapping
 
 * **Notifications:** Mapping von `vscode.window.showInformationMessage` auf native OS-Benachrichtigungen (Tauri Notification API).
 * **Diagnostics:** Mapping der Fehlermarkierungen (rote Wellenlinien) vom Extension Host zurück in den Renderer des Frontends.
 * **Quick Pick / Command Palette:** Nativ gerenderte Command Palette, die Befehle an den Host triggert.
 * **Status Bar:** Basis-Statusleiste für Extension-Beiträge.
 
+### 6.5. AI MVP Features (NEU in v2.0)
+
+* **Explain Code:** Markierten Code per Hotkey oder Kontextmenü erklären (via pi).
+* **Generate Tests:** Button "Generate Unit Tests" erzeugt Test-Datei mit Diff-Preview.
+* **Inline Completions:** Erste Ghost-Text Vorschläge (deaktivierbar).
+* **AI Chat Sidebar:** Minimales Chat-Panel mit aktuellem Buffer als Context.
+* **Capability Guard:** Alle AI-Features erfordern explizite `ai_*` Capabilities in `corecode.toml`.
+
 ---
 
-## 6. Out of Scope (Für das MVP)
+## 7. Out of Scope (Für das MVP)
 
 * **WebViews:** Komplette HTML/CSS-Fenster innerhalb von Extensions (erfordert Browser-Engine).
 * **Integrierter Terminal-Emulator** (Fokus liegt zunächst auf Code-Editing).
 * **Integrierter Debugger-UI (DAP)** (Nur Basis-LSP-Support im ersten Schritt).
 * **Settings Sync** (Cloud-Synchronisation).
-* **Windows-Support** (Post-MVP, siehe Abschnitt 4).
+* **Windows-Support** (Post-MVP, siehe Abschnitt 5).
 * **Extension Marketplace** (Extensions werden lokal installiert).
+* **Multi-File Agent Refactorings** (P2, nur in AI-Phase 3).
 
 ---
 
-## 7. Extension-Kompatibilitätsmatrix (Top 20 Ziel-Extensions)
+## 8. Extension-Kompatibilitätsmatrix (Top 20 Ziel-Extensions)
 
 | # | Extension | Benötigte APIs (Kern) | Priorität |
 |:--|:---|:---|:---|
@@ -202,7 +267,7 @@ Die ~20 kritischsten APIs werden handschriftlich implementiert und dienen als Re
 
 ---
 
-## 8. Lizenzierung & Distribution
+## 9. Lizenzierung & Distribution
 
 ### Extension-Quellen
 
@@ -217,7 +282,7 @@ Die ~20 kritischsten APIs werden handschriftlich implementiert und dienen als Re
 
 ---
 
-## 9. Technische Risiken & Mitigierung
+## 10. Technische Risiken & Mitigierung
 
 | Risiko | Beschreibung | Wahrscheinlichkeit | Impact | Mitigierung |
 |:---|:---|:---|:---|:---|
@@ -228,10 +293,13 @@ Die ~20 kritischsten APIs werden handschriftlich implementiert und dienen als Re
 | **Text-Rendering-Qualität** | Eigenes Rendering unter Chromium/CoreText-Niveau. | Mittel | Hoch | Plattform-native Schrift-APIs (DirectWrite, CoreText, FreeType). |
 | **Extension-Kompatibilität** | Extensions nutzen undokumentierte VS Code-Interna. | Hoch | Mittel | Kompatibilitätsmatrix; Tier-basiertes API-Mapping; Community-Feedback. |
 | **KI-generierter Code** | Halluzinationen in generierten API-Bindings. | Hoch | Hoch | Conformance Tests, manuelles Review für Tier 1+2, CI-Validierung. |
+| **AI Context Leakage** | Geheimnisse oder sensible Daten gelangen in KI-Requests. | Mittel | Hoch | Privacy Filter, Capability-Modell, explizite User-Bestätigung. |
+| **AI Latency** | Zu hohe Latenz bei Inline Completions führt zu schlechter UX. | Mittel | Hoch | Debouncing, kleine Context-Window, lokale Modelle (Ollama). |
+| **pi Abhängigkeit** | pi.dev ist ein externes Projekt mit eigenem Release-Zyklus. | Niedrig | Mittel | Fallback auf direkte OpenAI/Anthropic Calls; pi als optionales Modul. |
 
 ---
 
-## 10. Meilensteine
+## 11. Meilensteine
 
 | Meilenstein | Beschreibung | Ziel-Zeitraum |
 |:---|:---|:---|
@@ -240,3 +308,19 @@ Die ~20 kritischsten APIs werden handschriftlich implementiert und dienen als Re
 | **M2: Erste Extension** | ESLint Extension lädt, zeigt Diagnostics im Editor | 4 Wochen |
 | **M3: MVP Alpha** | Top 5 Extensions funktionsfähig, Tree-sitter Highlighting, Command Palette | 8 Wochen |
 | **M4: MVP Beta** | Top 20 Extensions, Performance-Optimierung, macOS+Linux | 8 Wochen |
+| **M5: AI Strategy** | AI-Strategie-Dokument, pi.dev Setup, erste Context-Engine | 3 Wochen |
+| **M6: AI Context + Explain** | pi Integration, Context-Engine, "Explain Code" Feature | 4 Wochen |
+| **M7: Inline Completions** | Ghost-Text Completions (< 200ms P95), Test-Generation | 6 Wochen |
+| **M8: AI Chat + Multi-Agent** | Chat Sidebar, Natural Language Commands, erste Agent-Workflows | 8 Wochen |
+
+---
+
+## 12. Fazit
+
+CoreCode v2.0 erweitert die bewährte "Frankenstein"-Architektur um eine erste Bürger-KI-Schicht. Durch die Integration von **pi.dev** als primäres Agenten-Framework wird CoreCode zu einer echten **AI-native Plattform**, die gleichzeitig die Stärken nativer Performance, VS Code Extension-Kompatibilität und moderne Agenten-basierten Workflows vereint.
+
+Die gestufte KI-Agenten-Pipeline für die API-Implementierung bleibt bestehen und wird nun zusätzlich für die AI-Context-Engine und Agent-Orchestrierung genutzt.
+
+---
+
+**Ende des Dokuments (Version 2.0)**

@@ -67,7 +67,7 @@ to VS Code API calls.
 
 ```
 my-ext-0.1.0.vsix  (ZIP)
-  package.json                   ← generated; activationEvents, engines.vscode
+  package.json                   ← generated; activationEvents (inferred from WIT exports), engines.vscode
   dist/
     extension.js                 ← generated adapter (Node.js)
     extension.wasm               ← same binary
@@ -76,6 +76,13 @@ my-ext-0.1.0.vsix  (ZIP)
     panel.js                     ← same JS
     corecode-bridge.js           ← VS Code variant (acquireVsCodeApi)
 ```
+
+**`activationEvents` mapping:** The build tool infers `activationEvents` from the WIT exports
+declared in the WASM binary and any explicit declarations in `corecode.toml`:
+- `language-provider` export → `onLanguage:<lang>` for each language in `[languages]`
+- `grammar-provider` export → `onLanguage:<lang>`
+- `webview-provider` export → `onCommand:<ext-id>.openPanel` (if custom commands are declared)
+- Explicit entries in `corecode.toml` `[activation]` section override the inferred list
 
 ---
 
@@ -103,7 +110,10 @@ export async function activate(context) {
   ext = await instantiate(wasm, {
     // WIT imports implemented with vscode APIs
     workspace: {
-      readFile: (path) => {
+      readFile: async (path) => {
+        if (!vscode.workspace.workspaceFolders?.length) {
+          throw new Error('No workspace folder open');
+        }
         const uri = vscode.Uri.joinPath(
           vscode.workspace.workspaceFolders[0].uri, path
         );
@@ -115,7 +125,12 @@ export async function activate(context) {
         const parts = key.split('.');
         const section = parts.slice(0, -1).join('.');
         const item = parts[parts.length - 1];
-        return vscode.workspace.getConfiguration(section).get(item)?.toString();
+        // Preserve native types: booleans, numbers, strings, objects.
+        // Only coerce to string for the WIT string return type.
+        const val = vscode.workspace.getConfiguration(section).get(item);
+        if (val === undefined || val === null) return '';
+        if (typeof val === 'object') return JSON.stringify(val);
+        return String(val);
       },
       // ... all workspace imports ...
     },
@@ -138,7 +153,10 @@ export async function activate(context) {
           { enableScripts: true, retainContextWhenHidden: true }
         );
         // Inject VS Code variant of corecode-bridge.js
-        const html = ext['webview-provider'].getHtml(panelId, null);
+        // state parameter: serialized panel state for restore, or null for new panels.
+        // The template is embedded in the WASM binary via include_str!/include_bytes!
+        // or loaded from a sidecar asset file in the extension directory.
+        const html = ext['webview-provider'].getHtml(panelId, null /* state */);
         panel.webview.html = injectVsCodeBridge(html, panel.webview);
         panel.webview.onDidReceiveMessage(msg => {
           const response = ext['webview-provider'].onMessage(panelId, JSON.stringify(msg));
@@ -164,18 +182,28 @@ export async function activate(context) {
 
   // Register providers based on what the WASM exports
   if (ext['language-provider']) {
-    context.subscriptions.push(
-      vscode.languages.registerCompletionItemProvider('*', {
-        provideCompletionItems(doc, pos, _token, ctx) {
-          const items = ext['language-provider'].completions(
-            doc.uri.toString(),
-            { line: pos.line, character: pos.character },
-            ctx.triggerCharacter ?? null,
-          );
-          return items.map(toVscodeCompletion);
-        }
-      })
-    );
+    // Register only for languages declared in corecode.toml [languages],
+    // not '*', to avoid incorrect triggers and unnecessary provider calls.
+    const languages = manifest.languages ?? ['*'];
+    for (const lang of languages) {
+      context.subscriptions.push(
+        vscode.languages.registerCompletionItemProvider(lang, {
+          provideCompletionItems(doc, pos, _token, ctx) {
+            try {
+              const items = ext['language-provider'].completions(
+                doc.uri.toString(),
+                { line: pos.line, character: pos.character },
+                ctx.triggerCharacter ?? null,
+              );
+              return items.map(toVscodeCompletion);
+            } catch (e) {
+              channels['corecode']?.appendLine(`completions error: ${e}`);
+              return []; // safe fallback
+            }
+          }
+        })
+      );
+    }
     // ... hover, diagnostics, format, definition, references, rename,
     //     code-actions, workspace-symbols, folding-ranges ...
   }
@@ -185,6 +213,38 @@ export async function deactivate() {
   await ext?.lifecycle.deactivate();
 }
 ```
+
+---
+
+## Completion item mapping (`toVscodeCompletion`)
+
+The adapter maps WIT `CompletionItem` fields to VS Code `CompletionItem`:
+
+| WIT field       | VS Code field                 | Notes |
+|:----------------|:------------------------------|:------|
+| `label`         | `label`                       | Required |
+| `kind`          | `kind` → `CompletionItemKind` | Map enum; unknown → `Text` |
+| `detail`        | `detail`                      | Optional |
+| `documentation` | `documentation`               | Optional; rendered as markdown |
+| `insert_text`   | `insertText`                  | Optional; if absent, uses `label` |
+| `filter_text`   | `filterText`                  | Optional |
+
+VS Code-specific fields (`sortText`, `preselect`, `commitCharacters`, `additionalTextEdits`)
+are omitted by the adapter — extensions that need them should use the Node.js host directly.
+
+---
+
+## Error handling policy
+
+| Call site | On error | User-visible? |
+|:----------|:---------|:--------------|
+| `activate()` | Log full error to output channel + `showErrorMessage` | Yes |
+| Provider calls (`completions`, `hover`, etc.) | Log + return empty/null | No (silent fallback) |
+| `webview-provider.onMessage` | Log + optionally post error back to webview | No |
+| WASM trap/panic | Log stack + `showErrorMessage` | Yes |
+
+All external calls (`instantiate`, `ext[...]` calls, webview `postMessage`) must be wrapped
+in `try/catch`. Errors include the WASM extension id and function name for traceability.
 
 ---
 

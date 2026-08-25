@@ -34,7 +34,13 @@ CoreCode uses a **"Frankenstein" hybrid architecture** — native Rust performan
 │  │  • Notification toasts                            │  │
 │  └──────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
-```
+
+### IPC Port Management
+
+The IPC connection uses an **ephemeral port** selected at startup via `TcpListener::bind(("127.0.0.1", 0))` (see `find_free_port()` in `ipc_bridge.rs`). The assigned port is passed to the Extension Host process through the `CORECODE_IPC_PORT` environment variable. This eliminates hardcoded-port conflicts entirely:
+- **No bind failures**: The OS assigns a guaranteed-free port.
+- **No configuration needed**: Port selection is automatic on every launch.
+- **Multi-instance safe**: Each CoreCode instance gets its own ephemeral port — no coordination or lockfiles required.
 
 ## Key Design Decisions
 
@@ -89,4 +95,4 @@ CoreCode uses a **"Frankenstein" hybrid architecture** — native Rust performan
 | IPC round-trip | 60µs (JSON) | < 1ms |
 | Extension command RTT | 131µs avg | < 5ms |
 | Tree-sitter initial parse (10k lines) | 37ms | < 50ms |
-| Tree-sitter incremental re-parse | 1.4ms | < 1ms |
+| Tree-sitter incremental re-parse | 1.4ms | < 1ms _(1.4ms measured; ~40% above target; async thread optimization planned)_ |

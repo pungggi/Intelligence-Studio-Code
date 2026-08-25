@@ -1,12 +1,12 @@
 {
   "identifier": "default",
-  "description": "Default permissions for CoreCode",
+  "description": "Minimal permissions for CoreCode frontend (principle of least privilege).\n\nRETAINED:\n- core:event:allow-listen / allow-unlisten: Frontend listens for 'terminal-data' and\n  'terminal-exit' events emitted by the Rust PTY backend (terminal.rs).\n- dialog:allow-open: File-open and folder-open picker dialogs (editor.js openFolderDialog,\n  openFileDialog).\n- dialog:allow-confirm: Confirmation dialog for destructive SCM actions (editor.js\n  scmActionDiscard).\n- dialog:allow-message: Tauri-intercepted browser `alert()` (editor.js scmCommit failure\n  path) and webview-default unhandled-rejection handler route here. Re-added to silence\n  spurious permission errors that surfaced during normal use.\n\nREMOVED (previously granted by broad default sets):\n- core:default (included ~88 permissions across path/event/window/webview/app/image/\n  resources/menu/tray sub-plugins — none used from JS). Custom Tauri commands registered\n  in generate_handler! are accessible without core plugin permissions.\n- core:event:allow-emit / allow-emit-to: emit is only called server-side (Rust\n  terminal.rs); frontend never emits events.\n- dialog:allow-ask / allow-save: No call sites use ask() or save() dialogs.\n- fs:default: Frontend never calls window.__TAURI__.fs; all file I/O goes through\n  custom Tauri commands (open_file, save_file, read_directory, etc.) which have\n  unrestricted filesystem access from the Rust side.\n- shell:allow-open: Frontend never calls window.__TAURI__.shell. If external URL\n  opening is needed later, add back with a scope restricted to https/http URLs.",
   "windows": ["main"],
   "permissions": [
-    "core:default",
-    "core:event:default",
-    "shell:allow-open",
-    "dialog:default",
-    "fs:default"
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "dialog:allow-open",
+    "dialog:allow-confirm",
+    "dialog:allow-message"
   ]
 }

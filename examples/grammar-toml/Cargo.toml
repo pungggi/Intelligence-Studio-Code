@@ -1,0 +1,21 @@
+[package]
+name    = "grammar-toml"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.43"
+
+[build-dependencies]
+# tree-sitter-toml is used at build time to embed the grammar dylib
+# and the highlights query. The grammar is compiled to a native dylib
+# by the build script and included via include_bytes!.
+
+[profile.release]
+opt-level     = "z"
+lto           = true
+codegen-units = 1
+strip         = true

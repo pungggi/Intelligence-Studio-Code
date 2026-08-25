@@ -98,7 +98,7 @@ impl FrameStats {
 
         let mut sorted = self.frame_times.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let p95 = sorted[(count as f64 * 0.95) as usize];
+        let p95 = sorted[(count as f64 * 0.95).min((count - 1) as f64) as usize];
         let p99 = sorted[(count as f64 * 0.99).min((count - 1) as f64) as usize];
 
         println!(
@@ -266,8 +266,7 @@ impl AppState {
         let visible_height = gpu.size.height as f32;
         let first_visible_line = (self.scroll_offset / line_height).floor() as usize;
         let visible_line_count = (visible_height / line_height).ceil() as usize + 1;
-        let last_visible_line =
-            (first_visible_line + visible_line_count).min(self.lines.len());
+        let last_visible_line = (first_visible_line + visible_line_count).min(self.lines.len());
 
         // Build vertex data for visible lines
         let y_offset = -(self.scroll_offset % line_height);
@@ -352,7 +351,7 @@ impl AppState {
             .as_ref()
             .map(|a| a.line_height())
             .unwrap_or(20.0);
-        let max_scroll = (self.lines.len() as f32 - 1.0) * line_height;
+        let max_scroll = (self.lines.len() as f32 - 1.0).max(0.0) * line_height;
         self.scroll_offset = (self.scroll_offset + delta).clamp(0.0, max_scroll);
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -373,10 +372,7 @@ impl ApplicationHandler for AppState {
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         self.init_gpu(window.clone());
 
-        println!(
-            "[Init] Window created, {} lines loaded",
-            self.lines.len()
-        );
+        println!("[Init] Window created, {} lines loaded", self.lines.len());
 
         window.request_redraw();
     }
@@ -433,7 +429,7 @@ impl ApplicationHandler for AppState {
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     println!("=== CoreCode Spike 1: wgpu Text Rendering ===\n");
 
     let event_loop = EventLoop::new()?;

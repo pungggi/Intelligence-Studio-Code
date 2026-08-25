@@ -1,12 +1,15 @@
 mod debug;
+mod dispatch;
 mod editor;
 mod ext_host;
 mod extension_mgr;
+mod grammar_registry;
 mod highlighting;
 mod ipc_bridge;
 mod marketplace;
 mod settings;
 mod terminal;
+mod wasm_host;
 
 use editor::WorkspaceState;
 use ipc_bridge::{IpcHandle, OutgoingMessage};
@@ -18,6 +21,8 @@ use tauri::AppHandle;
 
 /// Maximum text insertion size (1 MB).
 const MAX_INSERT_SIZE: usize = 1024 * 1024;
+/// Maximum buffer size (50 MB) — matches MAX_FILE_SIZE in editor.rs.
+const MAX_BUFFER_SIZE: usize = 50 * 1024 * 1024;
 
 /// Shared app state accessible from Tauri commands.
 struct AppState {
@@ -26,11 +31,15 @@ struct AppState {
     ipc: IpcHandle,
     marketplace: marketplace::MarketplaceClient,
     extension_mgr: Mutex<extension_mgr::ExtensionManager>,
-    settings: Mutex<settings::SettingsStore>,
+    settings: Arc<Mutex<settings::SettingsStore>>,
     terminal_mgr: Mutex<terminal::TerminalManager>,
     debug_mgr: Arc<debug::DebugManager>,
     /// Count of open windows; extension host is killed when this reaches zero.
     window_count: Arc<Mutex<usize>>,
+    /// WASM extension host — runs extensions compiled to wasm32-wasi in-process.
+    wasm_host: wasm_host::WasmHostManager,
+    /// Dynamic grammar registry — tree-sitter grammars loaded from WASM extensions.
+    grammar_registry: Arc<grammar_registry::GrammarRegistry>,
 }
 
 
@@ -43,7 +52,7 @@ struct AppState {
 /// - Must not point to a directory.
 /// - Must be within the current user's home directory to prevent extensions
 ///   from reading arbitrary system files (e.g. `/etc/passwd`).
-///   If the home directory cannot be determined the restriction is skipped.
+///   If the home directory cannot be determined, access is denied (fail-closed).
 fn validate_path(path: &str) -> Result<String, String> {
     let canonical = std::fs::canonicalize(path)
         .map_err(|e| format!("Invalid path '{}': {}", path, e))?;
@@ -114,6 +123,20 @@ fn ext_to_language_id(ext: &str) -> String {
     }
 }
 
+/// Get (or create) the `WorkspaceState` for a window, attaching the shared grammar
+/// registry to newly-created instances so dynamic grammars work automatically.
+fn get_or_create_ws<'a>(
+    workspaces: &'a mut HashMap<String, WorkspaceState>,
+    wid: String,
+    grammar_registry: &Arc<grammar_registry::GrammarRegistry>,
+) -> &'a mut WorkspaceState {
+    workspaces.entry(wid).or_insert_with(|| {
+        let mut ws = WorkspaceState::new();
+        ws.set_grammar_registry(grammar_registry.clone());
+        ws
+    })
+}
+
 // --- Tauri Commands ---
 
 /// Open a file into a buffer (multi-document: doesn't close previous files).
@@ -122,7 +145,7 @@ fn open_file(path: String, state: tauri::State<AppState>, window: tauri::Webview
     let canonical = validate_path(&path)?;
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
 
     let is_new = ws.open_file(&canonical).map_err(|e| e.to_string())?;
 
@@ -160,7 +183,7 @@ fn open_file(path: String, state: tauri::State<AppState>, window: tauri::Webview
 fn close_buffer(path: String, state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Result<Option<EditorContent>, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let path_buf = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
 
     // Send didClose for this buffer
@@ -181,7 +204,7 @@ fn close_buffer(path: String, state: tauri::State<AppState>, window: tauri::Webv
 fn switch_buffer(path: String, state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Result<EditorContent, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid, &state.grammar_registry);
     let path_buf = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
 
     if !ws.switch_buffer(&path_buf) {
@@ -201,7 +224,7 @@ fn switch_buffer(path: String, state: tauri::State<AppState>, window: tauri::Web
 fn list_open_buffers(state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Result<Vec<editor::BufferInfo>, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid, &state.grammar_registry);
     Ok(ws.list_open_buffers())
 }
 
@@ -216,7 +239,7 @@ fn read_directory(path: String) -> Result<Vec<editor::DirEntry>, String> {
 fn save_file(state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Result<(), String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     ws.save_active().map_err(|e| e.to_string())?;
 
     // Notify Extension Host that the document was saved
@@ -234,7 +257,7 @@ fn save_file(state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Res
 fn get_content(state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Result<EditorContent, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid, &state.grammar_registry);
     match ws.active() {
         Some(buf) => Ok(buf.get_content(&state.ipc)),
         None => Ok(EditorContent {
@@ -262,7 +285,7 @@ fn get_visible_content(
 ) -> Result<VisibleContent, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid, &state.grammar_registry);
     match ws.active() {
         Some(buf) => Ok(buf.get_visible_content(first_line, line_count, &state.ipc)),
         None => Ok(VisibleContent {
@@ -312,8 +335,15 @@ fn edit_insert(
     }
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let buf = ws.active_mut().ok_or("No active buffer")?;
+    // Check before mutating — once inserted the rope cannot be cheaply undone.
+    if buf.len_bytes().saturating_add(text.len()) > MAX_BUFFER_SIZE {
+        return Err(format!(
+            "Insertion would exceed {} MB buffer limit",
+            MAX_BUFFER_SIZE / (1024 * 1024)
+        ));
+    }
     buf.insert(line, col, &text).map_err(|e| e.to_string())?;
     do_edit(ws, &state.ipc, &wid)
 }
@@ -328,7 +358,7 @@ fn edit_delete(
 ) -> Result<EditResult, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.delete(line, col, len).map_err(|e| e.to_string())?;
     do_edit(ws, &state.ipc, &wid)
@@ -343,7 +373,7 @@ fn edit_newline(
 ) -> Result<EditResult, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.insert(line, col, "\n").map_err(|e| e.to_string())?;
     do_edit(ws, &state.ipc, &wid)
@@ -358,7 +388,7 @@ fn edit_backspace(
 ) -> Result<EditResult, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.backspace(line, col).map_err(|e| e.to_string())?;
     do_edit(ws, &state.ipc, &wid)
@@ -368,7 +398,7 @@ fn edit_backspace(
 fn edit_undo(state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Result<EditResult, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.undo();
     do_edit(ws, &state.ipc, &wid)
@@ -378,7 +408,7 @@ fn edit_undo(state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Res
 fn edit_redo(state: tauri::State<AppState>, window: tauri::WebviewWindow) -> Result<EditResult, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let buf = ws.active_mut().ok_or("No active buffer")?;
     buf.redo();
     do_edit(ws, &state.ipc, &wid)
@@ -403,8 +433,16 @@ fn edit_replace_range(
     }
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let buf = ws.active_mut().ok_or("No active buffer")?;
+    // Conservatively check before mutating — replacement text may be larger than
+    // the range it replaces, so use the full addition as an upper bound.
+    if buf.len_bytes().saturating_add(text.len()) > MAX_BUFFER_SIZE {
+        return Err(format!(
+            "Replacement would exceed {} MB buffer limit",
+            MAX_BUFFER_SIZE / (1024 * 1024)
+        ));
+    }
     buf.replace_range(start_line, start_col, end_line, end_col, &text)
         .map_err(|e| e.to_string())?;
     do_edit(ws, &state.ipc, &wid)
@@ -421,7 +459,7 @@ fn get_text_range(
 ) -> Result<String, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid, &state.grammar_registry);
     let buf = ws.active().ok_or("No active buffer")?;
     Ok(buf.get_text_range(start_line, start_col, end_line, end_col))
 }
@@ -435,7 +473,7 @@ fn find_in_file(
 ) -> Result<Vec<editor::FindMatch>, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid, &state.grammar_registry);
     let buf = ws.active().ok_or("No active buffer")?;
     Ok(buf.find_all(&query, case_sensitive))
 }
@@ -451,7 +489,7 @@ fn replace_in_file(
 ) -> Result<ReplaceResult, String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let buf = ws.active_mut().ok_or("No active buffer")?;
     let matches = buf.find_all(&query, case_sensitive);
 
@@ -549,7 +587,373 @@ fn get_output_lines(state: tauri::State<AppState>) -> Result<Vec<ipc_bridge::Out
     Ok(state.ipc.drain_output_lines())
 }
 
-/// Notify Extension Host of text changes.
+/// Drain buffered log messages from all active WASM extensions.
+///
+/// Returns `[channel, message]` pairs. The frontend polls this at the same
+/// cadence as `get_output_lines` and appends to the Output panel.
+#[tauri::command]
+fn get_wasm_output_lines(state: tauri::State<AppState>) -> Vec<[String; 2]> {
+    state
+        .wasm_host
+        .drain_all_output_lines()
+        .into_iter()
+        .map(|(ch, msg)| [ch, msg])
+        .collect()
+}
+
+/// Drain buffered notification toasts from all active WASM extensions.
+///
+/// Returns objects with `type` ("info"/"warning"/"error") and `message` fields,
+/// matching the same shape as `get_notifications` from the Node.js IPC bridge.
+#[tauri::command]
+fn get_wasm_notifications(state: tauri::State<AppState>) -> Vec<ipc_bridge::Notification> {
+    state
+        .wasm_host
+        .drain_all_notifications()
+        .into_iter()
+        .map(|(level, message)| ipc_bridge::Notification {
+            msg_type: level,
+            message,
+        })
+        .collect()
+}
+
+/// Collect status bar items from all active WASM extensions.
+///
+/// Returns objects matching the `StatusBarItem` shape used by the IPC bridge.
+#[tauri::command]
+fn get_wasm_status_bar_items(state: tauri::State<AppState>) -> Vec<ipc_bridge::StatusBarItem> {
+    state
+        .wasm_host
+        .get_all_status_items()
+        .into_iter()
+        .map(|(id, text, tooltip)| ipc_bridge::StatusBarItem {
+            id,
+            text,
+            tooltip,
+            command: None,
+            alignment: "left".to_string(),
+            priority: 0,
+        })
+        .collect()
+}
+
+// ── Unified Language Dispatch ─────────────────────────────────────────────────
+// All language provider features (completions, diagnostics, hover, definition,
+// references, format, rename, code actions, workspace symbols, folding ranges)
+// are exposed via lang_* commands below; they merge WASM extension results
+// with LSP server results through the dispatch module.
+
+
+/// Unified completions — merges results from WASM extensions and LSP servers.
+#[tauri::command]
+fn lang_completions(
+    uri: String,
+    line: u32,
+    character: u32,
+    trigger: Option<String>,
+    state: tauri::State<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+
+    // WASM: Pull — returns Vec, errors logged internally
+    let wasm_items = state.wasm_host.completions_for_lang(
+        &lang_id, &uri, line, character, trigger.as_deref(),
+    );
+
+    // LSP: Pull via request_sync
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/completion",
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        }),
+    );
+
+
+    Ok(dispatch::merged_completions(wasm_items, lsp_result))
+}
+
+/// Unified hover — WASM priority, LSP fallback.
+#[tauri::command]
+fn lang_hover(
+    uri: String,
+    line: u32,
+    character: u32,
+    state: tauri::State<AppState>,
+) -> Result<Option<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+    // WASM: Pull
+    let wasm_hover = state.wasm_host.hover_for_lang(&lang_id, &uri, line, character);
+
+    // LSP: Pull
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/hover",
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        }),
+    );
+
+    Ok(dispatch::merged_hover(wasm_hover, lsp_result))
+}
+
+/// Unified diagnostics — merges push-based LSP diagnostics with pull-based WASM diagnostics.
+///
+/// LSP diagnostics are stored in ipc_bridge state (arrived via publishDiagnostics).
+/// WASM diagnostics need file content, which is fetched from the open buffer.
+#[tauri::command]
+fn lang_diagnostics(
+    uri: String,
+    window: tauri::WebviewWindow,
+    state: tauri::State<AppState>,
+) -> Result<Vec<ipc_bridge::Diagnostic>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+
+    // LSP: Read from stored state (push-based)
+    let lsp_diags = state.ipc.get_diagnostics_for_uri(&uri);
+
+    // WASM: Pull — needs file content from open buffer
+    let content = {
+        let wid = window.label().to_string();
+        let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
+        let ws = get_or_create_ws(&mut guard, wid, &state.grammar_registry);
+        let path = dispatch::uri_to_path(&uri);
+        ws.get_buffer_by_path(std::path::Path::new(&path))
+            .map(|buf| buf.get_full_text())
+            .unwrap_or_default()
+    };
+
+    let wasm_diags = state.wasm_host.diagnostics_for_lang(&lang_id, &uri, &content);
+
+    Ok(dispatch::merged_diagnostics_for_uri(&uri, &wasm_diags, &lsp_diags))
+}
+
+/// Unified definition — WASM priority, LSP fallback.
+#[tauri::command]
+fn lang_definition(
+    uri: String,
+    line: u32,
+    character: u32,
+    state: tauri::State<AppState>,
+) -> Result<Option<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+    // WASM: Pull
+    let wasm_def = state.wasm_host.definition_for_lang(&lang_id, &uri, line, character);
+
+    // LSP: Pull
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/definition",
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        }),
+    );
+
+    Ok(dispatch::merged_definition(wasm_def, lsp_result))
+}
+
+/// Unified references — merged (union semantics).
+#[tauri::command]
+fn lang_references(
+    uri: String,
+    line: u32,
+    character: u32,
+    include_decl: bool,
+    state: tauri::State<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+
+    // WASM: Pull
+    let wasm_locs = state.wasm_host.references_for_lang(&lang_id, &uri, line, character, include_decl);
+
+
+    // LSP: Pull
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/references",
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+            "context": { "includeDeclaration": include_decl },
+        }),
+    );
+
+    Ok(dispatch::merged_references(wasm_locs, lsp_result))
+}
+
+/// Unified document formatting — LSP priority, WASM fallback.
+#[tauri::command]
+fn lang_format_document(
+    uri: String,
+    content: String,
+    tab_size: Option<u32>,
+    insert_spaces: Option<bool>,
+    state: tauri::State<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+    let wasm_edits = state.wasm_host.format_document_for_lang(&lang_id, &uri, &content);
+
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/formatting",
+        serde_json::json!({
+            "uri": uri,
+            "tabSize": tab_size.unwrap_or(2),
+            "insertSpaces": insert_spaces.unwrap_or(true),
+        }),
+    );
+
+    Ok(dispatch::merged_format_edits(&wasm_edits, lsp_result))
+}
+
+/// Unified range formatting — LSP priority, WASM fallback.
+#[tauri::command]
+fn lang_format_range(
+    uri: String,
+    content: String,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+    tab_size: Option<u32>,
+    insert_spaces: Option<bool>,
+    state: tauri::State<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+    let range = crate::wasm_host::wit_types::Range {
+        start: crate::wasm_host::wit_types::Position { line: start_line, character: start_character },
+        end: crate::wasm_host::wit_types::Position { line: end_line, character: end_character },
+    };
+    let wasm_edits = state.wasm_host.format_range_for_lang(&lang_id, &uri, &content, &range);
+
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/rangeFormatting",
+        serde_json::json!({
+            "uri": uri,
+            "startLine": start_line,
+            "startCharacter": start_character,
+            "endLine": end_line,
+            "endCharacter": end_character,
+            "tabSize": tab_size.unwrap_or(2),
+            "insertSpaces": insert_spaces.unwrap_or(true),
+        }),
+    );
+
+    Ok(dispatch::merged_format_edits(&wasm_edits, lsp_result))
+}
+
+/// Unified rename — LSP priority, WASM fallback. Returns workspace-edit changes
+/// ready for `apply_workspace_edit`.
+#[tauri::command]
+fn lang_rename(
+    uri: String,
+    line: u32,
+    character: u32,
+    new_name: String,
+    state: tauri::State<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+    let wasm_edits = state.wasm_host.rename_for_lang(&lang_id, &uri, line, character, &new_name);
+
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/rename",
+        serde_json::json!({
+            "uri": uri,
+            "line": line,
+            "character": character,
+            "newName": new_name,
+        }),
+    );
+
+    Ok(dispatch::merged_rename_changes(&wasm_edits, &uri, lsp_result))
+}
+
+/// Unified code actions — union of LSP and WASM results.
+#[tauri::command]
+fn lang_code_actions(
+    uri: String,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+    diagnostics: Option<serde_json::Value>,
+    state: tauri::State<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+    let range = wasm_host::Range {
+        start: wasm_host::Position { line: start_line, character: start_character },
+        end: wasm_host::Position { line: end_line, character: end_character },
+    };
+    let diags: Vec<wasm_host::Diagnostic> = diagnostics
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let wasm_actions = state.wasm_host.code_actions_for_lang(&lang_id, &uri, &range, &diags);
+
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/codeAction",
+        serde_json::json!({
+            "uri": uri,
+            "startLine": start_line,
+            "startCharacter": start_character,
+            "endLine": end_line,
+            "endCharacter": end_character,
+        }),
+    );
+
+    Ok(dispatch::merged_code_actions(wasm_actions, lsp_result, &uri))
+}
+
+/// Unified workspace symbols — union of LSP and WASM results.
+///
+/// When `lang_hint` is provided, only WASM extensions claiming that language
+/// are queried. Without a hint, every active WASM extension is consulted so
+/// that global symbol search is not constrained by the originating file.
+#[tauri::command]
+fn lang_workspace_symbols(
+    query: String,
+    lang_hint: Option<String>,
+    state: tauri::State<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let wasm_symbols = match lang_hint.as_deref().filter(|s| !s.is_empty()) {
+        Some(lang_id) => state.wasm_host.workspace_symbols_for_lang(lang_id, &query),
+        None => state.wasm_host.workspace_symbols_all(&query),
+    };
+
+    let lsp_result = state.ipc.request_sync(
+        "workspace/symbol",
+        serde_json::json!({ "query": query }),
+    );
+
+    Ok(dispatch::merged_workspace_symbols(wasm_symbols, lsp_result))
+}
+
+/// Unified folding ranges — WASM priority, LSP fallback.
+#[tauri::command]
+fn lang_folding_ranges(
+    uri: String,
+    content: String,
+    state: tauri::State<AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let lang_id = dispatch::lang_id_from_uri(&uri);
+
+    let wasm_ranges = state.wasm_host.folding_ranges_for_lang(&lang_id, &uri, &content);
+
+    let lsp_result = state.ipc.request_sync(
+        "textDocument/foldingRange",
+        serde_json::json!({ "uri": uri }),
+    );
+
+    Ok(dispatch::merged_folding_ranges(&wasm_ranges, lsp_result))
+}
+
 fn notify_change(path_str: &str, version: u32, text: &str, ipc: &IpcHandle, workspace_id: &str) {
     ipc.send(OutgoingMessage::DidChange {
         uri: path_to_uri(path_str),
@@ -560,82 +964,9 @@ fn notify_change(path_str: &str, version: u32, text: &str, ipc: &IpcHandle, work
 }
 
 // --- M6: LSP Tauri Commands ---
-
-/// Request hover information at a position.
-#[tauri::command]
-fn lsp_hover(
-    uri: String,
-    line: usize,
-    character: usize,
-    state: tauri::State<AppState>,
-) -> Result<serde_json::Value, String> {
-    let params = serde_json::json!({ "uri": uri, "line": line, "character": character });
-    state.ipc.request_sync("textDocument/hover", params)
-}
-
-/// Request completions at a position.
-#[tauri::command]
-fn lsp_completion(
-    uri: String,
-    line: usize,
-    character: usize,
-    trigger_kind: Option<u32>,
-    trigger_character: Option<String>,
-    state: tauri::State<AppState>,
-) -> Result<serde_json::Value, String> {
-    let params = serde_json::json!({
-        "uri": uri,
-        "line": line,
-        "character": character,
-        "triggerKind": trigger_kind.unwrap_or(1),
-        "triggerCharacter": trigger_character,
-    });
-    state.ipc.request_sync("textDocument/completion", params)
-}
-
-/// Request go-to-definition at a position.
-#[tauri::command]
-fn lsp_definition(
-    uri: String,
-    line: usize,
-    character: usize,
-    state: tauri::State<AppState>,
-) -> Result<serde_json::Value, String> {
-    let params = serde_json::json!({ "uri": uri, "line": line, "character": character });
-    state.ipc.request_sync("textDocument/definition", params)
-}
-
-/// Request find references at a position.
-#[tauri::command]
-fn lsp_references(
-    uri: String,
-    line: usize,
-    character: usize,
-    state: tauri::State<AppState>,
-) -> Result<serde_json::Value, String> {
-    let params = serde_json::json!({ "uri": uri, "line": line, "character": character });
-    state.ipc.request_sync("textDocument/references", params)
-}
-
-/// Request code actions for a range.
-#[tauri::command]
-fn lsp_code_action(
-    uri: String,
-    start_line: usize,
-    start_character: usize,
-    end_line: usize,
-    end_character: usize,
-    state: tauri::State<AppState>,
-) -> Result<serde_json::Value, String> {
-    let params = serde_json::json!({
-        "uri": uri,
-        "startLine": start_line,
-        "startCharacter": start_character,
-        "endLine": end_line,
-        "endCharacter": end_character,
-    });
-    state.ipc.request_sync("textDocument/codeAction", params)
-}
+// Hover/completion/definition/references/code-action/format/rename are exposed
+// only through the unified `lang_*` dispatch commands above. The LSP-only
+// commands below remain because no WASM dispatch equivalent exists yet.
 
 /// Request signature help at a position.
 #[tauri::command]
@@ -663,22 +994,6 @@ fn lsp_document_symbols(
 ) -> Result<serde_json::Value, String> {
     let params = serde_json::json!({ "uri": uri });
     state.ipc.request_sync("textDocument/documentSymbol", params)
-}
-
-/// Request document formatting.
-#[tauri::command]
-fn lsp_format(
-    uri: String,
-    tab_size: Option<u32>,
-    insert_spaces: Option<bool>,
-    state: tauri::State<AppState>,
-) -> Result<serde_json::Value, String> {
-    let params = serde_json::json!({
-        "uri": uri,
-        "tabSize": tab_size.unwrap_or(2),
-        "insertSpaces": insert_spaces.unwrap_or(true),
-    });
-    state.ipc.request_sync("textDocument/formatting", params)
 }
 
 /// Request inline completions (ghost text) at a position.
@@ -724,19 +1039,6 @@ fn lsp_inlay_hints(
     state.ipc.request_sync("textDocument/inlayHint", params)
 }
 
-/// Request rename edits for the symbol at the given position.
-#[tauri::command]
-fn lsp_rename(
-    uri: String,
-    line: usize,
-    character: usize,
-    new_name: String,
-    state: tauri::State<AppState>,
-) -> Result<serde_json::Value, String> {
-    let params = serde_json::json!({ "uri": uri, "line": line, "character": character, "newName": new_name });
-    state.ipc.request_sync("textDocument/rename", params)
-}
-
 /// Check if rename is available at the given position.
 #[tauri::command]
 fn lsp_prepare_rename(
@@ -759,6 +1061,122 @@ fn lsp_document_highlights(
 ) -> Result<serde_json::Value, String> {
     let params = serde_json::json!({ "uri": uri, "line": line, "character": character });
     state.ipc.request_sync("textDocument/documentHighlight", params)
+}
+
+/// Go to the type definition of the symbol at the given position.
+#[tauri::command]
+fn lsp_type_definition(
+    uri: String,
+    line: usize,
+    character: usize,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": line, "character": character },
+    });
+    state.ipc.request_sync("textDocument/typeDefinition", params)
+}
+
+/// Go to the implementation of the symbol at the given position.
+#[tauri::command]
+fn lsp_implementation(
+    uri: String,
+    line: usize,
+    character: usize,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": line, "character": character },
+    });
+    state.ipc.request_sync("textDocument/implementation", params)
+}
+
+/// Request selection ranges (smart selection expand/shrink) for given positions.
+#[tauri::command]
+fn lsp_selection_ranges(
+    uri: String,
+    positions: Vec<serde_json::Value>,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+        "positions": positions,
+    });
+    state.ipc.request_sync("textDocument/selectionRange", params)
+}
+
+/// Request document links (clickable URLs/refs) for a document.
+#[tauri::command]
+fn lsp_document_links(
+    uri: String,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+    });
+    state.ipc.request_sync("textDocument/documentLink", params)
+}
+
+/// Resolve a previously returned document link (fills in `target`/`tooltip`).
+///
+/// The link is wrapped in `{ "link": ... }` so the shim envelope is stable
+/// across future additions (e.g. cancellation/context fields).
+#[tauri::command]
+fn lsp_resolve_document_link(
+    link: serde_json::Value,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({ "link": link });
+    state.ipc.request_sync("documentLink/resolve", params)
+}
+
+/// Request full-document semantic tokens (encoded as relative deltas per LSP spec).
+#[tauri::command]
+fn lsp_semantic_tokens_full(
+    uri: String,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+    });
+    state.ipc.request_sync("textDocument/semanticTokens/full", params)
+}
+
+/// Request semantic tokens for a range only.
+#[tauri::command]
+fn lsp_semantic_tokens_range(
+    uri: String,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+        "range": {
+            "start": { "line": start_line, "character": start_character },
+            "end":   { "line": end_line,   "character": end_character },
+        },
+    });
+    state.ipc.request_sync("textDocument/semanticTokens/range", params)
+}
+
+/// Request a delta against a prior semantic-tokens result (`previousResultId`).
+/// The shim returns either a full SemanticTokens or an `edits` envelope.
+#[tauri::command]
+fn lsp_semantic_tokens_delta(
+    uri: String,
+    previous_result_id: String,
+    state: tauri::State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+        "previousResultId": previous_result_id,
+    });
+    state.ipc.request_sync("textDocument/semanticTokens/full/delta", params)
 }
 
 /// Drain showTextDocument requests from the Extension Host.
@@ -831,6 +1249,80 @@ async fn install_extension(
     };
 
     // Notify Extension Host about the new extension
+    state.ipc.send(OutgoingMessage::ExtensionInstalled {
+        path: installed.path.clone(),
+    });
+
+    Ok(installed)
+}
+
+#[tauri::command]
+async fn marketplace_get_native(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<marketplace::CcextExtensionEntry, String> {
+    state.marketplace.ccext_get(&id).await
+}
+
+#[tauri::command]
+async fn install_native_extension(
+    id: String,
+    version: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<extension_mgr::InstalledExtension, String> {
+    // id must be publisher.name — reject early (the manager validates again)
+    let (namespace, name) = id
+        .split_once('.')
+        .ok_or_else(|| format!("Native extension id must be 'publisher.name', got '{id}'"))?;
+
+    // Resolve version — latest when unspecified
+    let meta = state.marketplace.ccext_get(&id).await?;
+    let entry = match version.as_deref().filter(|v| !v.is_empty()) {
+        Some(v) => meta
+            .versions
+            .iter()
+            .find(|e| e.version == v)
+            .cloned()
+            .ok_or_else(|| format!("Version {v} of {id} not found in registry"))?,
+        None => meta
+            .versions
+            .first()
+            .cloned()
+            .ok_or_else(|| format!("No versions published for {id}"))?,
+    };
+
+    // Download and verify integrity before touching the extensions dir.
+    // The expected digest comes from the registry metadata (ccext_get), not
+    // from response headers — a hostile endpoint could otherwise serve its
+    // own bytes with its own digest.
+    let bytes = state.marketplace.ccext_download(&id, &entry.version).await?;
+    let expected_sha = entry.sha256.trim();
+    if expected_sha.is_empty() {
+        return Err(format!(
+            "registry metadata for {id} {v} has no sha256 digest — refusing to install",
+            v = entry.version
+        ));
+    }
+    {
+        use sha2::Digest;
+        let actual = hex::encode(sha2::Sha256::digest(&bytes));
+        if actual != expected_sha {
+            return Err(format!(
+                "Integrity check failed for {id} {v}: registry sha256 {expected_sha}, downloaded {actual}",
+                v = entry.version
+            ));
+        }
+    }
+    // Authenticate signed packages against the registry-pinned publisher key
+    marketplace::MarketplaceClient::verify_ccext_package(meta.pinned_key.as_deref(), &entry, &bytes)?;
+
+    let installed = {
+        let mgr = state.extension_mgr.lock().map_err(|e| e.to_string())?;
+        // .ccext archives carry corecode.toml at the root — install_from_vsix
+        // extracts root-level archives and validates corecode.toml
+        mgr.install_from_vsix(namespace, name, &entry.version, None, None, &bytes)?
+    };
+
     state.ipc.send(OutgoingMessage::ExtensionInstalled {
         path: installed.path.clone(),
     });
@@ -949,6 +1441,51 @@ fn get_setting_definitions(
 
 // --- M8b: Terminal Commands ---
 
+fn validate_shell_path(shell: &str) -> Result<(), String> {
+    if shell.contains("..") {
+        return Err("Invalid shell path: path traversal not allowed".to_string());
+    }
+
+    if !shell.contains('/') && !shell.contains('\\') {
+        return Ok(());
+    }
+
+    let path = std::path::Path::new(shell);
+
+    if path.is_absolute() {
+        let safe_shells = [
+            "bash", "zsh", "sh", "fish", "pwsh", "powershell", "dash",
+            "ksh", "csh", "tcsh", "cmd.exe", "powershell.exe", "pwsh.exe",
+        ];
+        let basename = path.file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        if safe_shells.iter().any(|s| *s == basename) {
+            return Ok(());
+        }
+
+        let home = dirs::home_dir().ok_or_else(|| {
+            "Invalid shell path: could not determine user home directory".to_string()
+        })?;
+        let canonical = std::fs::canonicalize(shell)
+            .map_err(|e| format!("Invalid shell path '{}': {}", shell, e))?;
+        let home_canonical = std::fs::canonicalize(&home).unwrap_or(home);
+        if !canonical.starts_with(&home_canonical) {
+            return Err(format!(
+                "Invalid shell path: '{}' is outside the user home directory and is not a recognized shell",
+                shell
+            ));
+        }
+        return Ok(());
+    }
+
+    Err(format!(
+        "Invalid shell path: relative paths with directory components are not allowed ('{}')",
+        shell
+    ))
+}
+
 #[tauri::command]
 fn terminal_create(
     app: AppHandle,
@@ -958,11 +1495,8 @@ fn terminal_create(
     rows: u32,
     state: tauri::State<AppState>,
 ) -> Result<String, String> {
-    // Reject shell paths that contain traversal sequences.
     if let Some(ref s) = shell {
-        if s.contains("..") {
-            return Err("Invalid shell path: path traversal not allowed".to_string());
-        }
+        validate_shell_path(s)?;
     }
     let mut mgr = state.terminal_mgr.lock().map_err(|e| e.to_string())?;
     mgr.create(
@@ -1045,27 +1579,53 @@ fn get_decorations(uri: String, state: tauri::State<AppState>) -> Result<Vec<ipc
 // --- M8b: WebView Commands ---
 
 /// Drain all pending webview panel events (create, setHtml, postMessage, reveal, close).
+///
+/// Merges events from both the Node.js extension host (via IPC) and WASM
+/// extensions (in-process). The frontend is agnostic to the event source.
 #[tauri::command]
 fn get_webview_events(state: tauri::State<AppState>) -> Result<Vec<ipc_bridge::WebviewPanelEvent>, String> {
-    Ok(state.ipc.drain_webview_events())
+    let mut events = state.ipc.drain_webview_events();
+    events.extend(state.wasm_host.drain_webview_events());
+    Ok(events)
 }
 
-/// Forward a message from a webview iframe to the Extension Host.
+/// Forward a message from a webview iframe to the owning extension.
+///
+/// Tries the WASM host first; if the panel is not owned by a WASM extension,
+/// falls back to forwarding via IPC to the Node.js extension host.
 #[tauri::command]
 fn webview_post_message(
     panel_id: String,
     message: serde_json::Value,
     state: tauri::State<AppState>,
 ) -> Result<(), String> {
-    state.ipc.send(OutgoingMessage::WebviewMessageFromWebview { panel_id, message });
-    Ok(())
+    // WASM extensions receive the message as a JSON string (WIT uses `string`);
+    // Node.js extensions receive the original serde_json::Value via IPC.
+    let msg_str = message.to_string();
+    match state.wasm_host.route_webview_message(&panel_id, &msg_str) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Not a WASM panel — forward to Node.js extension host
+            state.ipc.send(OutgoingMessage::WebviewMessageFromWebview { panel_id, message });
+            Ok(())
+        }
+    }
 }
 
-/// Notify Extension Host that the user closed a webview panel.
+/// Notify the owning extension that the user closed a webview panel.
+///
+/// Tries the WASM host first; if the panel is not owned by a WASM extension,
+/// falls back to notifying the Node.js extension host via IPC.
 #[tauri::command]
 fn webview_close_by_user(panel_id: String, state: tauri::State<AppState>) -> Result<(), String> {
-    state.ipc.send(OutgoingMessage::WebviewClosedByUser { panel_id });
-    Ok(())
+    match state.wasm_host.route_webview_close(&panel_id) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Not a WASM panel — forward to Node.js extension host
+            state.ipc.send(OutgoingMessage::WebviewClosedByUser { panel_id });
+            Ok(())
+        }
+    }
 }
 
 // --- workspace.applyEdit ---
@@ -1093,36 +1653,47 @@ fn uri_to_path(uri: &str) -> String {
 
 /// Apply a list of text edits (in descending position order) to a plain string.
 /// Each edit replaces [start_line:start_col, end_line:end_col) with `new_text`.
-fn apply_text_edits_to_str(text: &str, edits: &[ipc_bridge::WorkspaceTextEdit]) -> String {
-    // Collect lines, preserving original line endings.
+fn apply_text_edits_to_str(text: &str, edits: &[ipc_bridge::WorkspaceTextEdit]) -> Result<String, String> {
     let mut lines: Vec<String> = text.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect();
     let has_trailing_newline = text.ends_with('\n') || text.ends_with("\r\n");
 
-    for edit in edits {
-        let sl = edit.start_line.min(lines.len().saturating_sub(1));
-        let el = edit.end_line.min(lines.len().saturating_sub(1));
+    for (i, edit) in edits.iter().enumerate() {
+        if edit.start_line >= lines.len() || edit.end_line >= lines.len() {
+            return Err(format!(
+                "Edit #{} references line {}-{} but file only has {} line(s)",
+                i, edit.start_line, edit.end_line, lines.len()
+            ));
+        }
 
-        let start_line_text = lines.get(sl).cloned().unwrap_or_default();
-        let end_line_text = lines.get(el).cloned().unwrap_or_default();
+        let start_line_text = lines.get(edit.start_line).cloned().unwrap_or_default();
+        let end_line_text = lines.get(edit.end_line).cloned().unwrap_or_default();
 
-        let sc = edit.start_col.min(start_line_text.len());
-        let ec = edit.end_col.min(end_line_text.len());
+        if edit.start_col > start_line_text.len() {
+            return Err(format!(
+                "Edit #{} start_col {} exceeds line {} length {}",
+                i, edit.start_col, edit.start_line, start_line_text.len()
+            ));
+        }
+        if edit.end_col > end_line_text.len() {
+            return Err(format!(
+                "Edit #{} end_col {} exceeds line {} length {}",
+                i, edit.end_col, edit.end_line, end_line_text.len()
+            ));
+        }
 
-        let prefix = start_line_text[..sc].to_string();
-        let suffix = end_line_text[ec..].to_string();
+        let prefix = start_line_text[..edit.start_col].to_string();
+        let suffix = end_line_text[edit.end_col..].to_string();
         let combined = prefix + &edit.new_text + &suffix;
 
         let new_lines: Vec<String> = combined.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect();
-        let new_len = new_lines.len();
-        lines.splice(sl..=el, new_lines);
-        let _ = new_len; // suppress warning
+        lines.splice(edit.start_line..=edit.end_line, new_lines);
     }
 
     let mut result = lines.join("\n");
     if has_trailing_newline && !result.ends_with('\n') {
         result.push('\n');
     }
-    result
+    Ok(result)
 }
 
 /// Drain pending workspace edit requests and return them to the frontend.
@@ -1145,18 +1716,46 @@ fn apply_workspace_edit(
 ) -> Result<(), String> {
     let wid = window.label().to_string();
     let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-    let ws = guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+    let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
     let original_active = ws.active_path().cloned();
 
     for file_edit in &changes {
         if file_edit.edits.is_empty() {
             continue;
         }
-        // Canonicalize and enforce home-dir confinement before any file I/O.
-        // Without this check a malicious extension could write to arbitrary paths
-        // (e.g. ~/.ssh/authorized_keys) by supplying a crafted file:// URI.
+        // Layer 1: canonicalize and enforce home-dir confinement.
         let path_str = validate_path(&uri_to_path(&file_edit.uri))?;
         let path = std::path::PathBuf::from(&path_str);
+
+        // Layer 2: restrict workspace edits to the workspace root.
+        // Exception: files already open in a buffer are allowed even without a
+        // workspace root, because the user has explicitly opened them for editing.
+        // This supports the common "open single file, let extension format it"
+        // workflow where no folder is registered.
+        let in_buffer = ws.has_buffer(&path);
+        match ws.workspace_root() {
+            Some(root) if path.starts_with(root) => {}
+            Some(root) => {
+                return Err(format!(
+                    "Access denied: '{}' is outside the workspace root '{}'. \
+                     Workspace edits must target files within the workspace folder.",
+                    path_str,
+                    root.display()
+                ));
+            }
+            None if in_buffer => {
+                // No workspace root but file is open — allow; already home-dir
+                // restricted by Layer 1.
+            }
+            None => {
+                return Err(format!(
+                    "Access denied: '{}' — no workspace root is registered and \
+                     the file is not open in the editor. Open a workspace folder \
+                     before applying edits to files outside the editor.",
+                    path_str
+                ));
+            }
+        }
 
         // Sort edits in reverse position order so that applying each one does not
         // shift the positions of later edits.
@@ -1194,7 +1793,7 @@ fn apply_workspace_edit(
             // Apply to a file not currently open in the editor.
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read {}: {}", path_str, e))?;
-            let modified = apply_text_edits_to_str(&text, &edits);
+            let modified = apply_text_edits_to_str(&text, &edits)?;
             std::fs::write(&path, &modified)
                 .map_err(|e| format!("Failed to write {}: {}", path_str, e))?;
         }
@@ -1226,6 +1825,16 @@ fn validate_dir_path(path: &str) -> Result<String, String> {
         ));
     }
     Ok(canonical.to_string_lossy().to_string())
+}
+
+fn validate_relative_file_path(file_path: &str) -> Result<(), String> {
+    if file_path.contains("..") {
+        return Err("Invalid file path: path traversal not allowed".to_string());
+    }
+    if std::path::Path::new(file_path).is_absolute() {
+        return Err("Invalid file path: absolute paths not allowed".to_string());
+    }
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -1278,12 +1887,7 @@ fn git_diff_file(
     staged: bool,
 ) -> Result<String, String> {
     let dir = validate_dir_path(&workspace_path)?;
-    if file_path.contains("..") {
-        return Err("Invalid file path: path traversal not allowed".to_string());
-    }
-    if std::path::Path::new(&file_path).is_absolute() {
-        return Err("Invalid file path: absolute paths not allowed".to_string());
-    }
+    validate_relative_file_path(&file_path)?;
 
     let mut cmd = std::process::Command::new("git");
     cmd.arg("-C").arg(&dir);
@@ -1322,12 +1926,7 @@ fn git_diff_file(
 #[tauri::command]
 fn git_stage(workspace_path: String, file_path: String) -> Result<(), String> {
     let dir = validate_dir_path(&workspace_path)?;
-    if file_path.contains("..") {
-        return Err("Invalid file path".to_string());
-    }
-    if std::path::Path::new(&file_path).is_absolute() {
-        return Err("Invalid file path: absolute paths not allowed".to_string());
-    }
+    validate_relative_file_path(&file_path)?;
     let output = std::process::Command::new("git")
         .args(["-C", &dir, "add", "--", &file_path])
         .output()
@@ -1342,12 +1941,7 @@ fn git_stage(workspace_path: String, file_path: String) -> Result<(), String> {
 #[tauri::command]
 fn git_unstage(workspace_path: String, file_path: String) -> Result<(), String> {
     let dir = validate_dir_path(&workspace_path)?;
-    if file_path.contains("..") {
-        return Err("Invalid file path".to_string());
-    }
-    if std::path::Path::new(&file_path).is_absolute() {
-        return Err("Invalid file path: absolute paths not allowed".to_string());
-    }
+    validate_relative_file_path(&file_path)?;
     let output = std::process::Command::new("git")
         .args(["-C", &dir, "restore", "--staged", "--", &file_path])
         .output()
@@ -1362,12 +1956,7 @@ fn git_unstage(workspace_path: String, file_path: String) -> Result<(), String> 
 #[tauri::command]
 fn git_discard(workspace_path: String, file_path: String) -> Result<(), String> {
     let dir = validate_dir_path(&workspace_path)?;
-    if file_path.contains("..") {
-        return Err("Invalid file path".to_string());
-    }
-    if std::path::Path::new(&file_path).is_absolute() {
-        return Err("Invalid file path: absolute paths not allowed".to_string());
-    }
+    validate_relative_file_path(&file_path)?;
     let output = std::process::Command::new("git")
         .args(["-C", &dir, "restore", "--", &file_path])
         .output()
@@ -1451,7 +2040,7 @@ fn debug_poll_events(
     session_id: String,
     state: tauri::State<AppState>,
 ) -> Result<Vec<debug::DebugEvent>, String> {
-    Ok(state.debug_mgr.drain_events(&session_id))
+    state.debug_mgr.drain_events(&session_id)
 }
 
 /// Stop a debug session and kill the adapter process.
@@ -1478,11 +2067,15 @@ fn register_workspace(
 ) -> Result<(), String> {
     let wid = window.label().to_string();
     let dir = validate_dir_path(&root_path)?;
-    // Ensure workspace state entry exists for this window
+    // Ensure workspace state entry exists for this window and record the root.
     {
         let mut guard = state.workspaces.lock().map_err(|e| e.to_string())?;
-        guard.entry(wid.clone()).or_insert_with(WorkspaceState::new);
+        let ws = get_or_create_ws(&mut guard, wid.clone(), &state.grammar_registry);
+        ws.set_workspace_root(std::path::PathBuf::from(&dir));
     }
+    // Inform WASM extensions so workspace_read calls resolve against the new root.
+    state.wasm_host.notify_workspace_opened(std::path::PathBuf::from(&dir));
+
     state.ipc.send(OutgoingMessage::WorkspaceRegister {
         workspace_id: wid,
         root_path: dir,
@@ -1535,7 +2128,7 @@ pub struct HighlightedLine {
 pub struct Token {
     pub start: usize,
     pub end: usize,
-    pub kind: String,
+    pub kind: &'static str,
 }
 
 #[derive(serde::Serialize)]
@@ -1584,9 +2177,35 @@ pub fn run() {
         .expect("Failed to create marketplace client");
     let ext_mgr = extension_mgr::ExtensionManager::new()
         .expect("Failed to create extension manager");
-    let settings_store = settings::SettingsStore::new()
-        .expect("Failed to create settings store");
+    let settings_store = Arc::new(Mutex::new(
+        settings::SettingsStore::new().expect("Failed to create settings store"),
+    ));
     let debug_manager = Arc::new(debug::DebugManager::new());
+    let mut wasm_host_mgr = wasm_host::WasmHostManager::new()
+        .expect("Failed to initialise WASM extension host");
+    wasm_host_mgr.set_settings(settings_store.clone());
+    let grammar_reg = Arc::new(grammar_registry::GrammarRegistry::new());
+    wasm_host_mgr.set_grammar_registry(grammar_reg.clone());
+
+    // Populate the native grammar dylib allowlist from user settings.
+    // Native dylibs execute code outside the WASM sandbox, so only
+    // explicitly trusted extension IDs may load them.
+    {
+        let allowlist_val = settings_store.lock().unwrap()
+            .get("security.nativeGrammarAllowlist");
+        let mut ids = std::collections::HashSet::new();
+        if let serde_json::Value::Array(arr) = allowlist_val {
+            for v in arr {
+                if let serde_json::Value::String(s) = v {
+                    ids.insert(s);
+                }
+            }
+        }
+        if !ids.is_empty() {
+            log::info!("Native grammar allowlist: {:?}", ids);
+        }
+        wasm_host_mgr.set_native_grammar_allowlist(ids);
+    }
 
     // Get user extensions directory path for Extension Host
     let user_extensions_dir = ext_mgr.extensions_dir().to_string_lossy().to_string();
@@ -1600,10 +2219,12 @@ pub fn run() {
             ipc,
             marketplace: marketplace_client,
             extension_mgr: Mutex::new(ext_mgr),
-            settings: Mutex::new(settings_store),
+            settings: settings_store,
             terminal_mgr: Mutex::new(terminal::TerminalManager::new()),
             debug_mgr: debug_manager,
             window_count: Arc::new(Mutex::new(1)), // main window
+            wasm_host: wasm_host_mgr,
+            grammar_registry: grammar_reg,
         })
         .invoke_handler(tauri::generate_handler![
             open_file,
@@ -1633,29 +2254,48 @@ pub fn run() {
             respond_ui_request,
             get_status_bar_items,
             get_output_lines,
-            // M6: LSP commands
+            get_wasm_output_lines,
+            get_wasm_notifications,
+            get_wasm_status_bar_items,
+            // M6: LSP commands (LSP-only; lang_* superset commands above
+            // handle hover/completion/definition/references/code-action/format/rename)
             lsp_inline_completion,
             lsp_inlay_hints,
             get_tree_view_events,
             tree_view_get_children,
-            lsp_hover,
-            lsp_completion,
-            lsp_definition,
-            lsp_references,
-            lsp_code_action,
             lsp_signature_help,
             lsp_document_symbols,
-            lsp_format,
-            lsp_rename,
             lsp_prepare_rename,
             lsp_document_highlights,
+            lsp_type_definition,
+            lsp_implementation,
+            lsp_selection_ranges,
+            lsp_document_links,
+            lsp_resolve_document_link,
+            lsp_semantic_tokens_full,
+            lsp_semantic_tokens_range,
+            lsp_semantic_tokens_delta,
             get_show_text_document_requests,
+            // Unified Language Dispatch
+            lang_completions,
+            lang_hover,
+            lang_diagnostics,
+            lang_definition,
+            lang_references,
+            lang_format_document,
+            lang_format_range,
+            lang_rename,
+            lang_code_actions,
+            lang_workspace_symbols,
+            lang_folding_ranges,
             // M8: Marketplace commands
             marketplace_search,
             marketplace_get_extension,
             marketplace_list_installed,
             install_extension,
             uninstall_extension,
+            marketplace_get_native,
+            install_native_extension,
             check_extension_updates,
             get_extensions_dir,
             // M8: Settings commands
@@ -1716,6 +2356,26 @@ pub fn run() {
                 })
                 .expect("Failed to spawn Extension Host manager thread");
 
+            // Activate WASM extensions in a background thread (in-process but
+            // potentially slow on first engine compilation).
+            let wasm_ext_dir = user_extensions_dir.clone();
+            let app_handle2 = app.handle().clone();
+            std::thread::Builder::new()
+                .name("wasm-ext-host".to_string())
+                .spawn(move || {
+                    let state = app_handle2.state::<AppState>();
+                    let extensions_dir = std::path::PathBuf::from(&wasm_ext_dir);
+                    let errors = state.wasm_host.activate_all(&extensions_dir, None);
+                    for e in errors {
+                        log::error!("WASM extension error: {e}");
+                    }
+                    log::info!(
+                        "WASM extension host ready ({} active)",
+                        state.wasm_host.active_count()
+                    );
+                })
+                .expect("Failed to spawn WASM Extension Host thread");
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1725,6 +2385,7 @@ pub fn run() {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     ext_host::kill_extension_host();
+                    state.wasm_host.deactivate_all();
                 }
             }
         })
@@ -1876,35 +2537,74 @@ mod tests {
     // ── git path validation ──────────────────────────────────────────────────
 
     #[test]
-    fn git_diff_file_rejects_dotdot() {
-        // The path traversal check is inside the tauri command, so we test
-        // the guard logic directly by simulating its condition.
-        let file_path = "../../../etc/passwd";
-        assert!(
-            file_path.contains(".."),
-            "test setup: path should contain dotdot"
-        );
+    fn validate_relative_file_path_rejects_dotdot() {
+        assert!(validate_relative_file_path("../../../etc/passwd").is_err());
+        assert!(validate_relative_file_path("foo/../bar").is_err());
+    }
+
+    #[test]
+    fn validate_relative_file_path_rejects_absolute() {
+        #[cfg(not(target_os = "windows"))]
+        let path = "/etc/passwd";
+        #[cfg(target_os = "windows")]
+        let path = "C:\\Windows\\System32\\hosts";
+        assert!(validate_relative_file_path(path).is_err());
+    }
+
+    #[test]
+    fn validate_relative_file_path_accepts_relative() {
+        assert!(validate_relative_file_path("src/main.rs").is_ok());
+        assert!(validate_relative_file_path("foo/bar.txt").is_ok());
     }
 
     #[test]
     fn git_commands_reject_absolute_paths() {
-        // Use a platform-appropriate absolute path.
         #[cfg(not(target_os = "windows"))]
         let file_path = "/etc/passwd";
         #[cfg(target_os = "windows")]
         let file_path = "C:\\Windows\\System32\\drivers\\etc\\hosts";
+        assert!(validate_relative_file_path(file_path).is_err());
+    }
 
-        assert!(
-            std::path::Path::new(file_path).is_absolute(),
-            "test setup: path should be absolute"
-        );
-        // The actual guard in git_diff_file / git_stage / git_unstage / git_discard
-        // calls is_absolute() and returns an error — verified here structurally.
-        let result: Result<(), String> = if std::path::Path::new(file_path).is_absolute() {
-            Err("Invalid file path: absolute paths not allowed".to_string())
-        } else {
-            Ok(())
+    // ── shell validation ─────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_shell_accepts_bare_names() {
+        assert!(validate_shell_path("bash").is_ok());
+        assert!(validate_shell_path("zsh").is_ok());
+        assert!(validate_shell_path("sh").is_ok());
+    }
+
+    #[test]
+    fn validate_shell_rejects_dotdot() {
+        assert!(validate_shell_path("../evil").is_err());
+    }
+
+    #[test]
+    fn validate_shell_rejects_relative_with_dir() {
+        assert!(validate_shell_path("./evil").is_err());
+        assert!(validate_shell_path("bin/shell").is_err());
+    }
+
+    // ── apply_text_edits_to_str bounds checking ──────────────────────────────
+
+    #[test]
+    fn apply_text_edits_to_str_rejects_out_of_bounds_line() {
+        let text = "line0\nline1\n";
+        let edit = ipc_bridge::WorkspaceTextEdit {
+            start_line: 5, start_col: 0, end_line: 6, end_col: 0,
+            new_text: "x".to_string(),
         };
-        assert!(result.is_err(), "absolute path should be rejected");
+        assert!(apply_text_edits_to_str(text, &[edit]).is_err());
+    }
+
+    #[test]
+    fn apply_text_edits_to_str_rejects_out_of_bounds_col() {
+        let text = "hi\n";
+        let edit = ipc_bridge::WorkspaceTextEdit {
+            start_line: 0, start_col: 0, end_line: 0, end_col: 99,
+            new_text: "x".to_string(),
+        };
+        assert!(apply_text_edits_to_str(text, &[edit]).is_err());
     }
 }

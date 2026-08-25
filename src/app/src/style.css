@@ -30,6 +30,24 @@
   --selection-bg: var(--selection);
   --bg-editor: var(--bg);
   --bg-sidebar: var(--bg-gutter);
+
+  /* Diagnostic colors */
+  --diag-error: #f38ba8;
+  --diag-warning: #fab387;
+  --diag-info: #89b4fa;
+  --diag-hint: #a6e3a1;
+
+  /* Tab colors */
+  --tab-hover-bg: rgba(49, 50, 68, 0.5);
+  --tab-close-hover-bg: rgba(243, 139, 168, 0.3);
+  --tab-close-hover-fg: #f38ba8;
+
+  /* Input borders */
+  --border-input: #45475a;
+
+  /* Layout */
+  --bottom-panel-height: 280px;
+  --webview-bg: var(--bg);
 }
 
 * {
@@ -127,7 +145,7 @@ body {
 
 .tab:hover {
   color: var(--fg);
-  background: rgba(49, 50, 68, 0.5);
+  background: var(--tab-hover-bg);
 }
 
 .tab.active {
@@ -160,8 +178,8 @@ body {
 }
 
 .tab .tab-close:hover {
-  background: rgba(243, 139, 168, 0.3);
-  color: #f38ba8;
+  background: var(--tab-close-hover-bg);
+  color: var(--tab-close-hover-fg);
 }
 
 .tab-empty-hint {
@@ -375,7 +393,7 @@ body {
   width: 100%;
   padding: 6px 10px;
   background: var(--bg);
-  border: 1px solid #45475a;
+  border: 1px solid var(--border-input);
   border-radius: 4px;
   color: var(--fg);
   font-family: inherit;
@@ -527,6 +545,26 @@ body {
   font-size: 10px;
   color: var(--fg-dim);
   margin-left: auto;
+}
+
+/* Host-type badge (Phase 6): Native (WASM) vs Node.js */
+.ext-kind-native,
+.ext-kind-node {
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 8px;
+  letter-spacing: 0.02em;
+}
+
+.ext-kind-native {
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+.ext-kind-node {
+  color: var(--fg-dim);
+  border: 1px solid var(--fg-dim);
 }
 
 /* ─── M8: Settings Panel ──────────────────────────────────── */
@@ -777,32 +815,32 @@ body {
 
 /* Diagnostic underlines */
 .diag-error {
-  text-decoration: wavy underline #f38ba8;
+  text-decoration: wavy underline var(--diag-error);
   text-underline-offset: 3px;
 }
 
 .diag-warning {
-  text-decoration: wavy underline #fab387;
+  text-decoration: wavy underline var(--diag-warning);
   text-underline-offset: 3px;
 }
 
 .diag-info {
-  text-decoration: wavy underline #89b4fa;
+  text-decoration: wavy underline var(--diag-info);
   text-underline-offset: 3px;
 }
 
 .diag-hint {
-  text-decoration: wavy underline #a6e3a1;
+  text-decoration: wavy underline var(--diag-hint);
   text-underline-offset: 3px;
 }
 
 /* Diagnostic gutter markers */
 .gutter-error {
-  color: #f38ba8;
+  color: var(--diag-error);
 }
 
 .gutter-warning {
-  color: #fab387;
+  color: var(--diag-warning);
 }
 
 /* Find/Replace Bar */
@@ -878,10 +916,14 @@ body {
   display: none !important;
 }
 
+.sub-panel-hidden {
+  display: none !important;
+}
+
 #bottom-panel {
   display: flex;
   flex-direction: column;
-  height: 280px;
+  height: var(--bottom-panel-height);
   border-top: 1px solid var(--border);
 }
 
@@ -1560,7 +1602,7 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: #ffffff;
+  background: var(--webview-bg);
 }
 
 .webview-iframe {
@@ -1628,9 +1670,19 @@ body {
   --syn-punctuation: #000000;
 }
 
-/* High-contrast focus rings */
-:root.hc-dark *:focus,
-:root.hc-light *:focus {
+/* High-contrast focus rings — keyboard focus only, targeted interactive elements */
+:root.hc-dark a:focus-visible,
+:root.hc-dark button:focus-visible,
+:root.hc-dark input:focus-visible,
+:root.hc-dark select:focus-visible,
+:root.hc-dark textarea:focus-visible,
+:root.hc-dark [tabindex]:not([tabindex="-1"]):focus-visible,
+:root.hc-light a:focus-visible,
+:root.hc-light button:focus-visible,
+:root.hc-light input:focus-visible,
+:root.hc-light select:focus-visible,
+:root.hc-light textarea:focus-visible,
+:root.hc-light [tabindex]:not([tabindex="-1"]):focus-visible {
   outline: 2px solid var(--accent) !important;
   outline-offset: 1px;
 }
@@ -1801,6 +1853,15 @@ input:focus-visible,
 .debug-console-line.info   { color: var(--fg-dim); }
 
 /* Scrollbar */
+#editor,
+#output-content,
+#file-tree,
+#ext-list,
+#settings-list {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) var(--bg);
+}
+
 #editor::-webkit-scrollbar,
 #output-content::-webkit-scrollbar,
 #file-tree::-webkit-scrollbar,
@@ -1830,6 +1891,13 @@ input:focus-visible,
 #ext-list::-webkit-scrollbar-thumb:hover,
 #settings-list::-webkit-scrollbar-thumb:hover {
   background: #45475a;
+}
+
+#autocomplete-list,
+#references-list,
+#symbols-list {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
 }
 
 #autocomplete-list::-webkit-scrollbar,
@@ -1873,7 +1941,12 @@ input:focus-visible,
   flex-shrink: 0;
 }
 #sidebar-header-treeviews button {
-  background: none; border: none; color: var(--fg-muted); cursor: pointer; font-size: 14px; padding: 0 2px;
+  background: none;
+  border: none;
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 2px;
 }
 #treeviews-container {
   flex: 1;
@@ -1914,6 +1987,16 @@ input:focus-visible,
 .tv-item .tv-label { overflow: hidden; text-overflow: ellipsis; }
 .tv-item .tv-description { font-size: 11px; color: var(--fg-muted); margin-left: 4px; }
 .tv-children { padding-left: 14px; }
+
+.empty-state {
+  padding: 8px;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+.debug-btn-hidden {
+  display: none;
+}
 
 /* ── SCM Panel ────────────────────────────────────────────── */
 
@@ -2215,3 +2298,4 @@ input:focus-visible,
 .diff-line.meta { background: rgba(100, 149, 237, 0.08); }
 .diff-line.meta .diff-line-content { color: #6495ed; }
 .diff-line.file-header .diff-line-content { color: var(--fg-muted, #888); font-weight: 600; }
+

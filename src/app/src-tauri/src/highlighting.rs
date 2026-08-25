@@ -52,7 +52,7 @@ fn collect_tokens_in_range(
                 tokens.push(Token {
                     start,
                     end,
-                    kind: kind.to_string(),
+                    kind,
                 });
             }
         }
@@ -80,7 +80,7 @@ fn map_kind(kind: &str) -> &'static str {
         // Python-specific
         | "def" | "elif" | "except" | "finally" | "global" | "lambda"
         | "nonlocal" | "pass" | "raise" | "with" | "assert" | "del"
-        | "and" | "or" | "not" => "keyword",
+        | "and" | "or" | "not" | "is" => "keyword",
 
         // Strings
         "string" | "string_fragment" | "template_string" | "template_literal"

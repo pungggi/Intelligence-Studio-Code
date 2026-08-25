@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "identifier": "dev.corecode.editor",
   "build": {
+    "beforeDevCommand": "npx --yes http-server src -p 1420 -c-1 -s",
     "frontendDist": "../src",
     "devUrl": "http://localhost:1420"
   },
@@ -11,6 +12,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
+        "label": "main",
         "title": "CoreCode",
         "width": 1280,
         "height": 800,
@@ -21,17 +23,17 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/icon.png"]
+    "icon": ["icons/icon.png", "icons/icon.ico"]
   },
   "plugins": {
     "shell": {
-      "open": true
+      "open": false
     }
   }
 }

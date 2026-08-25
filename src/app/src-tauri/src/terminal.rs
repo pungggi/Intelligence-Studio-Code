@@ -8,8 +8,10 @@ use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::thread;
+use std::thread::JoinHandle;
 use tauri::{AppHandle, Emitter};
 
 /// Counter for generating unique terminal IDs.
@@ -58,6 +60,12 @@ struct PtySession {
     master: SendableMaster,
     /// Human-readable title (shell name).
     title: String,
+    /// Signals the reader thread to stop when set to `true`.
+    stop_flag: Arc<AtomicBool>,
+    /// Set to `true` by the reader thread just before it exits.
+    exited: Arc<AtomicBool>,
+    /// Join handle for the PTY reader thread.
+    reader_thread: Option<JoinHandle<()>>,
 }
 
 /// Manages multiple terminal sessions.
@@ -65,11 +73,17 @@ pub struct TerminalManager {
     sessions: HashMap<String, PtySession>,
 }
 
-impl TerminalManager {
-    pub fn new() -> Self {
+impl Default for TerminalManager {
+    fn default() -> Self {
         Self {
             sessions: HashMap::new(),
         }
+    }
+}
+
+impl TerminalManager {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Create a new terminal session, spawning a shell in the given directory.
@@ -104,7 +118,7 @@ impl TerminalManager {
             cmd.cwd(dir);
         }
 
-        let child = pair.slave.spawn_command(cmd).context("Failed to spawn shell")?;
+        let mut child = pair.slave.spawn_command(cmd).context("Failed to spawn shell")?;
         // Drop the slave — we only need the master side.
         drop(pair.slave);
 
@@ -114,12 +128,23 @@ impl TerminalManager {
         let reader = pair.master.try_clone_reader().context("Failed to clone PTY reader")?;
         let term_id = id.clone();
         let handle = app_handle.clone();
-        thread::Builder::new()
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_flag_reader = Arc::clone(&stop_flag);
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_reader = Arc::clone(&exited);
+        let reader_thread = match thread::Builder::new()
             .name(format!("pty-reader-{term_id}"))
             .spawn(move || {
-                pty_reader_thread(reader, term_id, handle);
-            })
-            .context("Failed to spawn PTY reader thread")?;
+                pty_reader_thread(reader, term_id, handle, stop_flag_reader, exited_reader);
+            }) {
+            Ok(handle) => handle,
+            Err(e) => {
+                // Kill child process to prevent leak.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow::anyhow!("Failed to spawn PTY reader thread: {e}"));
+            }
+        };
 
         self.sessions.insert(
             id.clone(),
@@ -128,6 +153,9 @@ impl TerminalManager {
                 child,
                 master: SendableMaster(pair.master),
                 title,
+                stop_flag,
+                exited,
+                reader_thread: Some(reader_thread),
             },
         );
 
@@ -163,16 +191,38 @@ impl TerminalManager {
     /// Close a terminal, killing the child process.
     pub fn close(&mut self, terminal_id: &str) -> Result<()> {
         if let Some(mut session) = self.sessions.remove(terminal_id) {
+            // Signal the reader thread to stop before releasing resources.
+            session.stop_flag.store(true, Ordering::Relaxed);
             // Drop writer to close stdin — this usually causes the shell to exit.
             drop(session.writer);
             // Kill the child process if still running.
             let _ = session.child.kill();
             let _ = session.child.wait();
+            // Poll the exited flag with a bounded timeout so close() never hangs
+            // indefinitely if the reader thread is blocked on a slow read.
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(300);
+            while !session.exited.load(Ordering::Relaxed) {
+                if std::time::Instant::now() >= deadline {
+                    log::warn!(
+                        "[Terminal] Reader thread for {} did not exit in time, detaching",
+                        terminal_id
+                    );
+                    session.reader_thread.take(); // drop without joining
+                    log::info!("[Terminal] Closed terminal {}", terminal_id);
+                    return Ok(());
+                }
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if let Some(handle) = session.reader_thread.take() {
+                let _ = handle.join();
+            }
             log::info!("[Terminal] Closed terminal {}", terminal_id);
+            Ok(())
         } else {
             log::warn!("[Terminal] close called for unknown terminal: {}", terminal_id);
+            Err(anyhow::anyhow!("unknown terminal: {}", terminal_id))
         }
-        Ok(())
     }
 
     /// List active terminals.
@@ -186,19 +236,26 @@ impl TerminalManager {
             .collect()
     }
 
-    /// Close all terminals (used during shutdown).
-    pub fn close_all(&mut self) {
-        let ids: Vec<String> = self.sessions.keys().cloned().collect();
-        for id in ids {
-            let _ = self.close(&id);
-        }
-    }
 }
 
 /// Background thread that reads PTY output and emits it to the frontend.
-fn pty_reader_thread(mut reader: Box<dyn Read + Send>, terminal_id: String, app: AppHandle) {
+///
+/// Exits when EOF/error is received on the PTY reader **or** when `stop` is
+/// set to `true` (signal sent by [`TerminalManager::close`]).
+fn pty_reader_thread(
+    mut reader: Box<dyn Read + Send>,
+    terminal_id: String,
+    app: AppHandle,
+    stop: Arc<AtomicBool>,
+    exited: Arc<AtomicBool>,
+) {
     let mut buf = [0u8; 4096];
     loop {
+        // Check the cancellation flag before each blocking read so that
+        // close() can terminate the thread promptly after killing the child.
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         match reader.read(&mut buf) {
             Ok(0) => {
                 // EOF — shell exited.
@@ -223,6 +280,10 @@ fn pty_reader_thread(mut reader: Box<dyn Read + Send>, terminal_id: String, app:
                 );
             }
             Err(e) => {
+                if stop.load(Ordering::Relaxed) {
+                    // Error was caused by close() dropping the master — not a real error.
+                    break;
+                }
                 log::error!("[Terminal] Read error on {}: {}", terminal_id, e);
                 let _ = app.emit(
                     "terminal-exit",
@@ -235,6 +296,8 @@ fn pty_reader_thread(mut reader: Box<dyn Read + Send>, terminal_id: String, app:
             }
         }
     }
+    // Signal close() that this thread has finished so it can join without blocking.
+    exited.store(true, Ordering::Relaxed);
 }
 
 /// Get the default shell for the current platform.

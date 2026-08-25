@@ -1,7 +1,7 @@
 # CoreCode — Extension Compatibility Matrix
 
-> **Status**: M12 (current)
-> **Last updated**: 2026-03-28
+> **Status**: M12 (current) — all ⚠️/❌ entries triaged (2026-08-24)
+> **Last updated**: 2026-08-24
 > **Shim version**: M12 + vscode.tasks + vscode.scm + git API
 
 ## Legend
@@ -37,14 +37,14 @@
 | 17 | **Error Lens** `usernamehw.errorlens` | `languages.onDidChangeDiagnostics`, `createTextEditorDecorationType`, `activeTextEditor`, `EventEmitter` | ✅ Compatible | — |
 | 18 | **Todo Tree** `Gruntfuggly.todo-tree` | `registerTreeDataProvider`, `createTextEditorDecorationType`, `workspaceFolders`, `workspace.findFiles`, `ThemeIcon` | ✅ Compatible | — |
 | 19 | **CodeSnap** `adpyke.codesnap` | `createWebviewPanel`, `activeTextEditor`, `Selection`, `registerCommand` | ✅ Compatible | WebView panel with canvas screenshot supported |
-| 20 | **Live Share** `ms-vsliveshare.vsliveshare` | `extensions.getExtension`, `env.openExternal`, `createStatusBarItem`, `EventEmitter` | ⚠️ Partial | Collaboration backend requires Live Share service (external proprietary); no crash |
+| 20 | **Live Share** `ms-vsliveshare.vsliveshare` | `extensions.getExtension`, `env.openExternal`, `createStatusBarItem`, `EventEmitter` | ⚠️ Partial | Collaboration backend requires Live Share service (external proprietary); no crash. **Triage: won't fix** — external proprietary service with no public protocol (VSCodium has the same limitation) |
 | 21 | **Auto Close Tag** `formulahendry.auto-close-tag` | `onDidChangeTextDocument`, `activeTextEditor`, `getConfiguration` | ✅ Compatible | — |
 | 22 | **Go** `golang.go` | `createTerminal`, `registerCompletionItemProvider`, `registerHoverProvider`, `registerDefinitionProvider`, `workspace.fs`, `vscode.debug`, `vscode.tasks` | ✅ Compatible | `vscode.tasks` implemented (M12); debugging (M9 DAP) and test runner all functional |
 | 23 | **C#** `ms-dotnettools.csharp` | All LSP providers, `createOutputChannel`, `createTerminal`, `vscode.debug`, `vscode.tasks` | ✅ Compatible | `vscode.tasks` implemented (M12); OmniSharp/Roslyn LSP, debugging, and build tasks all functional |
 | 24 | **Java Extension Pack** `vscjava.vscode-java-pack` | All LSP providers, `createTreeView`, `registerTreeDataProvider`, `vscode.debug`, `vscode.tasks` | ✅ Compatible | `vscode.tasks` implemented (M12); JDT LS, debugging, and maven/gradle tasks all functional |
 | 25 | **Git Graph** `mhutchie.git-graph` | `createWebviewPanel`, `registerCommand`, `workspaceFolders`, `workspace.findFiles` | ✅ Compatible | — |
-| 26 | **Jupyter** `ms-toolsai.jupyter` | `createWebviewPanel`, `registerNotebookSerializer`, `vscode.notebook`, `createOutputChannel` | ⚠️ Partial | `vscode.notebooks` API now stubbed (`createNotebookController`, `registerNotebookSerializer`, all types); notebook cell execution UI not yet rendered in canvas editor |
-| 27 | **Remote - WSL** `ms-vscode-remote.remote-wsl` | `createTerminal`, `createStatusBarItem`, `env.remoteName`, `extensions.getExtension` | ⚠️ Partial | Full filesystem virtualization requires `RemoteAuthorityResolver` (not implemented) |
+| 26 | **Jupyter** `ms-toolsai.jupyter` | `createWebviewPanel`, `registerNotebookSerializer`, `vscode.notebook`, `createOutputChannel` | ⚠️ Partial | `vscode.notebooks` API now stubbed (`createNotebookController`, `registerNotebookSerializer`, all types); notebook cell execution UI not yet rendered in canvas editor. **Triage: genuine feature gap (P3)** — needs notebook document model, canvas cell UI, and execution wiring; `openNotebookDocument()` currently rejects |
+| 27 | **Remote - WSL** `ms-vscode-remote.remote-wsl` | `createTerminal`, `createStatusBarItem`, `env.remoteName`, `extensions.getExtension` | ⚠️ Partial | Full filesystem virtualization requires `RemoteAuthorityResolver` (not implemented — zero occurrences in the shim). **Triage: deferred (P4)** — shares remote infrastructure with Remote-SSH; interim option: open WSL distros via UNC `\\wsl.localhost\<distro>` paths through the local fs stack |
 | 28 | **PowerShell** `ms-vscode.PowerShell` | `createTerminal`, `registerCompletionItemProvider`, `createOutputChannel`, `vscode.debug`, `vscode.tasks` | ✅ Compatible | `vscode.tasks` implemented (M12); LSP/REPL, debugging, and task execution all functional |
 | 29 | **Markdown All in One** `yzhang.markdown-all-in-one` | `registerCompletionItemProvider`, `registerDocumentFormattingEditProvider`, `onDidChangeTextDocument`, `getConfiguration`, `registerCommand` | ✅ Compatible | — |
 | 30 | **Better Comments** `aaron-bond.better-comments` | `createTextEditorDecorationType`, `activeTextEditor`, `onDidChangeTextDocument`, `getConfiguration` | ✅ Compatible | — |
@@ -58,7 +58,7 @@
 | 38 | **SonarLint** `SonarSource.sonarlint-vscode` | `createDiagnosticCollection`, `createOutputChannel`, `workspace.fs`, `workspaceFolders`, `getConfiguration`, `authentication` | ✅ Compatible | Static analysis works; connected mode (SonarQube/Cloud) requires matching SonarQube auth provider |
 | 39 | **Import Cost** `wix.vscode-import-cost` | `createTextEditorDecorationType`, `activeTextEditor`, `workspace.fs`, `workspaceFolders` | ✅ Compatible | — |
 | 40 | **Pylance** `ms-python.vscode-pylance` | All LSP providers, `createOutputChannel`, `workspaceFolders`, `getConfiguration` | ✅ Compatible | Full LSP path; Pylance language server activates; type checking and IntelliSense work |
-| 41 | **IntelliCode** `VisualStudioExptTeam.vscodeintellicode` | `registerCompletionItemProvider`, `activeTextEditor`, `onDidChangeTextDocument`, `getConfiguration` | ⚠️ Partial | AI-ranked suggestions depend on telemetry collection env APIs not yet exposed |
+| 41 | **IntelliCode** `VisualStudioExptTeam.vscodeintellicode` | `registerCompletionItemProvider`, `activeTextEditor`, `onDidChangeTextDocument`, `getConfiguration` | ⚠️ Partial | AI-ranked suggestions depend on telemetry collection env APIs not yet exposed. **Triage: won't fix** — the cited gap is stale (`vscode.env` already exposes `machineId`/`sessionId`/`isTelemetryEnabled`), but the extension is retired upstream and marketplace-only |
 | 42 | **GitHub Actions** `GitHub.vscode-github-actions` | `registerTreeDataProvider`, `createWebviewPanel`, `getConfiguration`, `authentication` | ✅ Compatible | GitHub Device Flow authentication works; workflow tree and logs functional |
 | 43 | **Dart** `Dart-Code.dart-code` | All LSP providers, `createTerminal`, `vscode.debug`, `vscode.tasks`, `getConfiguration` | ✅ Compatible | `vscode.tasks` implemented (M12); LSP, debugging, and task-based test runner all functional |
 | 44 | **Flutter** `Dart-Code.flutter` | All LSP providers, `createTerminal`, `vscode.debug`, `vscode.tasks`, `vscode.debug.registerDebugAdapterDescriptorFactory` | ✅ Compatible | `vscode.tasks` implemented (M12); hot reload terminal, debugging, and device picker tasks all functional |
@@ -66,7 +66,7 @@
 | 46 | **Vim** `vscodevim.vim` | `onDidChangeTextDocument`, `activeTextEditor`, `createStatusBarItem`, `getConfiguration`, `registerCommand`, `Selection` | ✅ Compatible | Vim key bindings active; status bar shows mode; normal/insert/visual modes work |
 | 47 | **Even Better TOML** `tamasfe.even-better-toml` | All LSP providers, `getConfiguration`, `createOutputChannel` | ✅ Compatible | Full LSP path; taplo language server activates |
 | 48 | **Svelte** `svelte.svelte-vscode` | All LSP providers, `getConfiguration`, `workspaceFolders`, `EventEmitter` | ✅ Compatible | Full LSP path; Svelte language server activates |
-| 49 | **Remote - SSH** `ms-vscode-remote.remote-ssh` | `RemoteAuthorityResolver`, `workspace.fs` (virtual FS), `vscode.env.remoteName` | ❌ Incompatible | Core feature requires `RemoteAuthorityResolver` API + full virtual filesystem — not implemented |
+| 49 | **Remote - SSH** `ms-vscode-remote.remote-ssh` | `RemoteAuthorityResolver`, `workspace.fs` (virtual FS), `vscode.env.remoteName` | ❌ Incompatible | Core feature requires `RemoteAuthorityResolver` API + full virtual filesystem — not implemented. **Triage: deferred (P4)** — largest infrastructure item (resolver + virtual FS + remote server distribution model) |
 | 50 | **Apollo GraphQL** `apollographql.vscode-apollo` | All LSP providers, `getConfiguration`, `workspaceFolders`, `createOutputChannel` | ✅ Compatible | Full LSP path; Apollo language server activates; schema introspection requires network access |
 | 51 | **clangd** `llvm-vs-code-extensions.vscode-clangd` | All LSP providers, `registerInlayHintsProvider`, `registerRenameProvider`, `createOutputChannel`, `getConfiguration` | ✅ Compatible | Inlay hints and rename (F2) fully working (M10/M11) |
 | 52 | **MQL Language** (clangd-based) `nicksahler.mql5` | All LSP providers, `getConfiguration`, `createOutputChannel` | ✅ Compatible | Follows standard clangd LSP path; MetaTrader `.mq5`/`.mq4` syntax and IntelliSense work |
@@ -91,10 +91,12 @@
 
 ## Remaining API Gaps
 
-| API | Blocked Extensions | Priority |
-|:----|:------------------|:---------|
-| `vscode.notebook` cell rendering UI | #26 Jupyter | P3 — canvas renderer needs notebook cell layout |
-| `RemoteAuthorityResolver` | #49 Remote SSH | P4 — requires virtual FS infrastructure |
+| Gap | Blocked Extensions | Priority | Triage (2026-08-24) |
+|:----|:------------------|:---------|:--------------------|
+| `vscode.notebook` cell rendering UI | #26 Jupyter | P3 | **Genuine feature gap** — notebook document model + canvas cell UI + execution wiring; the only remaining ⚠️ worth engineering |
+| `RemoteAuthorityResolver` + virtual FS + remote server distribution | #27 Remote-WSL, #49 Remote-SSH | P4 | **Deferred** — large shared infrastructure; interim for WSL: UNC `\\wsl.localhost` paths via local fs stack |
+| Live Share collaboration service | #20 Live Share | — | **Won't fix** — external proprietary service, no public protocol |
+| IntelliCode ranking backend | #41 IntelliCode | — | **Won't fix** — extension retired upstream (folded into VS Code core), marketplace-only; the cited env-telemetry gap is stale |
 
 ### Resolved gaps (previously listed, now implemented)
 

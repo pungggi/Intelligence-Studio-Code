@@ -41,14 +41,17 @@ fn main() -> Result<()> {
         .expect("Failed to set JavaScript language");
 
     let parse_start = Instant::now();
-    let tree = parser
-        .parse(&js_content, None)
-        .expect("Failed to parse");
+    let tree = parser.parse(&js_content, None).expect("Failed to parse");
     let parse_time_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
     let root = tree.root_node();
     println!("  Parse time:  {:.2}ms", parse_time_ms);
-    println!("  Root node:   {} ({}..{})", root.kind(), root.start_position().row, root.end_position().row);
+    println!(
+        "  Root node:   {} ({}..{})",
+        root.kind(),
+        root.start_position().row,
+        root.end_position().row
+    );
     println!("  Child count: {}", root.child_count());
     println!("  Has errors:  {}", root.has_error());
 
@@ -125,10 +128,7 @@ fn main() -> Result<()> {
     for range in &changed_ranges {
         println!(
             "    rows {}..{} bytes {}..{}",
-            range.start_point.row,
-            range.end_point.row,
-            range.start_byte,
-            range.end_byte
+            range.start_point.row, range.end_point.row, range.start_byte, range.end_byte
         );
     }
 
@@ -147,7 +147,7 @@ fn main() -> Result<()> {
 
     // Count node types in the first 100 lines
     let mut token_counts = std::collections::HashMap::new();
-    count_tokens(root, &source, 0, 100, &mut token_counts);
+    count_tokens(root, 0, 100, &mut token_counts);
 
     println!("  Token types in first 100 lines:");
     let mut sorted_tokens: Vec<_> = token_counts.iter().collect();
@@ -164,16 +164,32 @@ fn main() -> Result<()> {
     let has_strings = token_counts.contains_key("string")
         || token_counts.contains_key("string_fragment")
         || token_counts.contains_key("template_string");
-    let has_comments = token_counts.contains_key("comment")
-        || token_counts.contains_key("line_comment");
-    let has_identifiers = token_counts.contains_key("identifier")
-        || token_counts.contains_key("property_identifier");
+    let has_comments =
+        token_counts.contains_key("comment") || token_counts.contains_key("line_comment");
+    let has_identifiers =
+        token_counts.contains_key("identifier") || token_counts.contains_key("property_identifier");
 
     println!("\n  Expected token presence:");
-    println!("    Keywords:    {} {}", if has_keywords { "PASS" } else { "FAIL" }, if has_keywords { "" } else { "(missing)" });
-    println!("    Strings:     {} {}", if has_strings { "PASS" } else { "FAIL" }, if has_strings { "" } else { "(missing)" });
-    println!("    Comments:    {} {}", if has_comments { "PASS" } else { "FAIL" }, if has_comments { "" } else { "(missing)" });
-    println!("    Identifiers: {} {}", if has_identifiers { "PASS" } else { "FAIL" }, if has_identifiers { "" } else { "(missing)" });
+    println!(
+        "    Keywords:    {} {}",
+        if has_keywords { "PASS" } else { "FAIL" },
+        if has_keywords { "" } else { "(missing)" }
+    );
+    println!(
+        "    Strings:     {} {}",
+        if has_strings { "PASS" } else { "FAIL" },
+        if has_strings { "" } else { "(missing)" }
+    );
+    println!(
+        "    Comments:    {} {}",
+        if has_comments { "PASS" } else { "FAIL" },
+        if has_comments { "" } else { "(missing)" }
+    );
+    println!(
+        "    Identifiers: {} {}",
+        if has_identifiers { "PASS" } else { "FAIL" },
+        if has_identifiers { "" } else { "(missing)" }
+    );
 
     let all_tokens_ok = has_keywords && has_strings && has_comments && has_identifiers;
     if all_tokens_ok {
@@ -209,9 +225,18 @@ fn main() -> Result<()> {
             start_byte: line_start,
             old_end_byte: line_start + old_len,
             new_end_byte: line_start + new_len,
-            start_position: tree_sitter::Point { row: edit_line, column: 0 },
-            old_end_position: tree_sitter::Point { row: edit_line, column: old_len },
-            new_end_position: tree_sitter::Point { row: edit_line, column: new_len },
+            start_position: tree_sitter::Point {
+                row: edit_line,
+                column: 0,
+            },
+            old_end_position: tree_sitter::Point {
+                row: edit_line,
+                column: old_len,
+            },
+            new_end_position: tree_sitter::Point {
+                row: edit_line,
+                column: new_len,
+            },
         });
 
         // Incremental reparse using rope callback (zero-copy)
@@ -237,7 +262,11 @@ fn main() -> Result<()> {
     let max = reparse_times.iter().cloned().fold(0.0_f64, f64::max);
     let mut sorted = reparse_times.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p95 = sorted[(sorted.len() as f64 * 0.95) as usize];
+    let p95 = if sorted.is_empty() {
+        0.0
+    } else {
+        sorted[((sorted.len().saturating_sub(1)) as f64 * 0.95) as usize]
+    };
 
     println!("  100 incremental re-parses:");
     println!("    avg={:.3}ms  max={:.3}ms  p95={:.3}ms", avg, max, p95);
@@ -250,10 +279,29 @@ fn main() -> Result<()> {
 
     // --- Summary ---
     println!("\n=== SPIKE 4 SUMMARY ===");
-    println!("Initial parse (10k lines): {:.2}ms  {}", parse_time_ms, if parse_time_ms < 50.0 { "PASS" } else { "FAIL" });
-    println!("Incremental re-parse:      {:.3}ms  {}", reparse_time_ms, if reparse_time_ms < 1.0 { "PASS" } else { "FAIL" });
-    println!("Token mapping:             {}",  if all_tokens_ok { "PASS" } else { "FAIL" });
-    println!("Bulk incr. parse (avg):    {:.3}ms  {}", avg, if avg < 1.0 { "PASS" } else { "FAIL" });
+    println!(
+        "Initial parse (10k lines): {:.2}ms  {}",
+        parse_time_ms,
+        if parse_time_ms < 50.0 { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "Incremental re-parse:      {:.3}ms  {}",
+        reparse_time_ms,
+        if reparse_time_ms < 1.0 {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    );
+    println!(
+        "Token mapping:             {}",
+        if all_tokens_ok { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "Bulk incr. parse (avg):    {:.3}ms  {}",
+        avg,
+        if avg < 1.0 { "PASS" } else { "FAIL" }
+    );
     println!("========================\n");
 
     Ok(())
@@ -262,8 +310,7 @@ fn main() -> Result<()> {
 /// Generate realistic JavaScript content.
 fn generate_js_content(lines: usize) -> String {
     let mut out = String::with_capacity(lines * 60);
-    let blocks = [
-        r#"// Module: data processing utilities
+    let block = r#"// Module: data processing utilities
 const { EventEmitter } = require('events');
 
 /**
@@ -346,10 +393,7 @@ class DataPipeline extends EventEmitter {
 }
 
 module.exports = { processBatch, transformRecord, DataPipeline };
-"#,
-    ];
-
-    let block = blocks[0];
+"#;
     let block_lines: Vec<&str> = block.lines().collect();
     let mut line_idx = 0;
 
@@ -366,7 +410,6 @@ module.exports = { processBatch, transformRecord, DataPipeline };
 /// Recursively count named leaf node types within a line range.
 fn count_tokens(
     node: tree_sitter::Node,
-    source: &str,
     min_row: usize,
     max_row: usize,
     counts: &mut std::collections::HashMap<String, usize>,
@@ -386,7 +429,7 @@ fn count_tokens(
     } else {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            count_tokens(child, source, min_row, max_row, counts);
+            count_tokens(child, min_row, max_row, counts);
         }
     }
 }
@@ -413,13 +456,13 @@ fn map_node_to_highlight(node_kind: &str) -> HighlightType {
     match node_kind {
         // Keywords
         "const" | "let" | "var" | "function" | "async" | "await" | "return" | "if" | "else"
-        | "for" | "while" | "class" | "extends" | "new" | "import" | "export" | "from"
-        | "try" | "catch" | "throw" | "typeof" | "instanceof" | "super" | "this" | "yield"
-        | "of" | "in" => HighlightType::Keyword,
+        | "for" | "while" | "class" | "extends" | "new" | "import" | "export" | "from" | "try"
+        | "catch" | "throw" | "typeof" | "instanceof" | "super" | "this" | "yield" | "of"
+        | "in" => HighlightType::Keyword,
 
         // Strings
-        "string" | "string_fragment" | "template_string" | "template_literal" | "escape_sequence"
-        | "regex" | "regex_pattern" => HighlightType::String,
+        "string" | "string_fragment" | "template_string" | "template_literal"
+        | "escape_sequence" | "regex" | "regex_pattern" => HighlightType::String,
 
         // Numbers
         "number" | "integer" => HighlightType::Number,

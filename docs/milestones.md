@@ -218,7 +218,7 @@ read_directory(path)      → Vec<DirEntry>
 | **LSP client** | `LanguageClient` class, JSON-RPC 2.0 over stdio, child process management | Done |
 | **Request/response IPC** | Correlation IDs with oneshot channels (Rust), async dispatch (Node.js) | Done |
 | **CompletionItemProvider** | `registerCompletionItemProvider` → autocomplete popup with icons, detail panel | Done |
-| **HoverProvider** | `registerHoverProvider` → hover tooltip on mouse hover (5090ms delay) | Done |
+| **HoverProvider** | `registerHoverProvider` → hover tooltip on mouse hover (500ms delay) | Done |
 | **Go-to-definition** | `registerDefinitionProvider` → Ctrl+Click / F12, cross-file navigation | Done |
 | **Find references** | `registerReferenceProvider` → Shift+F12, floating references panel | Done |
 | **Code actions** | `registerCodeActionProvider` → Ctrl+., quick fix menu with workspace edits | Done |
@@ -367,7 +367,7 @@ VisibleContent { lines: Vec<HighlightedLine>, first_line, total_lines, file_path
 
 ---
 
-## M8: Full Platform (8 weeks) — IN PROGRESS
+## M8: Full Platform (8 weeks) — In Progress
 
 **Goal:** WebView support, integrated terminal, settings UI, extension marketplace, and accessibility.
 
@@ -674,7 +674,7 @@ Debounced 300ms on cursor move. Cleared on file switch and multi-cursor.
 
 | Command | Purpose |
 |:--------|:--------|
-| `lsp_rename` | Request rename edits from extension providers |
+| `lang_rename` | Request rename edits from extension providers (unified `lang_*` dispatch; originally shipped as `lsp_rename`) |
 | `lsp_prepare_rename` | Check rename availability at position |
 | `lsp_document_highlights` | Request symbol highlights at position |
 | `get_show_text_document_requests` | Poll showTextDocument requests from Extension Host |

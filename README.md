@@ -35,7 +35,7 @@ docs/                  # Documentation & PRD
 
 ## Getting Started
 
-> **Status:** Initial scaffold — Milestone M0 (Technology Spike)
+> **Status:** M0–M7 complete, M8 mostly complete, M9–M12 complete; WASM extension host Phases 1–4 done, Phase 5 partial — see [STATUS.md](STATUS.md)
 
 ### Prerequisites
 
@@ -60,6 +60,20 @@ npm run dev
 
 - [PRD (Product Requirements)](docs/prd-corecode.md)
 - [PRD Review](docs/prd-review.md)
+
+## Vendored Dependencies
+
+Some frontend dependencies (like `xterm.js`) are vendored for simplicity in the build-less Tauri frontend. To update or regenerate these assets, use the provided scripts:
+
+```bash
+# On Windows (PowerShell)
+./scripts/regenerate-xterm.ps1
+
+# On Linux/macOS (Bash)
+./scripts/regenerate-xterm.sh
+```
+
+See `src/app/src/lib/xterm/VERSION` for currently tracked versions and checksums.
 
 ## License
 

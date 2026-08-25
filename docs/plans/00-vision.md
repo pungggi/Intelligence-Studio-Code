@@ -61,4 +61,4 @@ Add a second, parallel extension host to CoreCode that:
 | Webview panel opens and exchanges messages | Custom HTML panel renders, postMessage round-trip works |
 | Same WASM binary runs in Zed | Extension installs and activates in Zed 0.x |
 | Same source builds a VS Code `.vsix` | Build tool produces a working VS Code extension package |
-| Node.js extensions unaffected | All M12 compatibility matrix entries unchanged |
+| Node.js extensions unaffected | All Milestone 12 compatibility matrix (Node.js extension API surface, activation events, and provider registrations) entries unchanged |

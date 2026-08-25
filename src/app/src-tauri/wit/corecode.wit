@@ -1,0 +1,217 @@
+package corecode:extension@0.1.0;
+
+// ── Shared types used by language providers ─────────────────────────────────
+
+interface types {
+  record position   { line: u32, character: u32 }
+  record range      { start: position, end: position }
+  record location   { uri: string, range: range }
+
+  record diagnostic {
+    range: range,
+    severity: severity,
+    message: string,
+    source: option<string>,
+    code: option<string>,
+  }
+  enum severity { error, warning, information, hint }
+
+  record completion-item {
+    label: string,
+    kind: option<completion-kind>,
+    detail: option<string>,
+    documentation: option<string>,
+    insert-text: string,
+    filter-text: option<string>,
+  }
+  enum completion-kind {
+    text, method, function, %constructor, field, variable,
+    class, %interface, %module, property, unit, value, enum-member,
+    keyword, snippet, color, file, reference, folder,
+  }
+
+  record hover-result { contents: string, range: option<range> }
+
+  record text-edit {
+    range:    range,
+    new-text: string,
+  }
+
+  record code-action  { title: string, kind: option<string>, edits: list<text-edit> }
+
+  record symbol {
+    name: string,
+    kind: symbol-kind,
+    location: location,
+    container-name: option<string>,
+  }
+  enum symbol-kind {
+    file, %module, namespace, %package, class, method, property,
+    field, %constructor, %enum, %interface, function, variable,
+    constant, %string, number, boolean, array, object, key, null,
+    enum-member, struct, event, operator, type-parameter,
+  }
+
+  record folding-range {
+    start-line: u32,
+    end-line: u32,
+    kind: option<string>,
+  }
+}
+
+// ── Host imports — UI ───────────────────────────────────────────────────────
+
+interface ui {
+  /// Append a line to a named output channel.
+  log: func(channel: string, message: string);
+
+  /// Show a transient notification. level: "info" | "warning" | "error"
+  show-message: func(level: string, message: string);
+
+  /// Create or update a status bar item. Passing empty text removes it.
+  set-status: func(id: string, text: string, tooltip: option<string>);
+}
+
+// ── Host imports — Workspace ────────────────────────────────────────────────
+
+interface workspace {
+  /// Read the content of a workspace-relative file.
+  read-file: func(path: string) -> result<string, string>;
+
+  /// Return workspace-relative paths matching a glob pattern.
+  find-files: func(glob: string) -> result<list<string>, string>;
+
+  /// Return the workspace root URI (file://).
+  root-uri: func() -> string;
+
+  /// Read a configuration value by dotted key, e.g. "editor.tabSize".
+  get-config: func(key: string) -> option<string>;
+}
+
+// ── Extension exports — lifecycle ───────────────────────────────────────────
+
+interface lifecycle {
+  /// Called once when the extension is loaded.
+  /// Return err to abort activation; the message is shown to the user.
+  activate: func() -> result<_, string>;
+
+  /// Called when the host is shutting down. Return value is ignored.
+  deactivate: func();
+}
+
+// ── Extension exports — language provider (optional) ────────────────────────
+
+interface language-provider {
+  use types.{
+    position, range, completion-item, hover-result,
+    diagnostic, text-edit, code-action, location,
+    symbol, folding-range, completion-kind, severity,
+  };
+
+  completions:       func(uri: string, pos: position, trigger: option<string>)
+                       -> result<list<completion-item>, string>;
+  hover:             func(uri: string, pos: position)
+                       -> result<option<hover-result>, string>;
+  diagnostics:       func(uri: string, content: string)
+                       -> result<list<diagnostic>, string>;
+  format-document:   func(uri: string, content: string)
+                       -> result<list<text-edit>, string>;
+  format-range:      func(uri: string, content: string, range: range)
+                       -> result<list<text-edit>, string>;
+  definition:        func(uri: string, pos: position)
+                       -> result<option<location>, string>;
+  references:        func(uri: string, pos: position, include-decl: bool)
+                       -> result<list<location>, string>;
+  rename:            func(uri: string, pos: position, new-name: string)
+                       -> result<list<text-edit>, string>;
+  code-actions:      func(uri: string, range: range, diagnostics: list<diagnostic>)
+                       -> result<list<code-action>, string>;
+  workspace-symbols: func(query: string)
+                       -> result<list<symbol>, string>;
+  folding-ranges:    func(uri: string, content: string)
+                       -> result<list<folding-range>, string>;
+}
+
+// ── Host imports — Webview panels ───────────────────────────────────────────
+
+interface webview {
+  /// Request opening a webview panel. The host calls get-html after this
+  /// returns to obtain the initial HTML content.
+  /// column: 1 = active, 2 = beside, 3 = third column.
+  open-panel: func(panel-id: string, title: string, column: u32) -> result<_, string>;
+
+  /// Update the HTML content of an already-open panel.
+  set-html: func(panel-id: string, html: string) -> result<_, string>;
+
+  /// Post a JSON-encoded message to the webview's JavaScript context.
+  post-message: func(panel-id: string, message: string) -> result<_, string>;
+
+  /// Close a panel programmatically.
+  close-panel: func(panel-id: string) -> result<_, string>;
+}
+
+// ── Extension exports — webview provider (optional) ─────────────────────────
+
+interface webview-provider {
+  /// Called by the host after open-panel to get the initial HTML.
+  /// state: JSON string of previously saved state, or empty string.
+  get-html: func(panel-id: string, state: string) -> string;
+
+  /// Called when the webview posts a message back to the extension.
+  on-message: func(panel-id: string, message: string);
+
+  /// Called when the user or host closes a webview panel.
+  on-close: func(panel-id: string);
+}
+
+// ── Extension exports — grammar provider (optional) ─────────────────────────
+
+interface grammar-provider {
+  /// Return the highlights.scm query string.
+  highlights-query: func() -> string;
+
+  /// Return the injections.scm query string, or none if not needed.
+  injections-query: func() -> option<string>;
+
+  /// Return bracket pair definitions as JSON: [["{","}"],["(",")"],...]
+  bracket-pairs: func() -> string;
+}
+
+// ── World ───────────────────────────────────────────────────────────────────
+
+world corecode-extension {
+  /// Host imports available to every extension.
+  import ui;
+  import workspace;
+
+  /// Extension exports required by every extension.
+  export lifecycle;
+}
+
+/// World for extensions that also provide language intelligence.
+world corecode-language-extension {
+  import ui;
+  import workspace;
+
+  export lifecycle;
+  export language-provider;
+}
+
+/// World for extensions that supply a tree-sitter grammar.
+world corecode-grammar-extension {
+  import ui;
+  import workspace;
+
+  export lifecycle;
+  export grammar-provider;
+}
+
+/// World for extensions that provide webview panels.
+world corecode-webview-extension {
+  import ui;
+  import workspace;
+  import webview;
+
+  export lifecycle;
+  export webview-provider;
+}
