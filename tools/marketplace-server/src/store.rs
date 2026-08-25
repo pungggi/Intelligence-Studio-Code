@@ -28,12 +28,22 @@ pub struct VersionEntry {
     pub sha256: String,
     pub size: u64,
     pub published_at: String,
+    /// base64 ed25519 signature over the package bytes, when signed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// base64 ed25519 public key that produced `signature`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtensionEntry {
     pub id: String,
     pub versions: Vec<VersionEntry>,
+    /// Publisher identity key (base64) — pinned by the first signed publish;
+    /// subsequent publishes must be signed with the same key (TOFU).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_key: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -46,6 +56,8 @@ struct IndexFile {
 pub enum PublishError {
     /// Extension id / version failed validation.
     Invalid(String),
+    /// Signature missing, invalid, or signed by the wrong key.
+    Forbidden(String),
     /// This exact id+version is already published.
     Conflict,
     /// Filesystem failure.
@@ -106,8 +118,16 @@ impl Store {
         })
     }
 
-    /// Store a package. Returns the recorded version entry.
-    pub fn publish(&self, id: &str, version: &str, bytes: &[u8]) -> Result<VersionEntry, PublishError> {
+    /// Store a package. `sig` is `(pubkey_b64, signature_b64)` for signed
+    /// publishes, `None` for unsigned ones (rejected once a key is pinned).
+    /// Returns the recorded version entry.
+    pub fn publish(
+        &self,
+        id: &str,
+        version: &str,
+        bytes: &[u8],
+        sig: Option<(&str, &str)>,
+    ) -> Result<VersionEntry, PublishError> {
         if !Self::valid_id(id) {
             return Err(PublishError::Invalid(format!("invalid extension id '{id}'")));
         }
@@ -125,7 +145,33 @@ impl Store {
             )));
         }
 
+        // Verify the signature over the package bytes before anything else.
+        if let Some((pubkey, signature)) = sig {
+            if let Err(e) = verify_signature(pubkey, signature, bytes) {
+                return Err(PublishError::Forbidden(format!("bad signature: {e}")));
+            }
+        }
+
         let mut index = self.index.lock().unwrap();
+
+        // Key pinning: the first signed publish fixes the publisher identity;
+        // later publishes must be signed with the same key (and cannot be
+        // unsigned once pinned).
+        let pinned = index.get(id).and_then(|e| e.pinned_key.clone());
+        let signed_by = match (sig, &pinned) {
+            (Some((pubkey, _)), Some(existing)) if pubkey != existing => {
+                return Err(PublishError::Forbidden(format!(
+                    "extension '{id}' is pinned to a different signing key"
+                )));
+            }
+            (None, Some(_)) => {
+                return Err(PublishError::Forbidden(format!(
+                    "extension '{id}' is pinned to a signing key — signature required"
+                )));
+            }
+            (Some((pubkey, _)), _) => Some(pubkey.to_string()),
+            (None, None) => None,
+        };
 
         // Reject duplicate id+version (immutable versions).
         if let Some(existing) = index.get(id) {
@@ -149,14 +195,20 @@ impl Store {
             sha256: hex::encode(Sha256::digest(bytes)),
             size: bytes.len() as u64,
             published_at: Utc::now().to_rfc3339(),
+            signature: sig.map(|(_, s)| s.to_string()),
+            signed_by: signed_by.clone(),
         };
 
         let ext = index.entry(id.to_string()).or_insert(ExtensionEntry {
             id: id.to_string(),
             versions: Vec::new(),
+            pinned_key: None,
         });
         ext.versions.push(entry.clone());
         ext.versions.sort_by(|a, b| version_key(&b.version).cmp(&version_key(&a.version)));
+        if ext.pinned_key.is_none() {
+            ext.pinned_key = signed_by;
+        }
 
         self.persist(&index)?;
         Ok(entry)
@@ -212,6 +264,25 @@ impl Store {
     }
 }
 
+/// Verify an ed25519 signature (base64) over `bytes` with a base64 public key.
+fn verify_signature(pubkey_b64: &str, signature_b64: &str, bytes: &[u8]) -> Result<(), String> {
+    use base64::Engine;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let engine = base64::engine::general_purpose::STANDARD;
+    let decode = |s: &str| engine.decode(s.trim()).map_err(|e| format!("invalid base64: {e}"));
+
+    let key_bytes: [u8; 32] = decode(pubkey_b64)?
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("public key must be 32 bytes, got {}", v.len()))?;
+    let key = VerifyingKey::from_bytes(&key_bytes).map_err(|e| format!("invalid public key: {e}"))?;
+    let sig_bytes: [u8; 64] = decode(signature_b64)?
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("signature must be 64 bytes, got {}", v.len()))?;
+    let signature = Signature::from_bytes(&sig_bytes);
+    key.verify(bytes, &signature).map_err(|e| format!("verification failed: {e}"))
+}
+
 /// Sort key so `1.0.0` > `1.0.0-rc.1` > `0.9.0`, newest first.
 fn version_key(v: &str) -> (u64, u64, u64, u8) {
     let (core, pre) = match v.split_once('-') {
@@ -229,6 +300,20 @@ fn version_key(v: &str) -> (u64, u64, u64, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn sign_with(key: &SigningKey, bytes: &[u8]) -> (String, String) {
+        (
+            b64(key.verifying_key().as_bytes()),
+            b64(&key.sign(bytes).to_bytes()),
+        )
+    }
 
     fn tmp_store(label: &str) -> (Store, PathBuf) {
         let dir = std::env::temp_dir().join(format!("ccmp-test-{label}-{}", std::process::id()));
@@ -240,7 +325,7 @@ mod tests {
     #[test]
     fn publish_and_fetch_roundtrip() {
         let (store, dir) = tmp_store("roundtrip");
-        let entry = store.publish("corecode.hello-wasm", "0.1.0", b"package-bytes").unwrap();
+        let entry = store.publish("corecode.hello-wasm", "0.1.0", b"package-bytes", None).unwrap();
         assert_eq!(entry.size, 13);
         assert_eq!(entry.sha256.len(), 64);
 
@@ -257,13 +342,13 @@ mod tests {
     #[test]
     fn duplicate_version_conflicts() {
         let (store, dir) = tmp_store("dup");
-        store.publish("pub.a", "1.0.0", b"x").unwrap();
+        store.publish("pub.a", "1.0.0", b"x", None).unwrap();
         assert!(matches!(
-            store.publish("pub.a", "1.0.0", b"y"),
+            store.publish("pub.a", "1.0.0", b"y", None),
             Err(PublishError::Conflict)
         ));
         // New version is fine
-        assert!(store.publish("pub.a", "1.0.1", b"y").is_ok());
+        assert!(store.publish("pub.a", "1.0.1", b"y", None).is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -272,13 +357,13 @@ mod tests {
         let (store, dir) = tmp_store("badids");
         for id in ["no-dot", "../evil", "a.b.c", "-bad.x"] {
             assert!(matches!(
-                store.publish(id, "1.0.0", b"x"),
+                store.publish(id, "1.0.0", b"x", None),
                 Err(PublishError::Invalid(_))
             ));
         }
         for v in ["1.2", "latest", "1.2.x", "1.2.3-", "1.2.3.4"] {
             assert!(matches!(
-                store.publish("pub.a", v, b"x"),
+                store.publish("pub.a", v, b"x", None),
                 Err(PublishError::Invalid(_))
             ));
         }
@@ -289,7 +374,7 @@ mod tests {
     fn latest_orders_by_semver() {
         let (store, dir) = tmp_store("semver");
         for v in ["1.0.0", "0.9.0", "1.0.0-rc.1", "1.1.0"] {
-            store.publish("pub.a", v, b"x").unwrap();
+            store.publish("pub.a", v, b"x", None).unwrap();
         }
         assert_eq!(store.latest("pub.a").unwrap().version, "1.1.0");
         // 1.0.0 release ranks above 1.0.0-rc.1
@@ -301,12 +386,71 @@ mod tests {
     #[test]
     fn index_survives_reopen() {
         let (store, dir) = tmp_store("reopen");
-        store.publish("pub.a", "1.0.0", b"persisted").unwrap();
+        store.publish("pub.a", "1.0.0", b"persisted", None).unwrap();
         drop(store);
         let reopened = Store::open(&dir).unwrap();
         assert!(reopened.get("pub.a").is_some());
         let (bytes, _) = reopened.package("pub.a", "1.0.0").unwrap();
         assert_eq!(bytes, b"persisted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn signed_publish_records_signature_and_pins_key() {
+        let (store, dir) = tmp_store("sig-pin");
+        let key = SigningKey::generate(&mut OsRng);
+        let (pubkey, sig) = sign_with(&key, b"pkg");
+
+        let entry = store.publish("pub.a", "1.0.0", b"pkg", Some((&pubkey, &sig))).unwrap();
+        assert_eq!(entry.signed_by.as_deref(), Some(pubkey.as_str()));
+        assert!(entry.signature.is_some());
+        assert_eq!(store.get("pub.a").unwrap().pinned_key.as_deref(), Some(pubkey.as_str()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tampered_signature_rejected() {
+        let (store, dir) = tmp_store("sig-tamper");
+        let key = SigningKey::generate(&mut OsRng);
+        let (pubkey, sig) = sign_with(&key, b"pkg");
+        // signature over different bytes
+        let result = store.publish("pub.a", "1.0.0", b"other", Some((&pubkey, &sig)));
+        assert!(matches!(result, Err(PublishError::Forbidden(_))));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn key_pinning_enforced() {
+        let (store, dir) = tmp_store("sig-enforce");
+        let key1 = SigningKey::generate(&mut OsRng);
+        let (pk1, sig1) = sign_with(&key1, b"pkg");
+        store.publish("pub.a", "1.0.0", b"pkg", Some((&pk1, &sig1))).unwrap();
+
+        // different key → rejected
+        let key2 = SigningKey::generate(&mut OsRng);
+        let (pk2, sig2) = sign_with(&key2, b"pkg2");
+        assert!(matches!(
+            store.publish("pub.a", "1.0.1", b"pkg2", Some((&pk2, &sig2))),
+            Err(PublishError::Forbidden(_))
+        ));
+        // unsigned once pinned → rejected
+        assert!(matches!(
+            store.publish("pub.a", "1.0.1", b"pkg2", None),
+            Err(PublishError::Forbidden(_))
+        ));
+        // same key, new version → accepted
+        let (_, sig1b) = sign_with(&key1, b"pkg2");
+        assert!(store.publish("pub.a", "1.0.1", b"pkg2", Some((&pk1, &sig1b))).is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unsigned_publish_still_allowed_for_unpinned_extensions() {
+        let (store, dir) = tmp_store("sig-optional");
+        assert!(store.publish("pub.a", "1.0.0", b"pkg", None).is_ok());
+        assert!(store.get("pub.a").unwrap().pinned_key.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

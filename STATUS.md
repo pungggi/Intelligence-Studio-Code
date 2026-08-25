@@ -32,7 +32,7 @@
 | **Phase 3** | Unified `lang_*` dispatch (format/range-format, rename, code actions, workspace symbols, folding) | **Done** (2026-05-25) |
 | **Phase 4** | Tier-1 LSP providers: typeDefinition, implementation, selectionRange, documentLinks, semanticTokens (+ frontend wiring, delta refresh) | **Done** (2026-05-26) |
 | **Phase 5** | Cross-editor toolchain (`.ccext` / Zed `.zip` / `.vsix`) | **Done** (2026-08-23) — `new`/`build`/`check`/`publish` |
-| **Phase 6** | Marketplace & discovery (registry server, `.ccext` install, Native badge) | **Mostly done** (2026-08-24) — ed25519 signature verification pending, see [phase-6-marketplace.md](docs/plans/impl/phase-6-marketplace.md) |
+| **Phase 6** | Marketplace & discovery (registry server, `.ccext` install, Native badge, ed25519 signatures) | **Done** (2026-08-25) — deployment + Native tab are backlog, see [phase-6-marketplace.md](docs/plans/impl/phase-6-marketplace.md) |
 
 ---
 
@@ -397,7 +397,7 @@ Full task API wired to the integrated terminal: `TaskScope`, `TaskRevealKind`, `
 
 ---
 
-## WASM Extension Host (parallel track) — PHASES 1–5 COMPLETE, PHASE 6 MOSTLY COMPLETE
+## WASM Extension Host (parallel track) — PHASES 1–6 COMPLETE
 
 Branch: `feature/wasm-extension-host-impl`. In-process `wasmtime` (component model) alongside the Node.js Extension Host — no subprocess. Plans: [docs/plans/impl/00-index.md](docs/plans/impl/00-index.md), architecture: [docs/plans/01-architecture.md](docs/plans/01-architecture.md).
 
@@ -422,13 +422,15 @@ Branch: `feature/wasm-extension-host-impl`. In-process `wasmtime` (component mod
 
 `tools/cargo-corecode`: `cargo corecode new --template <t>`, `cargo corecode build --target corecode|zed|vscode|all`, `cargo corecode check`, and `cargo corecode publish [--token <t>] [--registry <url>] [--dry-run]`. Packagers for `.ccext`, Zed `.zip`, VS Code `.vsix`. `publish` builds a release `.ccext`, validates the manifest (`publisher.name` id + semver version), and uploads via `POST {registry}/api/v1/publish` (Bearer token; 409 = version already published). Registry defaults to `$CORECODE_REGISTRY`, then `https://marketplace.corecode.dev`.
 
-### Marketplace (Phase 6 — mostly complete)
+### Marketplace (Phase 6 — complete)
 
-`tools/marketplace-server` — standalone axum registry implementing the publish protocol above plus read endpoints (`/api/v1/extension/{id}`, `/latest`, `/{version}/download` with `x-corecode-sha256`, `/search`, `/health`). Filesystem store (`index.json` + immutable `packages/<id>/<version>.ccext`), atomic index writes, immutable versions (409 on re-publish), SHA-256 recorded at publish and verified by the client before install. 10 unit/integration tests.
+`tools/marketplace-server` — standalone axum registry implementing the publish protocol above plus read endpoints (`/api/v1/extension/{id}`, `/latest`, `/{version}/download` with `x-corecode-sha256`, `/search`, `/health`). Filesystem store (`index.json` + immutable `packages/<id>/<version>.ccext`), atomic index writes, immutable versions (409 on re-publish), SHA-256 recorded at publish and verified by the client before install. 15 unit/integration tests.
 
-App side: `marketplace.rs` gains `ccext_get` / `ccext_download` (HTTPS-only outside loopback/LAN, URLs built from validated segments, 50MB cap); new commands `marketplace_get_native` + `install_native_extension` (resolves latest, downloads, verifies SHA-256, unpacks via the existing installer — `.ccext` carries `corecode.toml` at the root and routes to the WASM host). Extensions panel shows a **Native / Node.js host-type badge** (`InstalledExtension.kind`, recomputed from disk on every listing).
+**ed25519 signatures (TOFU key pinning)**: `cargo corecode keygen` generates a signing keypair; `publish` signs the package when `--signing-key`/`CORECODE_SIGNING_KEY` is set (`X-CoreCode-Signature` + `X-CoreCode-Pubkey` headers). The registry verifies signatures at publish, pins the first key per extension id, and rejects mismatches/unsigned re-publishes (403). `install_native_extension` verifies the downloaded bytes against the signature and pinned key after the SHA-256 check. Unsigned legacy entries still install (SHA-256 always applies).
 
-Remaining: ed25519 signature verification (SHA-256 integrity is enforced end-to-end today; signing keys + `X-CoreCode-Signature` reserved), public deployment, native extensions tab in the marketplace UI. Details: [phase-6-marketplace.md](docs/plans/impl/phase-6-marketplace.md).
+App side: `marketplace.rs` gains `ccext_get` / `ccext_download` (HTTPS-only outside loopback/LAN, URLs built from validated segments, 50MB cap) + `verify_ccext_signature`; new commands `marketplace_get_native` + `install_native_extension` (resolves latest, downloads, verifies SHA-256 + signature, unpacks via the existing installer — `.ccext` carries `corecode.toml` at the root and routes to the WASM host). Extensions panel shows a **Native / Node.js host-type badge** (`InstalledExtension.kind`, recomputed from disk on every listing).
+
+Backlog (not blockers): public deployment of `marketplace.corecode.dev`, Native tab in the marketplace UI, key rotation tooling. Details: [phase-6-marketplace.md](docs/plans/impl/phase-6-marketplace.md).
 
 ### Example WASM extensions (`examples/`)
 
@@ -547,6 +549,8 @@ Remaining: ed25519 signature verification (SHA-256 integrity is enforced end-to-
 | Extension Host (TS, `*.test.ts`) | extension-loader, ipc-server, language-client, git-api, lsp-dispatch | 144 test cases |
 | Frontend (`node --test`) | `src/app/src/lib/editor-helpers.test.js` | Pure helper functions extracted from editor.js |
 | Rust | Inline `#[test]` modules (editor, ipc_bridge, wasm_host, …) | No separate `tests/` dir |
+| Tools — `cargo-corecode` | Manifest, packaging, publish validation, signing | 10 tests |
+| Tools — `marketplace-server` | Store roundtrip/conflict/pinning, API auth/roundtrip/signatures | 15 tests |
 | Manual (`docs/testing/manual/`) | 00 prerequisites → 07 security: compile extensions, cargo-corecode CLI, runtime lifecycle, language/grammar providers, webview panels, security | 8 documents |
 | Compatibility | Top-20 extension matrix | 58 extensions: 53 ✅ / 4 ⚠️ / 1 ❌ |
 
@@ -555,4 +559,4 @@ Remaining: ed25519 signature verification (SHA-256 integrity is enforced end-to-
 - [ ] **Notebook support (P3 backlog)** — Jupyter's only genuine gap: notebook document model + canvas cell UI + execution wiring (see `docs/extension-compatibility.md` #26)
 - [ ] **Remote infrastructure (P4 backlog)** — `RemoteAuthorityResolver` + virtual FS for Remote-SSH/-WSL; interim for WSL: UNC `\\wsl.localhost` paths
 - [ ] **A11y polish (backlog)** — panel ARIA roles, focus management, high-contrast theme audit
-- [ ] **WASM Phase 6 remainder** — ed25519 signature verification (`cargo corecode keygen`, sign at publish, verify on install; `X-CoreCode-Signature` reserved), public deployment of `marketplace.corecode.dev`, Native tab in the marketplace UI. Server + install path + badge are done
+- [ ] **Marketplace rollout (backlog)** — public deployment of `marketplace.corecode.dev` (DNS + TLS + token), Native tab in the marketplace UI, key-rotation tooling. All Phase 6 protocol features are implemented

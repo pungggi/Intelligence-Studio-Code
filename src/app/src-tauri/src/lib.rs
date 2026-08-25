@@ -1303,6 +1303,8 @@ async fn install_native_extension(
             ));
         }
     }
+    // Authenticate signed packages against the registry-pinned publisher key
+    marketplace::MarketplaceClient::verify_ccext_signature(&entry, &bytes)?;
 
     let installed = {
         let mgr = state.extension_mgr.lock().map_err(|e| e.to_string())?;

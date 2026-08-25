@@ -1,8 +1,8 @@
 # Phase 6 — Marketplace and Discovery
 
-> **Status**: Mostly complete (2026-08-24)
+> **Status**: Complete (2026-08-25) — server, `.ccext` install, Native badge, and ed25519 signatures all landed
 > **Depends on**: Phase 5 (toolchain `publish`)
-> **Deliverables**: registry server · `.ccext` install · Native badge · signature verification (pending)
+> **Backlog**: public deployment, Native tab in the marketplace UI
 
 ## What exists
 
@@ -66,20 +66,62 @@ ordering, reopen persistence; API auth/roundtrip/malformed paths/search).
 from disk on every `list_installed` (survives registry upgrades). The
 extensions panel renders a badge with the host type and a tooltip.
 
-## What remains
+### 5. ed25519 signature verification (2026-08-25)
+
+Authenticated publishing with trust-on-first-use key pinning:
+
+```text
+cargo corecode keygen [--out <dir>] [--force]
+  → corecode-signing-key (base64 seed, SECRET) + corecode-signing-key.pub
+
+cargo corecode publish [--signing-key <path|base64>]
+  (or CORECODE_SIGNING_KEY; unsigned when unset)
+  → X-CoreCode-Signature: <base64 64-byte sig over the .ccext bytes>
+    X-CoreCode-Pubkey:    <base64 32-byte verifying key>
+```
+
+Server rules (`store.rs`):
+
+- Signatures are verified over the body **before** anything is stored
+- The first signed publish for an extension id **pins** its key
+  (`ExtensionEntry.pinned_key`); later publishes must use the same key
+- Unsigned publishes are rejected once a key is pinned (HTTP 403)
+- `VersionEntry` records `signature` + `signed_by`; downloads expose them
+  as `x-corecode-signature` / `x-corecode-signed-by` headers
+
+Client (`marketplace.rs::verify_ccext_signature`): `install_native_extension`
+verifies the downloaded bytes against the entry's signature and pinned key
+**after** the SHA-256 integrity check. Unsigned (legacy/dev) entries still
+install — SHA-256 integrity always applies; signatures are additive
+authentication.
+
+Trust model: the bearer token authenticates the *publisher connection*;
+the pinned key authenticates the *package lineage*. TOFU means the first
+publish of a new id trusts the presented key — acceptable while the token
+gates who can publish at all. Key rotation would require registry-side
+admin tooling (deliberately not built yet).
+
+E2E verified: keygen → signed publish (201, signature recorded) →
+re-publish with a different key → 403 → download headers carry signature
++ pinned key; tampered-bytes and wrong-key cases covered by unit tests in
+all three crates (CLI 10, server 15, app 167 total).
+
+## What remains (backlog — not part of the Phase 6 deliverables)
 
 | Item | Detail |
 |:-----|:-------|
-| **ed25519 signature verification** | Roadmap deliverable. SHA-256 integrity is enforced end-to-end today; package *signatures* still need: `cargo corecode keygen`, signing at publish (`CORECODE_SIGNING_KEY`), signature column in the index, host-side verification against trusted keys. Protocol reserves `X-CoreCode-Signature` for this. |
 | Public deployment | `marketplace.corecode.dev` DNS + TLS + a long-lived token; server runs anywhere cargo does. |
 | Marketplace UI for native extensions | The extensions panel currently searches Open VSX only; add a "Native" tab querying `/api/v1/search`. |
+| Key rotation / revocation | TOFU pinning has no admin override yet; needs registry-side tooling and a policy decision. |
 | Unpublish / deprecate | Not in the protocol; decide policy (immutable registry vs admin unpublish). |
 
 ## Security notes
 
 - Publish requires a bearer token; downloads are unauthenticated (public packages)
+- Signed packages are verified against a per-extension pinned ed25519 key
+  (server at publish time, client again at install time)
 - Server never executes or parses package contents — bytes in, bytes out
 - Path traversal is blocked at three layers (id validation, index-only lookups,
   router-normalised paths)
 - Client refuses non-HTTPS registries outside loopback/LAN and verifies
-  SHA-256 before touching the extensions dir
+  SHA-256 (+ signature when present) before touching the extensions dir

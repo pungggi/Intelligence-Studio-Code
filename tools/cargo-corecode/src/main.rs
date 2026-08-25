@@ -2,6 +2,7 @@ mod commands;
 mod manifest;
 mod packagers;
 mod adapter;
+mod signing;
 
 use clap::{Parser, Subcommand};
 
@@ -50,9 +51,22 @@ enum Command {
         /// then https://marketplace.corecode.dev)
         #[arg(long)]
         registry: Option<String>,
+        /// ed25519 signing key: path to a key file or the base64 seed
+        /// (defaults to $CORECODE_SIGNING_KEY; unsigned when unset)
+        #[arg(long)]
+        signing_key: Option<String>,
         /// Build and validate the package without uploading
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Generate an ed25519 signing keypair for authenticated publishing
+    Keygen {
+        /// Output directory (defaults to the current directory)
+        #[arg(long)]
+        out: Option<String>,
+        /// Overwrite existing key files
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -65,7 +79,14 @@ fn main() -> anyhow::Result<()> {
         Command::Publish {
             token,
             registry,
+            signing_key,
             dry_run,
-        } => commands::publish::run(token.as_deref(), registry.as_deref(), dry_run),
+        } => commands::publish::run(
+            token.as_deref(),
+            registry.as_deref(),
+            signing_key.as_deref(),
+            dry_run,
+        ),
+        Command::Keygen { out, force } => commands::keygen::run(out.as_deref(), force),
     }
 }

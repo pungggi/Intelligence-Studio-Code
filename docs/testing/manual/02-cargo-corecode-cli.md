@@ -248,13 +248,32 @@ ccr corecode publish --dry-run
 
 ---
 
+## T2.6 — `cargo corecode keygen` + Signed Publishing — ed25519
+
+Prereqs: T2.5 passing, marketplace-server built (`cargo build` in `tools/marketplace-server`), server running:
+
+```bash
+MARKETPLACE_TOKEN=dev MARKETPLACE_BIND=127.0.0.1:8987 cargo run --manifest-path tools/marketplace-server/Cargo.toml
+```
+
+| # | Step | Expected |
+|:--|:-----|:---------|
+| 1 | `cargo corecode keygen` in the extension dir | Writes `corecode-signing-key` + `corecode-signing-key.pub`; prints the base64 public key and usage hint |
+| 2 | Run again without `--force` | Error: files already exist |
+| 3 | `CORECODE_SIGNING_KEY=./corecode-signing-key cargo corecode publish --registry http://127.0.0.1:8987 --token dev` (new version) | Output shows `signed by : <pubkey>`; HTTP 201; response JSON contains `signature` + `signed_by` |
+| 4 | `GET /api/v1/extension/{id}/{version}/download` on the server | Response headers include `x-corecode-sha256`, `x-corecode-signature`, `x-corecode-signed-by` matching the printed pubkey |
+| 5 | Generate a second key elsewhere; publish a new version with it | HTTP 403 with `pinned to a different signing key` in the CLI error |
+| 6 | Publish a new version with no signing key | HTTP 403 `signature required` |
+| 7 | Publish a new version with the original key | HTTP 201 |
+
 ## Cleanup
 
 ```bash
 rm -rf /tmp/corecode-test
-# Remove generated packages from examples
+# Remove generated packages and keys from examples
 rm -f <REPO>/examples/hello-wasm/*.ccext <REPO>/examples/hello-wasm/*.zip <REPO>/examples/hello-wasm/*.vsix
 rm -f <REPO>/examples/simple-lsp/*.ccext
+rm -f <REPO>/examples/*/corecode-signing-key <REPO>/examples/*/corecode-signing-key.pub
 ```
 
 ## Next

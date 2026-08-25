@@ -16,6 +16,11 @@
 //!
 //! Success: 200/201. Failures: 401/403 bad token, 409 version already
 //! published, anything else is an error with the response body surfaced.
+//!
+//! Optional authenticated publishing (ed25519): when a signing key is
+//! available (`--signing-key`, or `$CORECODE_SIGNING_KEY`), the package bytes
+//! are signed and sent with `X-CoreCode-Signature` + `X-CoreCode-Pubkey`.
+//! Registries pin the first key per extension id and reject mismatches.
 
 use crate::manifest::{self, CoreCodeManifest};
 use std::path::PathBuf;
@@ -24,7 +29,12 @@ use std::time::Duration;
 /// Default public registry (Phase 6 — may not be live yet).
 const DEFAULT_REGISTRY: &str = "https://marketplace.corecode.dev";
 
-pub fn run(token: Option<&str>, registry: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
+pub fn run(
+    token: Option<&str>,
+    registry: Option<&str>,
+    signing_key: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
     let m = manifest::load()?;
     validate(&m)?;
 
@@ -44,6 +54,22 @@ pub fn run(token: Option<&str>, registry: Option<&str>, dry_run: bool) -> anyhow
     println!("  extension : {}", m.extension.id);
     println!("  version   : {}", m.extension.version);
     println!("  package   : {} ({size_kb} KB)", package.display());
+
+    // Signing key: flag, then env. May be a path or a literal base64 seed.
+    let signing_key = signing_key
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("CORECODE_SIGNING_KEY").ok())
+        .filter(|s| !s.is_empty());
+    let (signing, pubkey_b64, signature_b64) = match &signing_key {
+        Some(spec) => {
+            let key = crate::signing::load_signing_key(spec)?;
+            let sig = crate::signing::sign(&key, &bytes);
+            let pubkey = crate::signing::encode(key.verifying_key().as_bytes());
+            println!("  signed by : {pubkey}");
+            (true, pubkey, sig)
+        }
+        None => (false, String::new(), String::new()),
+    };
 
     if dry_run {
         println!("  dry run   : package built and validated, upload skipped");
@@ -69,13 +95,18 @@ pub fn run(token: Option<&str>, registry: Option<&str>, dry_run: bool) -> anyhow
     let url = format!("{registry}/api/v1/publish");
     println!("  registry  : {url}");
 
-    let response = ureq::post(&url)
+    let mut request = ureq::post(&url)
         .timeout(Duration::from_secs(300))
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/octet-stream")
         .set("X-CoreCode-Extension", &m.extension.id)
-        .set("X-CoreCode-Version", &m.extension.version)
-        .send_bytes(&bytes);
+        .set("X-CoreCode-Version", &m.extension.version);
+    if signing {
+        request = request
+            .set("X-CoreCode-Signature", &signature_b64)
+            .set("X-CoreCode-Pubkey", &pubkey_b64);
+    }
+    let response = request.send_bytes(&bytes);
 
     match response {
         Ok(resp) => {
@@ -87,8 +118,18 @@ pub fn run(token: Option<&str>, registry: Option<&str>, dry_run: bool) -> anyhow
             }
             Ok(())
         }
-        Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
-            anyhow::bail!("authentication failed — check your token (HTTP 401/403)")
+        Err(ureq::Error::Status(401, _)) => {
+            anyhow::bail!("authentication failed — check your token (HTTP 401)")
+        }
+        Err(ureq::Error::Status(403, resp)) => {
+            // 403 is either a bad token or a signing-key rejection — surface
+            // the registry's explanation (e.g. key pinning mismatch).
+            let body = resp.into_string().unwrap_or_default();
+            let detail = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                .unwrap_or(body);
+            anyhow::bail!("forbidden: {detail}")
         }
         Err(ureq::Error::Status(409, _)) => anyhow::bail!(
             "version {} of {} is already published — bump the version in corecode.toml",

@@ -3,11 +3,14 @@
 //!
 //! ```text
 //! POST   /api/v1/publish                              (Bearer token)
-//!        headers: X-CoreCode-Extension, X-CoreCode-Version
+//!        headers: X-CoreCode-Extension, X-CoreCode-Version,
+//!                 optional X-CoreCode-Signature + X-CoreCode-Pubkey (ed25519,
+//!                 base64; first signed publish pins the key per extension id)
 //!        body:    raw .ccext bytes                → 201 {version entry}
 //! GET    /api/v1/extension/{id}                    → extension metadata
 //! GET    /api/v1/extension/{id}/latest             → latest version entry
 //! GET    /api/v1/extension/{id}/{version}/download → .ccext bytes
+//!                 (+ x-corecode-sha256, x-corecode-signature, x-corecode-signed-by)
 //! GET    /api/v1/search?q=&offset=&limit=          → id search
 //! GET    /api/v1/health                             → {"status":"ok"}
 //! ```
@@ -73,12 +76,38 @@ async fn publish(
         .get("X-CoreCode-Version")
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
+    // Optional ed25519 signature over the body: (pubkey, signature), both base64.
+    let signature = headers
+        .get("X-CoreCode-Signature")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let pubkey = headers
+        .get("X-CoreCode-Pubkey")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let sig = match (signature, pubkey) {
+        (Some(s), Some(k)) => Some((k, s)),
+        (None, None) => None,
+        (Some(_), None) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                "X-CoreCode-Signature requires X-CoreCode-Pubkey",
+            )
+        }
+        (None, Some(_)) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                "X-CoreCode-Pubkey requires X-CoreCode-Signature",
+            )
+        }
+    };
 
-    match state.store.publish(id, version, &body) {
+    match state.store.publish(id, version, &body, sig.as_ref().map(|(k, s)| (k.as_str(), s.as_str()))) {
         Ok(entry) => (StatusCode::CREATED, Json(json!(entry))).into_response(),
         Err(PublishError::Conflict) => {
             error_json(StatusCode::CONFLICT, &format!("version {version} of {id} is already published"))
         }
+        Err(PublishError::Forbidden(msg)) => error_json(StatusCode::FORBIDDEN, &msg),
         Err(PublishError::Invalid(msg)) => error_json(StatusCode::BAD_REQUEST, &msg),
         Err(PublishError::Io(msg)) => error_json(StatusCode::INTERNAL_SERVER_ERROR, &msg),
     }
@@ -113,12 +142,29 @@ async fn download(
     match state.store.package(&id, &version) {
         Some((bytes, sha256)) => {
             let mut response = (StatusCode::OK, bytes).into_response();
-            response.headers_mut().insert(
+            let response_headers = response.headers_mut();
+            response_headers.insert(
                 header::CONTENT_TYPE,
                 "application/octet-stream".parse().unwrap(),
             );
             if let Ok(value) = sha256.parse() {
-                response.headers_mut().insert("x-corecode-sha256", value);
+                response_headers.insert("x-corecode-sha256", value);
+            }
+            // Signature metadata (when the version was signed) so clients can
+            // authenticate the bytes without a separate metadata round-trip.
+            if let Some(entry) = state.store.get(&id).and_then(|e| {
+                e.versions.into_iter().find(|v| v.version == version)
+            }) {
+                if let Some(sig) = entry.signature {
+                    if let Ok(value) = sig.parse() {
+                        response_headers.insert("x-corecode-signature", value);
+                    }
+                }
+                if let Some(key) = entry.signed_by {
+                    if let Ok(value) = key.parse() {
+                        response_headers.insert("x-corecode-signed-by", value);
+                    }
+                }
             }
             response
         }
@@ -299,5 +345,81 @@ mod tests {
         let app = test_router("health", None);
         let res = app.oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn signed_publish_and_download_headers() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand::rngs::OsRng;
+
+        let app = test_router("signed", Some("secret"));
+        let pkg: &[u8] = b"signed-ccext-bytes";
+        let key = SigningKey::generate(&mut OsRng);
+        let pubkey = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(key.verifying_key().as_bytes())
+        };
+        let signature = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(key.sign(pkg).to_bytes())
+        };
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/publish")
+                    .header("Authorization", "Bearer secret")
+                    .header("X-CoreCode-Extension", "pub.signed")
+                    .header("X-CoreCode-Version", "1.0.0")
+                    .header("X-CoreCode-Signature", &signature)
+                    .header("X-CoreCode-Pubkey", &pubkey)
+                    .body(Body::from(pkg.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let body = body_string(res).await;
+        assert!(body.contains("signed_by"), "entry must record signed_by, got: {body}");
+
+        // Wrong key for the pinned extension → 403
+        let other = SigningKey::generate(&mut OsRng);
+        let other_sig = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(other.sign(b"x").to_bytes())
+        };
+        let other_pub = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(other.verifying_key().as_bytes())
+        };
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/publish")
+                    .header("Authorization", "Bearer secret")
+                    .header("X-CoreCode-Extension", "pub.signed")
+                    .header("X-CoreCode-Version", "1.0.1")
+                    .header("X-CoreCode-Signature", &other_sig)
+                    .header("X-CoreCode-Pubkey", &other_pub)
+                    .body(Body::from(b"x".to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Download carries the signature headers
+        let res = app
+            .oneshot(
+                Request::get("/api/v1/extension/pub.signed/1.0.0/download")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-corecode-signed-by".parse::<axum::http::HeaderName>().unwrap().as_str()], pubkey);
+        assert_eq!(res.headers()["x-corecode-signature".parse::<axum::http::HeaderName>().unwrap().as_str()], signature);
+        assert_eq!(body_string(res).await, "signed-ccext-bytes");
     }
 }

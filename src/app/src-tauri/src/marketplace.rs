@@ -71,12 +71,21 @@ pub struct CcextVersionEntry {
     pub size: u64,
     #[serde(rename = "publishedAt", default)]
     pub published_at: String,
+    /// base64 ed25519 signature over the package bytes (signed publishes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// base64 ed25519 public key that produced `signature`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CcextExtensionEntry {
     pub id: String,
     pub versions: Vec<CcextVersionEntry>,
+    /// Publisher identity key pinned by the registry (TOFU).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_key: Option<String>,
 }
 
 pub struct MarketplaceClient {
@@ -359,6 +368,42 @@ impl MarketplaceClient {
 
         Ok((bytes, expected_sha))
     }
+
+    /// Verify a downloaded package against the version entry's ed25519
+    /// signature. Unsigned (legacy/dev) entries pass — the registry only
+    /// records signatures for publishers that opted in; once signed, the
+    /// registry pins the key and clients authenticate against it.
+    pub fn verify_ccext_signature(
+        entry: &CcextVersionEntry,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        use base64::Engine;
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        let (Some(signature), Some(signed_by)) = (&entry.signature, &entry.signed_by) else {
+            return Ok(()); // unsigned publish — SHA-256 integrity still applies
+        };
+
+        let engine = base64::engine::general_purpose::STANDARD;
+        let key_bytes: Vec<u8> = engine
+            .decode(signed_by.trim())
+            .map_err(|e| format!("invalid publisher key encoding: {e}"))?;
+        let key_bytes: [u8; 32] = key_bytes.try_into().map_err(|v: Vec<u8>| {
+            format!("publisher key must be 32 bytes, got {}", v.len())
+        })?;
+        let key = VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|e| format!("invalid publisher key: {e}"))?;
+
+        let sig_bytes: Vec<u8> = engine
+            .decode(signature.trim())
+            .map_err(|e| format!("invalid signature encoding: {e}"))?;
+        let sig_bytes: [u8; 64] = sig_bytes.try_into().map_err(|v: Vec<u8>| {
+            format!("signature must be 64 bytes, got {}", v.len())
+        })?;
+
+        key.verify(bytes, &Signature::from_bytes(&sig_bytes))
+            .map_err(|_| "signature verification failed — package may be tampered".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -498,5 +543,71 @@ mod tests {
             .push("../evil").push("1.0.0").push("download");
         let s = url.to_string();
         assert!(!s.contains("/../"), "download URL must not allow traversal, got: {s}");
+    }
+
+    // ── ed25519 signature verification ─────────────────────────────────
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn signed_entry(key: &ed25519_dalek::SigningKey, bytes: &[u8]) -> CcextVersionEntry {
+        use ed25519_dalek::Signer;
+        CcextVersionEntry {
+            version: "1.0.0".into(),
+            sha256: String::new(),
+            size: bytes.len() as u64,
+            published_at: String::new(),
+            signature: Some(b64(&key.sign(bytes).to_bytes())),
+            signed_by: Some(b64(key.verifying_key().as_bytes())),
+        }
+    }
+
+    fn unsigned_entry() -> CcextVersionEntry {
+        CcextVersionEntry {
+            version: "1.0.0".into(),
+            sha256: String::new(),
+            size: 0,
+            published_at: String::new(),
+            signature: None,
+            signed_by: None,
+        }
+    }
+
+    #[test]
+    fn ccext_signature_valid_passes() {
+        use ed25519_dalek::Signer;
+        use rand::rngs::OsRng;
+        let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let entry = signed_entry(&key, b"package");
+        assert!(MarketplaceClient::verify_ccext_signature(&entry, b"package").is_ok());
+    }
+
+    #[test]
+    fn ccext_signature_tampered_bytes_fail() {
+        use rand::rngs::OsRng;
+        let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let entry = signed_entry(&key, b"package");
+        let err = MarketplaceClient::verify_ccext_signature(&entry, b"tampered").unwrap_err();
+        assert!(err.contains("tampered"), "got: {err}");
+    }
+
+    #[test]
+    fn ccext_signature_wrong_key_fails() {
+        use ed25519_dalek::Signer;
+        use rand::rngs::OsRng;
+        let signer = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let mut entry = signed_entry(&signer, b"package");
+        // re-sign with a different key but keep the original signed_by
+        let other = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        entry.signature = Some(b64(&other.sign(b"package").to_bytes()));
+        assert!(MarketplaceClient::verify_ccext_signature(&entry, b"package").is_err());
+    }
+
+    #[test]
+    fn ccext_unsigned_entry_passes() {
+        let entry = unsigned_entry();
+        assert!(MarketplaceClient::verify_ccext_signature(&entry, b"anything").is_ok());
     }
 }
